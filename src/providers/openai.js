@@ -23,4 +23,66 @@ function extractOpenAIText(data) {
   return ''
 }
 
-module.exports = { extractOpenAIText }
+function safeParseJsonObject(value) {
+  if (!value) return {}
+  if (typeof value === 'object') return value
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function extractOpenAIToolCalls(data) {
+  if (!data || typeof data !== 'object') return []
+  const out = []
+  if (Array.isArray(data.output)) {
+    for (const item of data.output) {
+      if (!item || item.type !== 'function_call' || !item.name) continue
+      out.push({
+        id: item.call_id || item.id || item.name,
+        name: item.name,
+        arguments: safeParseJsonObject(item.arguments)
+      })
+    }
+  }
+  const chatToolCalls = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.tool_calls
+  if (Array.isArray(chatToolCalls)) {
+    for (const item of chatToolCalls) {
+      const fn = item && item.function
+      if (!fn || !fn.name) continue
+      out.push({
+        id: item.id || fn.name,
+        name: fn.name,
+        arguments: safeParseJsonObject(fn.arguments)
+      })
+    }
+  }
+  return out
+}
+
+function formatOpenAITools(tools, useResponses) {
+  if (!Array.isArray(tools) || tools.length === 0) return []
+  return tools.map((tool) => {
+    const parameters = tool.inputSchema || { type: 'object', properties: {} }
+    if (useResponses) {
+      return {
+        type: 'function',
+        name: tool.name,
+        description: tool.description || '',
+        parameters
+      }
+    }
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters
+      }
+    }
+  })
+}
+
+module.exports = { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools }

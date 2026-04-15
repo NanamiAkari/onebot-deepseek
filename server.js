@@ -4,7 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
-const { extractOpenAIText } = require('./src/providers/openai')
+const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
 const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
 const { createToolExecutor } = require('./src/agent/tool-executor')
@@ -61,11 +61,11 @@ const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw })
 const agentRunner = createAgentRunner({
   toolRegistry,
   toolExecutor,
-  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage }),
+  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
   invokeModelWithToolResult: async (input, toolResult) => {
     const toolSummary = `工具 ${toolResult.name} 返回：${JSON.stringify(toolResult.result || '').slice(0, 1500)}`
     const mergedHistory = (input.history || []).concat([{ role: 'system', content: toolSummary }])
-    return callLLM(input.message, input.media, mergedHistory, { contextImage: input.contextImage })
+    return callLLM(input.message, input.media, mergedHistory, { contextImage: input.contextImage, tools: input.tools, structured: true })
   }
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
@@ -179,7 +179,15 @@ function stripPrefix(text) {
 
 async function callLLM(text, media, hist, opts) {
   const b = await callOpenAI(text, media, hist, opts)
+  if (b && typeof b === 'object' && !Array.isArray(b)) {
+    const out = {
+      text: b.text ? sanitizeText(b.text) : '',
+      toolCalls: Array.isArray(b.toolCalls) ? b.toolCalls : []
+    }
+    if (out.text || out.toolCalls.length > 0) return out
+  }
   if (b) return sanitizeText(b)
+  if (opts && opts.structured) return { text: '上游模型暂时不可用，请稍后再试', toolCalls: [] }
   return '上游模型暂时不可用，请稍后再试'
 }
 
@@ -280,38 +288,69 @@ async function callOpenAI(text, media, hist, opts) {
       }
       msg.push({ role: 'user', content })
     }
-    const res = await axios.post(
-      url,
-      useResponses
-        ? {
-            model: OPENAI_MODEL,
-            input: [{ role: 'user', content }],
-            ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
-            ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {})
-          }
-        : { model: OPENAI_MODEL, messages: msg },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: requestTimeout,
-        httpsAgent: HTTPS_AGENT,
-        proxy: false
-      }
-    )
+    const tools = formatOpenAITools(opts && opts.tools, useResponses)
+    const buildPayload = (includeTools) => useResponses
+      ? {
+          model: OPENAI_MODEL,
+          input: [{ role: 'user', content }],
+          ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
+          ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {}),
+          ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
+        }
+      : {
+          model: OPENAI_MODEL,
+          messages: msg,
+          ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
+        }
+    let res
+    try {
+      res = await axios.post(
+        url,
+        buildPayload(true),
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: requestTimeout,
+          httpsAgent: HTTPS_AGENT,
+          proxy: false
+        }
+      )
+    } catch (e) {
+      const status = e && e.response && e.response.status
+      const raw = e && e.response && e.response.data
+      const errorText = typeof raw === 'string' ? raw : JSON.stringify(raw || '')
+      const canFallback = tools.length > 0 && (status === 400 || status === 404 || /tool|parameter|unsupported|schema|function/i.test(errorText))
+      if (!canFallback) throw e
+      console.log('OpenAI工具调用参数不兼容，回退纯文本模式')
+      res = await axios.post(
+        url,
+        buildPayload(false),
+        {
+          headers: {
+            Authorization: `Bearer ${OPENAI_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: requestTimeout,
+          httpsAgent: HTTPS_AGENT,
+          proxy: false
+        }
+      )
+    }
     const contentText = extractOpenAIText(res.data)
-    if (!contentText) return null
+    const toolCalls = extractOpenAIToolCalls(res.data)
+    if (!contentText && toolCalls.length === 0) return null
     console.log('OpenAI成功')
-    const txt = String(contentText).slice(0, 2000)
-    if (Array.isArray(media) && media.length > 0) {
+    const txt = String(contentText || '').slice(0, 2000)
+    if (txt && Array.isArray(media) && media.length > 0) {
       const ignoreHints = /(未提供(对应)?图片|无法识别到你提供的图片|暂时无法解答|请你补充相关信息)/i
       if (ignoreHints.test(txt)) {
         const again = await callGemini(text, media, opts)
-        if (again) return String(again).slice(0, 2000)
+        if (again) return { text: String(again).slice(0, 2000), toolCalls }
       }
     }
-    return txt
+    return { text: txt, toolCalls }
   } catch (e) {
     const status = e && e.response && e.response.status
     const msg = e && e.response && e.response.data
@@ -326,11 +365,11 @@ async function callOpenAI(text, media, hist, opts) {
       }
     }
     console.log('OpenAI失败', status || '', `media=${Array.isArray(media) ? media.length : 0}`, `timeout=${requestTimeout}`, errorMessage, errText.slice(0, 500))
-    if (status === 429) return '上游限流，请稍后再试'
-    if (status === 401) return '上游鉴权失败，请检查 API Key'
-    if (status === 502 || status === 503 || status === 504) return '上游网关异常（5xx），请稍后再试'
-    if (errorMessage && /timeout/i.test(errorMessage)) return '图片分析超时，请稍后重试或发送更小的图片'
-    return '上游调用失败'
+    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [] } : '上游限流，请稍后再试'
+    if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [] } : '上游鉴权失败，请检查 API Key'
+    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [] } : '上游网关异常（5xx），请稍后再试'
+    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [] } : '图片分析超时，请稍后重试或发送更小的图片'
+    return opts && opts.structured ? { text: '上游调用失败', toolCalls: [] } : '上游调用失败'
   }
 }
 
