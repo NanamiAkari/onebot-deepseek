@@ -53,7 +53,7 @@ const AI_IMAGE_CONTEXT_TTL = parseInt(process.env.AI_IMAGE_CONTEXT_TTL || '60', 
 const AI_IMAGE_CONTEXT_MODE = (process.env.AI_IMAGE_CONTEXT_MODE || 'rule').toLowerCase()
 const AI_IMAGE_CONTEXT_REQUIRE_HINTS = String(process.env.AI_IMAGE_CONTEXT_REQUIRE_HINTS || 'true').toLowerCase() === 'true'
 const AI_IMAGE_CONTEXT_REQUIRE_SAME_USER = String(process.env.AI_IMAGE_CONTEXT_REQUIRE_SAME_USER || 'true').toLowerCase() === 'true'
-const AI_IMAGE_HINT_REGEX = process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这张图|图中|这幅图|图片里)/i
+const AI_IMAGE_HINT_REGEX = process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这个图|这图|这张图|这个图片|这张图片|图中|这幅图|图片里)/i
 const AI_IMAGE_CONTEXT_MAX = parseInt(process.env.AI_IMAGE_CONTEXT_MAX || '3', 10)
 const AI_IMAGE_ONLY_NO_CALL = String(process.env.AI_IMAGE_ONLY_NO_CALL || 'true').toLowerCase() === 'true'
 const BANNED_PATH = path.join(__dirname, 'banned.json')
@@ -119,6 +119,7 @@ wss.on('connection', (ws) => {
     if (payload.post_type !== 'message') return
     const isGroup = payload.message_type === 'group'
     const raw = extractContent(payload.message)
+    raw.media = await resolveMediaSources(ws, raw.media)
     const key = getKey(payload)
     let ctxImgUsed = false
     if (raw.media && raw.media.length > 0) {
@@ -136,13 +137,14 @@ wss.on('connection', (ws) => {
         }
       }
     }
-    const mentioned = checkMention(payload.message, payload.self_id)
+    const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
     if (!mentioned) return
     const content = raw
     if ((!content.media || content.media.length === 0) && content.replyId) {
       const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
       if (resp && resp.status === 'ok' && resp.data && resp.data.message) {
         const q = extractContent(resp.data.message)
+        q.media = await resolveMediaSources(ws, q.media)
         const merged = content.media ? content.media.slice() : []
         if (q.media && q.media.length) {
           for (const m of q.media) {
@@ -160,11 +162,17 @@ wss.on('connection', (ws) => {
     }
     const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
     if (cmdHandled) return
-    if (!shouldRespond(content.text)) {
-      if (AI_IMAGE_ONLY_NO_CALL && content.media && content.media.length > 0) return
+    const hasText = Boolean(String(content.text || '').trim())
+    const hasMedia = Array.isArray(content.media) && content.media.length > 0
+    if (!hasText) {
+      if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
+      if (!hasMedia) return
+    }
+    const wantsReply = isGroup ? shouldRespond(content.text) : hasText
+    if (!wantsReply) {
       return
     }
-    const stripped = stripPrefix(content.text || '')
+    const stripped = stripPrefix(content.text || '') || ((content.media && content.media.length > 0) ? '请描述这张图片' : '')
     const hist = getContext(payload, stripped)
     const aiText = await callLLM(stripped, content.media, hist, { contextImage: ctxImgUsed })
     if (!aiText) return
@@ -190,14 +198,15 @@ function extractContent(message) {
       if (seg.type === 'text') {
         text += (seg.data && seg.data.text) || ''
       } else if (seg.type === 'image' && seg.data) {
-        const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'image', url })
+        const url = seg.data.url || ''
+        const file = seg.data.file || ''
+        if (url || file) media.push({ kind: 'image', url, file })
       } else if ((seg.type === 'record' || seg.type === 'audio') && seg.data) {
         const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'audio', url })
+        if (url) media.push({ kind: 'audio', url, file: seg.data.file || '' })
       } else if (seg.type === 'video' && seg.data) {
         const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'video', url })
+        if (url) media.push({ kind: 'video', url, file: seg.data.file || '' })
       } else if (seg.type === 'face') {
         text += '[表情]'
       } else if (seg.type === 'emoji' && seg.data && seg.data.id) {
@@ -269,6 +278,32 @@ function sanitizeText(s) {
   t = t.trim()
   return t.slice(0, 2000)
 }
+
+function extractOpenAIText(data) {
+  if (!data || typeof data !== 'object') return ''
+  if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim()
+  const chatContent = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
+  if (typeof chatContent === 'string' && chatContent.trim()) return chatContent.trim()
+  if (Array.isArray(chatContent)) {
+    const chatParts = []
+    for (const item of chatContent) {
+      if (item && typeof item.text === 'string' && item.text.trim()) chatParts.push(item.text.trim())
+    }
+    if (chatParts.length > 0) return chatParts.join('\n')
+  }
+  if (Array.isArray(data.output)) {
+    const outputParts = []
+    for (const item of data.output) {
+      if (!item || !Array.isArray(item.content)) continue
+      for (const part of item.content) {
+        if (part && typeof part.text === 'string' && part.text.trim()) outputParts.push(part.text.trim())
+      }
+    }
+    if (outputParts.length > 0) return outputParts.join('\n')
+  }
+  return ''
+}
+
 async function callGemini(text, media, opts) {
   if (!GEMINI_KEY) return null
   try {
@@ -312,11 +347,14 @@ async function callGemini(text, media, opts) {
 
 async function callOpenAI(text, media, hist, opts) {
   if (!OPENAI_KEY) return null
+  const imageCount = Array.isArray(media) ? media.filter((m) => m && m.kind === 'image').length : 0
+  const requestTimeout = imageCount > 0 ? Math.max(OPENAI_TIMEOUT_MS, 60000) : OPENAI_TIMEOUT_MS
   try {
     console.log('调用OpenAI')
     const useResponses = OPENAI_WIRE_API === 'responses' || /ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(OPENAI_BASE_URL)
     const url = useResponses ? `${OPENAI_BASE_URL}/responses` : `${OPENAI_BASE_URL}/chat/completions`
     const content = []
+    let attached = 0
     if (opts && opts.contextImage) {
       if (useResponses) content.push({ type: 'input_text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
       else content.push({ type: 'text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
@@ -324,16 +362,15 @@ async function callOpenAI(text, media, hist, opts) {
     if (useResponses) content.push({ type: 'input_text', text: text || 'Hello' })
     else content.push({ type: 'text', text: text || 'Hello' })
     if (Array.isArray(media) && media.length > 0) {
-      const limited = media.slice(0, AI_IMAGE_CONTEXT_MAX)
+      const limited = media.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
       for (const m of limited) {
-        const file = await sourceToBase64(m.url)
-        if (file && file.data) {
-          const dataUrl = `data:${file.mime};base64,${file.data}`
-          if (useResponses) content.push({ type: 'input_image', image_url: dataUrl })
-          else content.push({ type: 'image_url', image_url: { url: dataUrl } })
-        }
+        const imageUrl = await toOpenAIImageUrl(m)
+        if (!imageUrl) continue
+        if (useResponses) content.push({ type: 'input_image', image_url: imageUrl })
+        else content.push({ type: 'image_url', image_url: { url: imageUrl } })
+        attached += 1
       }
-      console.log(`OpenAI媒体数量: ${limited.length}`)
+      console.log(`OpenAI媒体数量: ${attached}`)
     }
     const msg = []
     if (!useResponses) {
@@ -360,16 +397,12 @@ async function callOpenAI(text, media, hist, opts) {
           Authorization: `Bearer ${OPENAI_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: OPENAI_TIMEOUT_MS,
+        timeout: requestTimeout,
         httpsAgent: HTTPS_AGENT,
         proxy: false
       }
     )
-    const contentText =
-      (res.data && res.data.output_text) ||
-      (res.data && res.data.choices && res.data.choices[0] && res.data.choices[0].message && res.data.choices[0].message.content) ||
-      (res.data && res.data.output && res.data.output_text) ||
-      ''
+    const contentText = extractOpenAIText(res.data)
     if (!contentText) return null
     console.log('OpenAI成功')
     const txt = String(contentText).slice(0, 2000)
@@ -384,10 +417,21 @@ async function callOpenAI(text, media, hist, opts) {
   } catch (e) {
     const status = e && e.response && e.response.status
     const msg = e && e.response && e.response.data
-    console.log('OpenAI失败', status || '', msg || '')
+    const errorMessage = e && e.message ? String(e.message) : ''
+    let errText = ''
+    if (typeof msg === 'string') errText = msg
+    else {
+      try {
+        errText = JSON.stringify(msg || '')
+      } catch {
+        errText = String(msg || '')
+      }
+    }
+    console.log('OpenAI失败', status || '', `media=${Array.isArray(media) ? media.length : 0}`, `timeout=${requestTimeout}`, errorMessage, errText.slice(0, 500))
     if (status === 429) return '上游限流，请稍后再试'
     if (status === 401) return '上游鉴权失败，请检查 API Key'
     if (status === 502 || status === 503 || status === 504) return '上游网关异常（5xx），请稍后再试'
+    if (errorMessage && /timeout/i.test(errorMessage)) return '图片分析超时，请稍后重试或发送更小的图片'
     return '上游调用失败'
   }
 }
@@ -471,10 +515,85 @@ function parseCQMedia(str) {
     const url = kv.url || kv.file
     if (url) {
       const kind = type === 'record' ? 'audio' : type
-      out.push({ kind, url })
+      out.push({ kind, url, file: kv.file || '' })
     }
   }
   return out
+}
+
+async function resolveMediaSources(ws, media) {
+  if (!Array.isArray(media) || media.length === 0) return []
+  const out = []
+  for (const item of media) {
+    if (!item || item.kind !== 'image') {
+      out.push(item)
+      continue
+    }
+    let url = item.url || ''
+    let localPath = item.localPath || ''
+    const fileRef = item.file || ''
+    if (!localPath && fileRef && !isDirectMediaSource(fileRef)) {
+      const resp = await sendAction(ws, 'get_image', { file: fileRef }).catch(() => null)
+      if (resp && resp.status === 'ok' && resp.data) {
+        if (resp.data.file) localPath = String(resp.data.file)
+        if (!url && resp.data.url) url = String(resp.data.url)
+      }
+    }
+    out.push({ ...item, url, localPath })
+  }
+  return out
+}
+
+function isDirectMediaSource(src) {
+  return /^https?:\/\//i.test(src) || /^file:\/\//i.test(src) || /^data:/i.test(src) || /^base64:\/\//i.test(src) || /^[\\/]/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)
+}
+
+function isQqImageUrl(src) {
+  try {
+    const u = new URL(src)
+    const host = u.hostname || ''
+    return /qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host) || /multimedia\.nt\.qq\.com$/i.test(host) || /multimedia\.nt\.qq\.com\.cn$/i.test(host)
+  } catch {
+    return false
+  }
+}
+
+function detectMimeFromBuffer(buf, fallback = '') {
+  if (!buf || buf.length < 4) return fallback || 'application/octet-stream'
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif'
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') return 'video/mp4'
+  return fallback || 'application/octet-stream'
+}
+
+function detectMimeFromExt(filePath) {
+  const ext = path.extname(filePath || '').toLowerCase()
+  return ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+    : ext === '.png' ? 'image/png'
+    : ext === '.gif' ? 'image/gif'
+    : ext === '.webp' ? 'image/webp'
+    : ext === '.mp3' ? 'audio/mpeg'
+    : ext === '.wav' ? 'audio/wav'
+    : ext === '.mp4' ? 'video/mp4'
+    : 'application/octet-stream'
+}
+
+async function toOpenAIImageUrl(media) {
+  if (!media) return ''
+  const candidates = [media.localPath, media.file, media.url].filter(Boolean)
+  for (const src of candidates) {
+    if (!src) continue
+    if (!/^https?:\/\//i.test(src) || isQqImageUrl(src)) {
+      const file = await sourceToBase64(src)
+      if (file && file.data && /^image\//i.test(file.mime)) return `data:${file.mime};base64,${file.data}`
+    }
+  }
+  for (const src of candidates) {
+    if (/^https?:\/\//i.test(src)) return src
+  }
+  return ''
 }
 
 async function sourceToBase64(src) {
@@ -496,32 +615,19 @@ async function sourceToBase64(src) {
   }
   if (/^file:\/\//i.test(src)) {
     try {
-      const p = src.replace(/^file:\/\//i, '')
+      const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
       const buf = fs.readFileSync(p)
-      const ext = path.extname(p).toLowerCase()
-      const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
-        : ext === '.png' ? 'image/png'
-        : ext === '.gif' ? 'image/gif'
-        : ext === '.mp3' ? 'audio/mpeg'
-        : ext === '.wav' ? 'audio/wav'
-        : ext === '.mp4' ? 'video/mp4'
-        : 'application/octet-stream'
+      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
       return { mime, data: buf.toString('base64') }
     } catch {
       return null
     }
   }
-  if (/^[\\/].+/.test(src)) {
+  if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
     try {
-      const buf = fs.readFileSync(src)
-      const ext = path.extname(src).toLowerCase()
-      const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
-        : ext === '.png' ? 'image/png'
-        : ext === '.gif' ? 'image/gif'
-        : ext === '.mp3' ? 'audio/mpeg'
-        : ext === '.wav' ? 'audio/wav'
-        : ext === '.mp4' ? 'video/mp4'
-        : 'application/octet-stream'
+      const p = decodeURIComponent(src)
+      const buf = fs.readFileSync(p)
+      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
       return { mime, data: buf.toString('base64') }
     } catch {
       // fallthrough
@@ -542,8 +648,9 @@ async function sourceToBase64(src) {
       }
       const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
       const ct = (res.headers && res.headers['content-type']) || ''
-      const mime = ct.split(';')[0] || 'application/octet-stream'
-      const data = Buffer.from(res.data).toString('base64')
+      const buf = Buffer.from(res.data)
+      const mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
+      const data = buf.toString('base64')
       return { mime, data }
     } catch (e) {
       const status = e && e.response && e.response.status
