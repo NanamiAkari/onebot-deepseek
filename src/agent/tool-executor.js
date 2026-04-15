@@ -97,8 +97,14 @@ function createToolExecutor(deps) {
   async function execute(name, args, runtime) {
     const safeArgs = args && typeof args === 'object' ? args : {}
     const handler = handlers[name]
-    if (!handler) throw new Error(`unknown tool: ${name}`)
-    return handler(safeArgs, runtime)
+    if (!handler) return { ok: false, error: `unknown tool: ${name}` }
+    try {
+      const data = await handler(safeArgs, runtime)
+      return { ok: true, data }
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : String(error)
+      return { ok: false, error: message }
+    }
   }
 
   return { execute, handlers, safePath }

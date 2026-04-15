@@ -12,9 +12,18 @@ function createAgentRunner(deps) {
 
   function formatToolResultForHistory(toolCall) {
     const payload = toolCall.ok
-      ? { ok: true, result: toolCall.result }
+      ? { ok: true, data: toolCall.data }
       : { ok: false, error: toolCall.error }
     return `工具 ${toolCall.name} 调用结果：${JSON.stringify(payload).slice(0, 1500)}`
+  }
+
+  function summarizeArguments(args) {
+    try {
+      const text = JSON.stringify(args || {})
+      return text.length > 300 ? `${text.slice(0, 300)}...` : text
+    } catch {
+      return '[unserializable arguments]'
+    }
   }
 
   async function run(input) {
@@ -39,6 +48,7 @@ function createAgentRunner(deps) {
     let finalText = ''
 
     for (let step = 0; step < maxSteps; step += 1) {
+      console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
       const output = normalizeModelOutput(
         step === 0 || !invokeModelWithToolResult
           ? await invokeModel(agentInput)
@@ -60,25 +70,17 @@ function createAgentRunner(deps) {
       if (output.text) finalText = output.text
 
       const currentCall = output.toolCalls[0]
-      let toolEntry
-      try {
-        const result = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
-        toolEntry = {
-          id: currentCall.id || currentCall.name,
-          name: currentCall.name,
-          arguments: currentCall.arguments || {},
-          result,
-          ok: true
-        }
-      } catch (error) {
-        toolEntry = {
-          id: currentCall.id || currentCall.name,
-          name: currentCall.name,
-          arguments: currentCall.arguments || {},
-          error: error && error.message ? String(error.message) : String(error),
-          ok: false
-        }
+      console.log(`Agent step ${step + 1}/${maxSteps}: 调用工具 ${currentCall.name} args=${summarizeArguments(currentCall.arguments || {})}`)
+      const toolResult = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
+      const toolEntry = {
+        id: currentCall.id || currentCall.name,
+        name: currentCall.name,
+        arguments: currentCall.arguments || {},
+        ok: Boolean(toolResult && toolResult.ok),
+        data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? toolResult.data : null,
+        error: toolResult && toolResult.error ? String(toolResult.error) : ''
       }
+      console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} ${toolEntry.ok ? '成功' : '失败'}`)
 
       executedToolCalls.push(toolEntry)
       agentInput.toolResults = executedToolCalls.slice()
