@@ -11,6 +11,7 @@ const { createToolExecutor } = require('./src/agent/tool-executor')
 const { createMessageHandler } = require('./src/app/message-handler')
 
 const {
+  PROJECT_ROOT,
   PORT,
   PATH: WS_PATH,
   PROVIDER,
@@ -57,16 +58,13 @@ const {
 const sessionStore = createSessionStore(config)
 const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
-const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw })
+const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
   toolRegistry,
   toolExecutor,
   invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
-  invokeModelWithToolResult: async (input, toolResult) => {
-    const toolSummary = `工具 ${toolResult.name} 返回：${JSON.stringify(toolResult.result || '').slice(0, 1500)}`
-    const mergedHistory = (input.history || []).concat([{ role: 'system', content: toolSummary }])
-    return callLLM(input.message, input.media, mergedHistory, { contextImage: input.contextImage, tools: input.tools, structured: true })
-  }
+  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
+  maxSteps: 5
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 
