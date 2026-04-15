@@ -1,12 +1,16 @@
-# OneBot v11 反向WS服务（OpenAI/Responses）
+# OneBot v11 反向WS服务（OpenAI/Responses + Agent Loop）
 
 ## 用途
 - 接收 Napcat 的消息事件（反向 WebSocket）
-- 当群内 @机器人 时调用单一 OpenAI 兼容上游生成回复
+- 支持群聊与私聊消息回复
+- 使用 OpenAI 兼容上游生成回复，支持 `responses` / `chat.completions`
+- 内部已升级为多轮 `agent loop + tool registry + tool executor` 架构
 - 通过 OneBot v11 动作帧把回复发回 QQ
 
 ## 准备
 - 安装 Node.js 18+
+- 如果部署在 Linux 服务器，建议在服务器本机执行 `npm install`
+- 不要把 Windows 上的 `node_modules` 直接复制到 Linux；`sharp` 这类原生模块需要按目标平台重新安装
 - 在此目录执行:
   - `npm install`
   - 复制 `.env.example` 为 `.env`
@@ -43,9 +47,11 @@
 ```
 
 ## 工作方式
-- 群消息事件到达后检测是否包含 @机器人
-- 提取文本与媒体，按配置调用单一 OpenAI 兼容上游
-- 不再自动回退到 Gemini/DeepSeek；若上游失败，直接回复失败提示
+- 入口层仍使用 OneBot v11 反向 WebSocket，不改变 Napcat 接法
+- 私聊默认可直接回复；群聊可按 `@机器人` / 前缀规则触发
+- 消息进入 `message-handler -> agent runner -> provider -> tool executor` 主链路
+- 当前已支持多轮 agent loop、工具注册表、dispatch map、统一 tool result 格式
+- 若上游或工具链失败，服务会返回失败提示而不是自动回退到其他模型
 - 使用 `send_group_msg` 或 `send_private_msg` 动作帧回复
 
 ## 上游协议
@@ -54,8 +60,39 @@
   - 留空：调用 `POST <OPENAI_BASE_URL>/chat/completions`
 - 当前实现会根据 `OPENAI_WIRE_API` 和网关地址自动选择协议。
 
+## Agent Loop
+- 当前服务已升级为有限步数的多轮 agent loop
+- 默认最大步数为 `5`
+- 每轮流程：
+  - 调用模型
+  - 若模型返回工具调用，则执行首个工具
+  - 将工具结果写回历史
+  - 继续下一轮，直到得到最终文本或达到步数上限
+- 当前已接入的工具包括：
+  - `get_msg`
+  - `get_image`
+  - `send_group_msg`
+  - `send_private_msg`
+  - `history`
+  - `read_file`
+  - `write_file`
+  - `edit_file`
+  - `list_dir`
+- 文件类工具带工作区路径沙箱，不能逃逸项目目录
+
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。
+- 首次部署或更新依赖时，请在服务器项目目录重新安装依赖：
+```
+cd /opt/onebot-deepseek
+npm install
+```
+- 如果 Linux 上 `sharp` 加载失败，可尝试：
+```
+npm install --include=optional sharp
+# 或
+npm install --os=linux --cpu=x64 sharp
+```
 - 创建服务：
 ```
 sudo tee /etc/systemd/system/onebot-deepseek.service >/dev/null <<'EOF'
@@ -84,9 +121,9 @@ sudo chown -R www-data:www-data /opt/onebot-deepseek
 sudo systemctl daemon-reload
 sudo systemctl enable --now onebot-deepseek
 sudo systemctl status onebot-deepseek
-sudo systemctl start onebot-deepseeks
-sudo systemctl stop onebot-deepseeks
-sudo systemctl restart onebot-deepseeks
+sudo systemctl start onebot-deepseek
+sudo systemctl stop onebot-deepseek
+sudo systemctl restart onebot-deepseek
 ```
 - 查看日志：
 ```
@@ -113,12 +150,31 @@ sudo systemctl daemon-reload
 sudo systemctl restart onebot-deepseek
 ```
 
-## 验证
-- Napcat url（同机）：`ws://127.0.0.1:5000/onebot/v11/ws`
-- 群内 @机器人，观察日志：
+## 日志说明
+- 启动成功时：
+  - `服务已启动`
+- OpenAI 调用：
   - `调用OpenAI`
   - `OpenAI媒体数量: 1`
-  - `OpenAI成功` 或 `OpenAI失败`
+  - `OpenAI成功`
+  - `OpenAI失败 media=1 timeout=...`
+- Agent loop：
+  - `Agent step 1/5: 调用模型`
+  - `Agent step 1/5: 调用工具 get_msg args=...`
+  - `Agent step 1/5: 工具 get_msg 成功`
+- 媒体链路：
+  - `媒体下载失败`
+- 图片超时：
+  - `图片分析超时，请稍后重试或发送更小的图片`
+
+## 验证
+- Napcat url（同机）：`ws://127.0.0.1:5000/onebot/v11/ws`
+- 推荐先做一轮最小冒烟测试：
+  - 私聊发送普通文本，确认能回复
+  - 群聊按前缀或 @ 规则触发一次，确认能回复
+  - 回复一条旧消息再提问，确认引用消息场景正常
+  - 发送一张简单图片并提问，确认图片链路正常
+  - 对同一张图片重复提问一次，确认缓存与稳定性
 
 ## 常见问题
 - 端口被占用（EADDRINUSE）：
@@ -127,9 +183,17 @@ sudo systemctl restart onebot-deepseek
   - 将 Clash 配置中的 `dns.listen` 改为 `127.0.0.1:1053` 或关闭 `dns.enable`。
 - 权限问题（CHDIR）：
   - `WorkingDirectory` 指向不可访问路径会失败；推荐 `/opt/onebot-deepseek` 并赋权给运行用户。
+- `sharp` 无法加载：
+  - 不要复用其他平台的 `node_modules`
+  - 在目标 Linux 机器上重新执行 `npm install`
+  - 如仍失败，执行 `npm install --include=optional sharp`
+- 图片一直超时：
+  - 先提高 `OPENAI_TIMEOUT_MS`
+  - 确认图片预处理已开启
+  - 优先测试简单图片，再测信息密集型截图
 
 ## 触发控制
-- 默认仅在群内 **@机器人** 且消息以 `/ai` 前缀时触发（可在 `.env` 配置）。
+- 默认群聊按 `@机器人` + 前缀控制；私聊默认可直接回复。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_PREFIXES=ai`：多个前缀用逗号分隔，如 `ai,chat`
@@ -159,6 +223,20 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_IMAGE_CONTEXT_MODE=ai`
   - `AI_IMAGE_CONTEXT_MAX`
   - `AI_IMAGE_ONLY_NO_CALL=true`
+- 图片预处理：
+  - 默认启用 `sharp` 预处理
+  - 会在发送给上游前按图片类型缩放 / 压缩
+  - 普通图片、截图、长图采用不同策略
+  - 预处理结果会按图片内容 hash 做进程内缓存
+- 关键配置：
+  - `AI_IMAGE_PREPROCESS_ENABLE=true`
+  - `AI_IMAGE_CACHE_ENABLE=true`
+  - `AI_IMAGE_CACHE_TTL=1800`
+  - `AI_IMAGE_PREPROCESS_MAX_EDGE=1568`
+  - `AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE=1400`
+  - `AI_IMAGE_PREPROCESS_LONG_MAX_EDGE=1080`
+  - `AI_IMAGE_PREPROCESS_JPEG_QUALITY=82`
+  - `AI_IMAGE_PREPROCESS_WEBP_QUALITY=86`
 
 ## 拍一拍与戳一戳
 - 监听 OneBot `notice.notify.poke`
@@ -189,3 +267,25 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 示例：
   - `PROMPT_FILE=prompt.txt`
   - 可使用项目中的 `prompt.py` 生成 `prompt.txt`
+
+## 推荐测试 Checklist
+- 部署前
+  - 确认已同步 `server.js`、`src/`、`package.json`、`.env`
+  - 在目标服务器执行 `npm install`
+  - 确认 `node_modules/sharp` 能在目标平台加载
+- 启动后
+  - `sudo systemctl status onebot-deepseek`
+  - `sudo journalctl -u onebot-deepseek -f`
+  - 确认 Napcat 已连接到 `ws://127.0.0.1:5000/onebot/v11/ws`
+- 功能测试
+  - 私聊普通文本回复
+  - 群聊触发回复
+  - 引用消息回复
+  - 简单图片回复
+  - 信息密集型截图回复
+  - 同图重复提问，观察是否更快
+  - 连续追问上下文相关问题
+- 日志核对
+  - 是否出现 `Agent step`
+  - 是否出现 `OpenAI成功`
+  - 图片失败时是否出现 `OpenAI失败` 或 `媒体下载失败`
