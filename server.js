@@ -2,63 +2,67 @@ const { WebSocketServer } = require('ws')
 const axios = require('axios')
 const fs = require('fs')
 const path = require('path')
-const { HttpsProxyAgent } = require('https-proxy-agent')
-require('dotenv').config()
+const config = require('./src/config')
+const { createSessionStore } = require('./src/session/store')
+const { extractOpenAIText } = require('./src/providers/openai')
+const { createDefaultToolRegistry } = require('./src/agent/tools')
+const { createAgentRunner } = require('./src/agent/runner')
+const { createMessageHandler } = require('./src/app/message-handler')
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 5000
-const PATH = process.env.ONEBOT_PATH || '/onebot/v11/ws'
-const PROVIDER = (process.env.LLM_PROVIDER || 'deepseek').toLowerCase()
-const MODEL = process.env.LLM_MODEL || process.env.DEEPSEEK_MODEL || (PROVIDER === 'gemini' ? 'gemini-1.5-flash' : PROVIDER === 'openai' ? 'gpt-3.5-turbo' : 'deepseek-chat')
-const API_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY || ''
-const API_URL = process.env.LLM_API_URL || process.env.DEEPSEEK_API_URL || (PROVIDER === 'openai' ? 'https://api.openai.com/v1/chat/completions' : 'https://api.deepseek.com/v1/chat/completions')
-const SYSTEM_PROMPT = (() => {
-  const f = process.env.PROMPT_FILE
-  if (f) {
-    const p = path.isAbsolute(f) ? f : path.join(__dirname, f)
-    try {
-      const s = fs.readFileSync(p, 'utf8').trim()
-      if (s) return s
-    } catch {}
-  }
-  return process.env.SYSTEM_PROMPT || '你是一个QQ群内的AI助手，回答简洁且有帮助。'
-})()
-const GEMINI_KEY = (process.env.LLM_PROVIDER === 'gemini' ? process.env.LLM_API_KEY : process.env.GEMINI_API_KEY) || ''
-const GEMINI_MODEL = (process.env.LLM_PROVIDER === 'gemini' ? process.env.LLM_MODEL : process.env.GEMINI_MODEL) || 'gemini-1.5-flash-latest'
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY || ''
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
-const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
-const HTTPS_AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined
-const REQUIRE_PREFIX = String(process.env.AI_REQUIRE_PREFIX || 'true').toLowerCase() === 'true'
-const PREFIXES = (process.env.AI_PREFIXES || '/ai').split(',').map((s) => s.trim()).filter(Boolean)
-const IGNORE_REGEX = process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : null
-const MAX_MEDIA_BYTES = parseInt(process.env.AI_MAX_MEDIA_BYTES || '5242880', 10)
-const MEDIA_REFERER = process.env.AI_MEDIA_REFERER || ''
-const OPENAI_KEY = process.env.OPENAI_API_KEY || ''
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
-const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || process.env.LLM_API_URL || 'https://api.openai.com/v1').replace(/\/+$/, '')
-const OPENAI_WIRE_API = (process.env.OPENAI_WIRE_API || '').toLowerCase()
-const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || ''
-const OPENAI_NETWORK_ACCESS = process.env.OPENAI_NETWORK_ACCESS || ''
-const AI_SIMPLE_MODE = String(process.env.AI_SIMPLE_MODE || 'false').toLowerCase() === 'true'
-const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '12000', 10)
-const AI_POKE_ENABLE = String(process.env.AI_POKE_ENABLE || 'true').toLowerCase() === 'true'
-const AI_POKE_COOLDOWN = parseInt(process.env.AI_POKE_COOLDOWN || '10', 10)
-const AI_POKE_REPLY_TEXT = process.env.AI_POKE_REPLY_TEXT || '拍了拍'
-const AI_CONTEXT_ENABLE = String(process.env.AI_CONTEXT_ENABLE || 'true').toLowerCase() === 'true'
-const AI_CONTEXT_WINDOW = parseInt(process.env.AI_CONTEXT_WINDOW || '6', 10)
-const AI_CONTEXT_TTL = parseInt(process.env.AI_CONTEXT_TTL || '900', 10)
-const AI_BAN_DURATION = parseInt(process.env.AI_BAN_DURATION || '600', 10)
-const AI_MOD_ENABLE = String(process.env.AI_MOD_ENABLE || 'true').toLowerCase() === 'true'
-const AI_IMAGE_CONTEXT_TTL = parseInt(process.env.AI_IMAGE_CONTEXT_TTL || '60', 10)
-const AI_IMAGE_CONTEXT_MODE = (process.env.AI_IMAGE_CONTEXT_MODE || 'rule').toLowerCase()
-const AI_IMAGE_CONTEXT_REQUIRE_HINTS = String(process.env.AI_IMAGE_CONTEXT_REQUIRE_HINTS || 'true').toLowerCase() === 'true'
-const AI_IMAGE_CONTEXT_REQUIRE_SAME_USER = String(process.env.AI_IMAGE_CONTEXT_REQUIRE_SAME_USER || 'true').toLowerCase() === 'true'
-const AI_IMAGE_HINT_REGEX = process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这个图|这图|这张图|这个图片|这张图片|图中|这幅图|图片里)/i
-const AI_IMAGE_CONTEXT_MAX = parseInt(process.env.AI_IMAGE_CONTEXT_MAX || '3', 10)
-const AI_IMAGE_ONLY_NO_CALL = String(process.env.AI_IMAGE_ONLY_NO_CALL || 'true').toLowerCase() === 'true'
-const BANNED_PATH = path.join(__dirname, 'banned.json')
+const {
+  PORT,
+  PATH: WS_PATH,
+  PROVIDER,
+  MODEL,
+  API_KEY,
+  API_URL,
+  SYSTEM_PROMPT,
+  GEMINI_KEY,
+  GEMINI_MODEL,
+  DEEPSEEK_KEY,
+  DEEPSEEK_MODEL,
+  HTTPS_AGENT,
+  REQUIRE_PREFIX,
+  PREFIXES,
+  IGNORE_REGEX,
+  MAX_MEDIA_BYTES,
+  MEDIA_REFERER,
+  OPENAI_KEY,
+  OPENAI_MODEL,
+  OPENAI_BASE_URL,
+  OPENAI_WIRE_API,
+  OPENAI_REASONING_EFFORT,
+  OPENAI_NETWORK_ACCESS,
+  AI_SIMPLE_MODE,
+  OPENAI_TIMEOUT_MS,
+  AI_POKE_ENABLE,
+  AI_POKE_COOLDOWN,
+  AI_POKE_REPLY_TEXT,
+  AI_CONTEXT_ENABLE,
+  AI_CONTEXT_WINDOW,
+  AI_CONTEXT_TTL,
+  AI_BAN_DURATION,
+  AI_MOD_ENABLE,
+  AI_IMAGE_CONTEXT_TTL,
+  AI_IMAGE_CONTEXT_MODE,
+  AI_IMAGE_CONTEXT_REQUIRE_HINTS,
+  AI_IMAGE_CONTEXT_REQUIRE_SAME_USER,
+  AI_IMAGE_HINT_REGEX,
+  AI_IMAGE_CONTEXT_MAX,
+  AI_IMAGE_ONLY_NO_CALL,
+  BANNED_PATH
+} = config
 
-const wss = new WebSocketServer({ port: PORT, path: PATH })
+const sessionStore = createSessionStore(config)
+const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext } = sessionStore
+const toolRegistry = createDefaultToolRegistry()
+const agentRunner = createAgentRunner({
+  toolRegistry,
+  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage })
+})
+const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
+
+const wss = new WebSocketServer({ port: PORT, path: WS_PATH })
 
 wss.on('listening', () => {
   try {
@@ -66,127 +70,38 @@ wss.on('listening', () => {
   } catch {}
 })
 
-const pending = new Map()
-const pokeCooldown = new Map()
-const sessionHist = new Map()
-const roleCache = new Map()
-const mediaCache = new Map()
+const onMessage = createMessageHandler({
+  pending,
+  pokeCooldown,
+  mediaCache,
+  getKey,
+  pushHistory,
+  sendAction,
+  extractContent,
+  resolveMediaSources,
+  checkMention,
+  checkModeration,
+  handleCommands,
+  shouldRespond,
+  stripPrefix,
+  getContext,
+  agentRunner,
+  buildReplySegments,
+  AI_POKE_ENABLE,
+  AI_POKE_COOLDOWN,
+  AI_POKE_REPLY_TEXT,
+  AI_POKE_ONLY_SELF,
+  AI_IMAGE_CONTEXT_TTL,
+  AI_IMAGE_CONTEXT_REQUIRE_HINTS,
+  AI_IMAGE_HINT_REGEX,
+  AI_IMAGE_CONTEXT_MODE,
+  AI_IMAGE_CONTEXT_REQUIRE_SAME_USER,
+  AI_IMAGE_CONTEXT_MAX,
+  AI_IMAGE_ONLY_NO_CALL
+})
 
 wss.on('connection', (ws) => {
-  ws.on('message', async (data) => {
-    let payload
-    try {
-      payload = JSON.parse(data.toString())
-    } catch {
-      return
-    }
-    if (payload && payload.echo && pending.has(payload.echo)) {
-      const r = pending.get(payload.echo)
-      pending.delete(payload.echo)
-      r(payload)
-      return
-    }
-    if (payload.post_type === 'notice' && payload.notice_type === 'notify' && payload.sub_type === 'poke') {
-      if (!AI_POKE_ENABLE) return
-      const ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
-      if (ONLY_SELF) {
-        const tgt = payload.target_id || payload.target || payload.receiver_id || payload.to_id
-        if (tgt && String(tgt) !== String(payload.self_id)) return
-      }
-      const gid = payload.group_id
-      const uid = payload.user_id
-      const key = `${gid || 'priv'}:${uid}`
-      const now = Date.now()
-      const last = pokeCooldown.get(key) || 0
-      if (now - last < AI_POKE_COOLDOWN * 1000) return
-      pokeCooldown.set(key, now)
-      if (gid) {
-        try {
-          const r = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
-          if (!(r && r.status === 'ok')) {
-            const msg = [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
-            await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg })
-          }
-        } catch {}
-      } else {
-        try {
-          const msg = [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
-          await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
-        } catch {}
-      }
-      return
-    }
-    if (payload.post_type !== 'message') return
-    const isGroup = payload.message_type === 'group'
-    const raw = extractContent(payload.message)
-    raw.media = await resolveMediaSources(ws, raw.media)
-    const key = getKey(payload)
-    let ctxImgUsed = false
-    if (raw.media && raw.media.length > 0) {
-      mediaCache.set(key, { media: raw.media.slice(0, AI_IMAGE_CONTEXT_MAX), ts: Date.now(), userId: payload.user_id })
-    } else {
-      const cached = mediaCache.get(key)
-      if (cached && Date.now() - cached.ts <= AI_IMAGE_CONTEXT_TTL * 1000) {
-        const textNow = String(raw.text || '')
-        let hintsOk = !AI_IMAGE_CONTEXT_REQUIRE_HINTS || AI_IMAGE_HINT_REGEX.test(textNow)
-        if (AI_IMAGE_CONTEXT_MODE === 'ai') hintsOk = true
-        const userOk = !AI_IMAGE_CONTEXT_REQUIRE_SAME_USER || String(payload.user_id) === String(cached.userId)
-        if (hintsOk && userOk) {
-          raw.media = (raw.media || []).concat(cached.media).slice(0, AI_IMAGE_CONTEXT_MAX)
-          ctxImgUsed = true
-        }
-      }
-    }
-    const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-    if (!mentioned) return
-    const content = raw
-    if ((!content.media || content.media.length === 0) && content.replyId) {
-      const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
-      if (resp && resp.status === 'ok' && resp.data && resp.data.message) {
-        const q = extractContent(resp.data.message)
-        q.media = await resolveMediaSources(ws, q.media)
-        const merged = content.media ? content.media.slice() : []
-        if (q.media && q.media.length) {
-          for (const m of q.media) {
-            merged.push(m)
-            if (merged.length >= AI_IMAGE_CONTEXT_MAX) break
-          }
-          content.media = merged
-        }
-        if (!content.text && q.text) content.text = q.text
-      }
-    }
-    if (isGroup) {
-      const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
-      if (ban) return
-    }
-    const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
-    if (cmdHandled) return
-    const hasText = Boolean(String(content.text || '').trim())
-    const hasMedia = Array.isArray(content.media) && content.media.length > 0
-    if (!hasText) {
-      if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
-      if (!hasMedia) return
-    }
-    const wantsReply = isGroup ? shouldRespond(content.text) : hasText
-    if (!wantsReply) {
-      return
-    }
-    const stripped = stripPrefix(content.text || '') || ((content.media && content.media.length > 0) ? '请描述这张图片' : '')
-    const hist = getContext(payload, stripped)
-    const aiText = await callLLM(stripped, content.media, hist, { contextImage: ctxImgUsed })
-    if (!aiText) return
-    const messageSegments = buildReplySegments(payload.message_id, aiText)
-    const action = isGroup ? 'send_group_msg' : 'send_private_msg'
-    const params = isGroup
-      ? { group_id: payload.group_id, message: messageSegments }
-      : { user_id: payload.user_id, message: messageSegments }
-    const frame = { action, params, echo: String(Date.now()) }
-    try {
-      ws.send(JSON.stringify(frame))
-    } catch {}
-    pushHistory(payload, stripped, aiText)
-  })
+  ws.on('message', (data) => onMessage(ws, data))
 })
 
 function extractContent(message) {
@@ -277,31 +192,6 @@ function sanitizeText(s) {
   t = t.replace(/\n{3,}/g, '\n\n')
   t = t.trim()
   return t.slice(0, 2000)
-}
-
-function extractOpenAIText(data) {
-  if (!data || typeof data !== 'object') return ''
-  if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim()
-  const chatContent = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
-  if (typeof chatContent === 'string' && chatContent.trim()) return chatContent.trim()
-  if (Array.isArray(chatContent)) {
-    const chatParts = []
-    for (const item of chatContent) {
-      if (item && typeof item.text === 'string' && item.text.trim()) chatParts.push(item.text.trim())
-    }
-    if (chatParts.length > 0) return chatParts.join('\n')
-  }
-  if (Array.isArray(data.output)) {
-    const outputParts = []
-    for (const item of data.output) {
-      if (!item || !Array.isArray(item.content)) continue
-      for (const part of item.content) {
-        if (part && typeof part.text === 'string' && part.text.trim()) outputParts.push(part.text.trim())
-      }
-    }
-    if (outputParts.length > 0) return outputParts.join('\n')
-  }
-  return ''
 }
 
 async function callGemini(text, media, opts) {
@@ -664,44 +554,6 @@ process.on('SIGINT', () => {
   try { wss.close() } catch {}
   process.exit(0)
 })
-
-function getKey(payload) {
-  const isGroup = payload.message_type === 'group'
-  return isGroup ? `g:${payload.group_id}` : `u:${payload.user_id}`
-}
-
-function pushHistory(payload, userText, aiText) {
-  if (!AI_CONTEXT_ENABLE) return
-  const k = getKey(payload)
-  const arr = sessionHist.get(k) || []
-  arr.push({ role: 'user', content: String(userText || '').slice(0, 2000), ts: Date.now() })
-  arr.push({ role: 'assistant', content: String(aiText || '').slice(0, 2000), ts: Date.now() })
-  while (arr.length > AI_CONTEXT_WINDOW * 2) arr.shift()
-  sessionHist.set(k, arr)
-}
-
-function getHistoryRaw(payload) {
-  const k = getKey(payload)
-  const arr = sessionHist.get(k) || []
-  const now = Date.now()
-  return arr.filter((x) => now - x.ts <= AI_CONTEXT_TTL * 1000)
-}
-
-function needContext(text) {
-  const t = String(text || '').trim()
-  if (!AI_CONTEXT_ENABLE) return false
-  if (t.length <= 12) return true
-  if (/继续|上文|刚才|前面|同样|还是|上述|之前/i.test(t)) return true
-  return false
-}
-
-function getContext(payload, userText) {
-  if (!needContext(userText)) return []
-  const raw = getHistoryRaw(payload)
-  const out = []
-  for (const h of raw) out.push({ role: h.role, content: h.content })
-  return out.slice(-AI_CONTEXT_WINDOW * 2)
-}
 
 function buildTextWithContext(text, hist) {
   if (!Array.isArray(hist) || hist.length === 0) return text
