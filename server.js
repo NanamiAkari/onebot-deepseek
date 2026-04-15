@@ -121,6 +121,16 @@ wss.on('connection', (ws) => {
   ws.on('message', (data) => onMessage(ws, data))
 })
 
+process.on('unhandledRejection', (reason) => {
+  const text = reason && reason.stack ? String(reason.stack) : String(reason)
+  console.log('unhandledRejection', text)
+})
+
+process.on('uncaughtException', (error) => {
+  const text = error && error.stack ? String(error.stack) : String(error)
+  console.log('uncaughtException', text)
+})
+
 function extractContent(message) {
   let text = ''
   const media = []
