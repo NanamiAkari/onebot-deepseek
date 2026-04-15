@@ -7,6 +7,7 @@ const { createSessionStore } = require('./src/session/store')
 const { extractOpenAIText } = require('./src/providers/openai')
 const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
+const { createToolExecutor } = require('./src/agent/tool-executor')
 const { createMessageHandler } = require('./src/app/message-handler')
 
 const {
@@ -56,9 +57,16 @@ const {
 const sessionStore = createSessionStore(config)
 const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
+const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw })
 const agentRunner = createAgentRunner({
   toolRegistry,
-  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage })
+  toolExecutor,
+  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage }),
+  invokeModelWithToolResult: async (input, toolResult) => {
+    const toolSummary = `工具 ${toolResult.name} 返回：${JSON.stringify(toolResult.result || '').slice(0, 1500)}`
+    const mergedHistory = (input.history || []).concat([{ role: 'system', content: toolSummary }])
+    return callLLM(input.message, input.media, mergedHistory, { contextImage: input.contextImage })
+  }
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 

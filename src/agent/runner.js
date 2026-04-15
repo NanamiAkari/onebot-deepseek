@@ -1,5 +1,14 @@
 function createAgentRunner(deps) {
-  const { toolRegistry, invokeModel } = deps
+  const { toolRegistry, toolExecutor, invokeModel, invokeModelWithToolResult } = deps
+
+  function normalizeModelOutput(output) {
+    if (!output) return { text: '', toolCalls: [] }
+    if (typeof output === 'string') return { text: output, toolCalls: [] }
+    return {
+      text: output.text ? String(output.text) : '',
+      toolCalls: Array.isArray(output.toolCalls) ? output.toolCalls : []
+    }
+  }
 
   async function run(input) {
     const tools = toolRegistry ? toolRegistry.list().map((tool) => ({
@@ -17,10 +26,27 @@ function createAgentRunner(deps) {
       tools
     }
 
-    const output = await invokeModel(agentInput)
+    const firstOutput = normalizeModelOutput(await invokeModel(agentInput))
+    if (!firstOutput.toolCalls.length || !toolExecutor) return firstOutput
+
+    const firstToolCall = firstOutput.toolCalls[0]
+    const toolResult = await toolExecutor.execute(firstToolCall.name, firstToolCall.arguments || {}, input.runtime || {})
+    if (!invokeModelWithToolResult) {
+      return {
+        text: firstOutput.text || '',
+        toolCalls: firstOutput.toolCalls,
+        toolResult
+      }
+    }
+
+    const secondOutput = normalizeModelOutput(await invokeModelWithToolResult(agentInput, {
+      name: firstToolCall.name,
+      arguments: firstToolCall.arguments || {},
+      result: toolResult
+    }))
     return {
-      text: output ? String(output) : '',
-      toolCalls: []
+      ...secondOutput,
+      toolCalls: firstOutput.toolCalls
     }
   }
 

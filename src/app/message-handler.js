@@ -132,6 +132,7 @@ function createMessageHandler(deps) {
       media: content.media,
       history: hist,
       contextImage: ctxImgUsed,
+      runtime: { ws, payload },
       session: {
         key,
         isGroup,
