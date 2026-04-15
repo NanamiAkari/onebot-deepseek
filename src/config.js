@@ -62,5 +62,13 @@ module.exports = {
   AI_IMAGE_HINT_REGEX: process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这个图|这图|这张图|这个图片|这张图片|图中|这幅图|图片里)/i,
   AI_IMAGE_CONTEXT_MAX: parseInt(process.env.AI_IMAGE_CONTEXT_MAX || '3', 10),
   AI_IMAGE_ONLY_NO_CALL: String(process.env.AI_IMAGE_ONLY_NO_CALL || 'true').toLowerCase() === 'true',
+  AI_IMAGE_PREPROCESS_ENABLE: String(process.env.AI_IMAGE_PREPROCESS_ENABLE || 'true').toLowerCase() === 'true',
+  AI_IMAGE_CACHE_ENABLE: String(process.env.AI_IMAGE_CACHE_ENABLE || 'true').toLowerCase() === 'true',
+  AI_IMAGE_CACHE_TTL: parseInt(process.env.AI_IMAGE_CACHE_TTL || '1800', 10),
+  AI_IMAGE_PREPROCESS_MAX_EDGE: parseInt(process.env.AI_IMAGE_PREPROCESS_MAX_EDGE || '1568', 10),
+  AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE: parseInt(process.env.AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE || '1400', 10),
+  AI_IMAGE_PREPROCESS_LONG_MAX_EDGE: parseInt(process.env.AI_IMAGE_PREPROCESS_LONG_MAX_EDGE || '1080', 10),
+  AI_IMAGE_PREPROCESS_JPEG_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_JPEG_QUALITY || '82', 10),
+  AI_IMAGE_PREPROCESS_WEBP_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_WEBP_QUALITY || '86', 10),
   BANNED_PATH: path.join(PROJECT_ROOT, 'banned.json')
 }

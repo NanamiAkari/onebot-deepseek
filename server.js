@@ -1,7 +1,9 @@
 const { WebSocketServer } = require('ws')
 const axios = require('axios')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
+const sharp = require('sharp')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
 const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
@@ -52,6 +54,14 @@ const {
   AI_IMAGE_HINT_REGEX,
   AI_IMAGE_CONTEXT_MAX,
   AI_IMAGE_ONLY_NO_CALL,
+  AI_IMAGE_PREPROCESS_ENABLE,
+  AI_IMAGE_CACHE_ENABLE,
+  AI_IMAGE_CACHE_TTL,
+  AI_IMAGE_PREPROCESS_MAX_EDGE,
+  AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE,
+  AI_IMAGE_PREPROCESS_LONG_MAX_EDGE,
+  AI_IMAGE_PREPROCESS_JPEG_QUALITY,
+  AI_IMAGE_PREPROCESS_WEBP_QUALITY,
   BANNED_PATH
 } = config
 
@@ -67,6 +77,7 @@ const agentRunner = createAgentRunner({
   maxSteps: 5
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
+const processedImageCache = new Map()
 
 const wss = new WebSocketServer({ port: PORT, path: WS_PATH })
 
@@ -515,6 +526,103 @@ function detectMimeFromExt(filePath) {
     : 'application/octet-stream'
 }
 
+function isImageMime(mime) {
+  return typeof mime === 'string' && /^image\//i.test(mime)
+}
+
+function isLikelyScreenshot(meta, mime) {
+  if (!meta || !meta.width || !meta.height) return false
+  // Most QQ screenshots are PNG; treat as screenshot-like when PNG or very text-heavy ratio.
+  if (mime === 'image/png') return true
+  const ratio = meta.height / meta.width
+  return ratio >= 1.6
+}
+
+function isLongImage(meta) {
+  if (!meta || !meta.width || !meta.height) return false
+  const ratio = meta.height / meta.width
+  return ratio >= 2.6
+}
+
+function hashBuffer(buf) {
+  return crypto.createHash('sha1').update(buf).digest('hex')
+}
+
+function getCachedProcessed(key) {
+  if (!AI_IMAGE_CACHE_ENABLE) return null
+  const hit = processedImageCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.ts > AI_IMAGE_CACHE_TTL * 1000) {
+    processedImageCache.delete(key)
+    return null
+  }
+  return hit
+}
+
+function setCachedProcessed(key, value) {
+  if (!AI_IMAGE_CACHE_ENABLE) return
+  processedImageCache.set(key, { ...value, ts: Date.now() })
+  // cheap bounded size
+  if (processedImageCache.size > 256) {
+    const firstKey = processedImageCache.keys().next().value
+    if (firstKey) processedImageCache.delete(firstKey)
+  }
+}
+
+async function preprocessImageBuffer(buf, mime) {
+  if (!AI_IMAGE_PREPROCESS_ENABLE) return { buf, mime }
+  if (!buf || buf.length < 16) return { buf, mime }
+  if (!isImageMime(mime)) return { buf, mime }
+
+  // Cache by content hash + strategy parameters.
+  const cacheKey = `v1:${mime}:${AI_IMAGE_PREPROCESS_MAX_EDGE}:${AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE}:${AI_IMAGE_PREPROCESS_LONG_MAX_EDGE}:${AI_IMAGE_PREPROCESS_JPEG_QUALITY}:${AI_IMAGE_PREPROCESS_WEBP_QUALITY}:${hashBuffer(buf)}`
+  const cached = getCachedProcessed(cacheKey)
+  if (cached && cached.data && cached.mime) {
+    return { buf: Buffer.from(cached.data, 'base64'), mime: cached.mime }
+  }
+
+  let img = sharp(buf, { failOnError: false })
+  let meta
+  try {
+    meta = await img.metadata()
+  } catch {
+    return { buf, mime }
+  }
+
+  const maxEdge = AI_IMAGE_PREPROCESS_MAX_EDGE
+  const screenMax = AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE
+  const longMax = AI_IMAGE_PREPROCESS_LONG_MAX_EDGE
+  const targetMax = isLongImage(meta) ? longMax : (isLikelyScreenshot(meta, mime) ? screenMax : maxEdge)
+
+  const width = meta.width || 0
+  const height = meta.height || 0
+  const needResize = width > targetMax || height > targetMax
+  if (needResize) {
+    img = img.resize({ width: targetMax, height: targetMax, fit: 'inside', withoutEnlargement: true })
+  }
+
+  // Prefer jpeg for speed unless original is png and looks like screenshot (preserve text clarity).
+  let outMime = mime
+  let outBuf = buf
+  try {
+    if (mime === 'image/png' && isLikelyScreenshot(meta, mime)) {
+      outBuf = await img.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
+      outMime = 'image/png'
+    } else if (mime === 'image/webp') {
+      outBuf = await img.webp({ quality: AI_IMAGE_PREPROCESS_WEBP_QUALITY }).toBuffer()
+      outMime = 'image/webp'
+    } else {
+      outBuf = await img.jpeg({ quality: AI_IMAGE_PREPROCESS_JPEG_QUALITY, mozjpeg: true }).toBuffer()
+      outMime = 'image/jpeg'
+    }
+  } catch {
+    return { buf, mime }
+  }
+
+  setCachedProcessed(cacheKey, { mime: outMime, data: outBuf.toString('base64') })
+  return { buf: outBuf, mime: outMime }
+}
+
 async function toOpenAIImageUrl(media) {
   if (!media) return ''
   const candidates = [media.localPath, media.file, media.url].filter(Boolean)
@@ -553,7 +661,8 @@ async function sourceToBase64(src) {
       const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
       const buf = fs.readFileSync(p)
       const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      return { mime, data: buf.toString('base64') }
+      const processed = await preprocessImageBuffer(buf, mime)
+      return { mime: processed.mime, data: processed.buf.toString('base64') }
     } catch {
       return null
     }
@@ -563,7 +672,8 @@ async function sourceToBase64(src) {
       const p = decodeURIComponent(src)
       const buf = fs.readFileSync(p)
       const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      return { mime, data: buf.toString('base64') }
+      const processed = await preprocessImageBuffer(buf, mime)
+      return { mime: processed.mime, data: processed.buf.toString('base64') }
     } catch {
       // fallthrough
     }
@@ -585,8 +695,8 @@ async function sourceToBase64(src) {
       const ct = (res.headers && res.headers['content-type']) || ''
       const buf = Buffer.from(res.data)
       const mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
-      const data = buf.toString('base64')
-      return { mime, data }
+      const processed = await preprocessImageBuffer(buf, mime)
+      return { mime: processed.mime, data: processed.buf.toString('base64') }
     } catch (e) {
       const status = e && e.response && e.response.status
       console.log('媒体下载失败', status || '')
