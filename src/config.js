@@ -70,5 +70,14 @@ module.exports = {
   AI_IMAGE_PREPROCESS_LONG_MAX_EDGE: parseInt(process.env.AI_IMAGE_PREPROCESS_LONG_MAX_EDGE || '1080', 10),
   AI_IMAGE_PREPROCESS_JPEG_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_JPEG_QUALITY || '82', 10),
   AI_IMAGE_PREPROCESS_WEBP_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_WEBP_QUALITY || '86', 10),
+  AI_OCR_ENABLE: String(process.env.AI_OCR_ENABLE || 'true').toLowerCase() === 'true',
+  AI_OCR_LANG: process.env.AI_OCR_LANG || 'eng+jpn+chi_sim',
+  AI_OCR_TIMEOUT_MS: parseInt(process.env.AI_OCR_TIMEOUT_MS || '45000', 10),
+  AI_OCR_CACHE_ENABLE: String(process.env.AI_OCR_CACHE_ENABLE || 'true').toLowerCase() === 'true',
+  AI_OCR_CACHE_TTL: parseInt(process.env.AI_OCR_CACHE_TTL || '1800', 10),
+  AI_OCR_MAX_CHARS: parseInt(process.env.AI_OCR_MAX_CHARS || '3000', 10),
+  AI_OCR_TRIGGER_REGEX: process.env.AI_OCR_TRIGGER_REGEX ? new RegExp(process.env.AI_OCR_TRIGGER_REGEX, 'i') : /(写了什么|文字|识别|ocr|翻译|读图|内容|标题|地名|地图|哪个|哪一个|都道府县|县市|是什么字)/i,
+  AI_OCR_ONLY_TEXT_REGEX: process.env.AI_OCR_ONLY_TEXT_REGEX ? new RegExp(process.env.AI_OCR_ONLY_TEXT_REGEX, 'i') : /(写了什么|提取.*文字|识别.*文字|ocr|翻译|读出|图中.*字|图片.*字|截图.*字)/i,
+  AI_OCR_MIN_TEXT_LENGTH: parseInt(process.env.AI_OCR_MIN_TEXT_LENGTH || '12', 10),
   BANNED_PATH: path.join(PROJECT_ROOT, 'banned.json')
 }

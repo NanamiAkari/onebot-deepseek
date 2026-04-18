@@ -26,6 +26,14 @@ function createAgentRunner(deps) {
     }
   }
 
+  function buildCallSignature(name, args) {
+    try {
+      return `${name}:${JSON.stringify(args || {})}`
+    } catch {
+      return `${name}:[unserializable]`
+    }
+  }
+
   async function run(input) {
     const tools = toolRegistry ? toolRegistry.list().map((tool) => ({
       name: tool.name,
@@ -46,6 +54,9 @@ function createAgentRunner(deps) {
 
     const executedToolCalls = []
     let finalText = ''
+    const toolBudgets = new Map([['history', 1]])
+    let lastSignature = ''
+    let repeatCount = 0
 
     for (let step = 0; step < maxSteps; step += 1) {
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
@@ -70,6 +81,30 @@ function createAgentRunner(deps) {
       if (output.text) finalText = output.text
 
       const currentCall = output.toolCalls[0]
+      const signature = buildCallSignature(currentCall.name, currentCall.arguments || {})
+      const usedCount = executedToolCalls.filter((x) => x.name === currentCall.name).length
+      const toolBudget = toolBudgets.get(currentCall.name)
+      if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
+        console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} 已达到调用上限，停止循环`)
+        return {
+          text: finalText || '工具调用次数达到限制，请简化问题后重试',
+          toolCalls: executedToolCalls,
+          steps: step + 1,
+          stoppedReason: `budget:${currentCall.name}`
+        }
+      }
+      if (signature === lastSignature) repeatCount += 1
+      else repeatCount = 1
+      lastSignature = signature
+      if (repeatCount >= 2) {
+        console.log(`Agent step ${step + 1}/${maxSteps}: 检测到重复工具调用 ${currentCall.name}，停止循环`)
+        return {
+          text: finalText || '检测到重复工具调用，请换一种问法后重试',
+          toolCalls: executedToolCalls,
+          steps: step + 1,
+          stoppedReason: `repeat:${currentCall.name}`
+        }
+      }
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用工具 ${currentCall.name} args=${summarizeArguments(currentCall.arguments || {})}`)
       const toolResult = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
       const toolEntry = {

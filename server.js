@@ -4,6 +4,7 @@ const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const sharp = require('sharp')
+const Tesseract = require('tesseract.js')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
 const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
@@ -62,6 +63,15 @@ const {
   AI_IMAGE_PREPROCESS_LONG_MAX_EDGE,
   AI_IMAGE_PREPROCESS_JPEG_QUALITY,
   AI_IMAGE_PREPROCESS_WEBP_QUALITY,
+  AI_OCR_ENABLE,
+  AI_OCR_LANG,
+  AI_OCR_TIMEOUT_MS,
+  AI_OCR_CACHE_ENABLE,
+  AI_OCR_CACHE_TTL,
+  AI_OCR_MAX_CHARS,
+  AI_OCR_TRIGGER_REGEX,
+  AI_OCR_ONLY_TEXT_REGEX,
+  AI_OCR_MIN_TEXT_LENGTH,
   BANNED_PATH
 } = config
 
@@ -78,6 +88,7 @@ const agentRunner = createAgentRunner({
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 const processedImageCache = new Map()
+const ocrTextCache = new Map()
 
 const wss = new WebSocketServer({ port: PORT, path: WS_PATH })
 
@@ -272,7 +283,16 @@ async function callGemini(text, media, opts) {
 
 async function callOpenAI(text, media, hist, opts) {
   if (!OPENAI_KEY) return null
-  const imageCount = Array.isArray(media) ? media.filter((m) => m && m.kind === 'image').length : 0
+  let effectiveMedia = Array.isArray(media) ? media.slice() : []
+  const ocrContext = await buildOCRAssistContext(text, effectiveMedia)
+  const ocrOnly = ocrContext && ocrContext.mode === 'ocr_only'
+  if (ocrOnly) {
+    effectiveMedia = []
+    console.log(`OCR-first: 使用 OCR-only 路径 confidence=${ocrContext.confidence || 0}`)
+  } else if (ocrContext) {
+    console.log(`OCR-first: 使用 OCR-assist 路径 confidence=${ocrContext.confidence || 0}`)
+  }
+  const imageCount = Array.isArray(effectiveMedia) ? effectiveMedia.filter((m) => m && m.kind === 'image').length : 0
   const requestTimeout = imageCount > 0 ? Math.max(OPENAI_TIMEOUT_MS, 60000) : OPENAI_TIMEOUT_MS
   try {
     console.log('调用OpenAI')
@@ -284,10 +304,15 @@ async function callOpenAI(text, media, hist, opts) {
       if (useResponses) content.push({ type: 'input_text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
       else content.push({ type: 'text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
     }
+    if (ocrContext && ocrContext.text) {
+      const ocrPrompt = `以下是服务端 OCR 提取结果，可能存在少量识别误差。请优先利用这些文本进行判断；若仍附带图片，则以图片为最终校验依据。\n${ocrContext.text}`
+      if (useResponses) content.push({ type: 'input_text', text: ocrPrompt })
+      else content.push({ type: 'text', text: ocrPrompt })
+    }
     if (useResponses) content.push({ type: 'input_text', text: text || 'Hello' })
     else content.push({ type: 'text', text: text || 'Hello' })
-    if (Array.isArray(media) && media.length > 0) {
-      const limited = media.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
+    if (Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
+      const limited = effectiveMedia.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
       for (const m of limited) {
         const imageUrl = await toOpenAIImageUrl(m)
         if (!imageUrl) continue
@@ -362,10 +387,10 @@ async function callOpenAI(text, media, hist, opts) {
     if (!contentText && toolCalls.length === 0) return null
     console.log('OpenAI成功')
     const txt = String(contentText || '').slice(0, 2000)
-    if (txt && Array.isArray(media) && media.length > 0) {
+    if (txt && Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
       const ignoreHints = /(未提供(对应)?图片|无法识别到你提供的图片|暂时无法解答|请你补充相关信息)/i
       if (ignoreHints.test(txt)) {
-        const again = await callGemini(text, media, opts)
+        const again = await callGemini(text, effectiveMedia, opts)
         if (again) return { text: String(again).slice(0, 2000), toolCalls }
       }
     }
@@ -579,6 +604,39 @@ function setCachedProcessed(key, value) {
   }
 }
 
+function getCachedOcr(key) {
+  if (!AI_OCR_CACHE_ENABLE) return null
+  const hit = ocrTextCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.ts > AI_OCR_CACHE_TTL * 1000) {
+    ocrTextCache.delete(key)
+    return null
+  }
+  return hit
+}
+
+function setCachedOcr(key, value) {
+  if (!AI_OCR_CACHE_ENABLE) return
+  ocrTextCache.set(key, { ...value, ts: Date.now() })
+  if (ocrTextCache.size > 256) {
+    const firstKey = ocrTextCache.keys().next().value
+    if (firstKey) ocrTextCache.delete(firstKey)
+  }
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`ocr timeout ${ms}ms`)), ms)
+    promise.then((value) => {
+      clearTimeout(timer)
+      resolve(value)
+    }).catch((error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
 async function preprocessImageBuffer(buf, mime) {
   if (!AI_IMAGE_PREPROCESS_ENABLE) return { buf, mime }
   if (!buf || buf.length < 16) return { buf, mime }
@@ -633,6 +691,132 @@ async function preprocessImageBuffer(buf, mime) {
   return { buf: outBuf, mime: outMime }
 }
 
+async function preprocessOCRBuffer(buf, mime) {
+  if (!buf || buf.length < 16 || !isImageMime(mime)) return { buf, mime }
+  try {
+    let img = sharp(buf, { failOnError: false }).rotate()
+    const meta = await img.metadata()
+    const width = meta.width || 0
+    const height = meta.height || 0
+    const targetMax = isLongImage(meta) ? AI_IMAGE_PREPROCESS_LONG_MAX_EDGE : (isLikelyScreenshot(meta, mime) ? Math.max(AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE, 1600) : Math.max(AI_IMAGE_PREPROCESS_MAX_EDGE, 1600))
+    if (width > targetMax || height > targetMax) {
+      img = img.resize({ width: targetMax, height: targetMax, fit: 'inside', withoutEnlargement: true })
+    }
+    const outBuf = await img.grayscale().normalize().sharpen().png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
+    return { buf: outBuf, mime: 'image/png', meta }
+  } catch {
+    return { buf, mime }
+  }
+}
+
+async function sourceToBuffer(src, purpose = 'vision') {
+  if (!src) return null
+  let buf = null
+  let mime = 'application/octet-stream'
+  if (/^base64:\/\//i.test(src)) {
+    buf = Buffer.from(src.replace(/^base64:\/\//i, ''), 'base64')
+    mime = detectMimeFromBuffer(buf, mime)
+  } else if (/^data:/i.test(src)) {
+    const i = src.indexOf(',')
+    if (i <= 0) return null
+    const head = src.slice(0, i)
+    const data = src.slice(i + 1)
+    const mimeMatch = head.match(/^data:([^;]+)/i)
+    mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream'
+    buf = Buffer.from(data, 'base64')
+  } else if (/^file:\/\//i.test(src)) {
+    const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
+    buf = fs.readFileSync(p)
+    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
+  } else if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
+    const p = decodeURIComponent(src)
+    buf = fs.readFileSync(p)
+    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
+  } else if (/^https?:\/\//i.test(src)) {
+    const headers = { 'User-Agent': 'Mozilla/5.0' }
+    if (MEDIA_REFERER) {
+      headers.Referer = MEDIA_REFERER
+    } else {
+      try {
+        const u = new URL(src)
+        const host = u.hostname || ''
+        if (/qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host)) headers.Referer = 'https://gchat.qpic.cn'
+        else if (/qun\.qq\.com$/i.test(host)) headers.Referer = 'https://qun.qq.com'
+      } catch {}
+    }
+    const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
+    buf = Buffer.from(res.data)
+    const ct = (res.headers && res.headers['content-type']) || ''
+    mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
+  } else {
+    return null
+  }
+
+  const processed = purpose === 'ocr'
+    ? await preprocessOCRBuffer(buf, mime)
+    : await preprocessImageBuffer(buf, mime)
+  return { buf: processed.buf, mime: processed.mime, meta: processed.meta || null }
+}
+
+function isTextHeavyQuestion(text) {
+  return AI_OCR_ONLY_TEXT_REGEX.test(String(text || ''))
+}
+
+function shouldTryOCRFirst(text, media) {
+  if (!AI_OCR_ENABLE) return false
+  if (!Array.isArray(media) || media.length === 0) return false
+  const images = media.filter((m) => m && m.kind === 'image')
+  if (images.length === 0) return false
+  return AI_OCR_TRIGGER_REGEX.test(String(text || ''))
+}
+
+async function recognizeTextFromImageSource(src) {
+  const source = await sourceToBuffer(src, 'ocr')
+  if (!source || !source.buf || !isImageMime(source.mime)) return null
+  const cacheKey = `ocr:v1:${AI_OCR_LANG}:${hashBuffer(source.buf)}`
+  const cached = getCachedOcr(cacheKey)
+  if (cached) return cached
+  const ocrPromise = Tesseract.recognize(source.buf, AI_OCR_LANG, {})
+  const result = await withTimeout(ocrPromise, AI_OCR_TIMEOUT_MS)
+  const text = String(result && result.data && result.data.text || '').replace(/\n{3,}/g, '\n\n').trim()
+  const confidence = Number(result && result.data && result.data.confidence || 0)
+  const payload = {
+    text: text.slice(0, AI_OCR_MAX_CHARS),
+    confidence,
+    hasEnoughText: text.replace(/\s+/g, '').length >= AI_OCR_MIN_TEXT_LENGTH
+  }
+  setCachedOcr(cacheKey, payload)
+  return payload
+}
+
+async function buildOCRAssistContext(text, media) {
+  if (!shouldTryOCRFirst(text, media)) return null
+  const images = media.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
+  const chunks = []
+  let bestConfidence = 0
+  for (let i = 0; i < images.length; i += 1) {
+    const src = images[i].localPath || images[i].file || images[i].url
+    if (!src) continue
+    try {
+      const ocr = await recognizeTextFromImageSource(src)
+      if (!ocr || !ocr.text) continue
+      bestConfidence = Math.max(bestConfidence, ocr.confidence || 0)
+      chunks.push(`[图片${i + 1} OCR]\n${ocr.text}`)
+    } catch (error) {
+      console.log('OCR失败', error && error.message ? String(error.message) : String(error))
+    }
+  }
+  if (chunks.length === 0) return null
+  const mergedText = chunks.join('\n\n').slice(0, AI_OCR_MAX_CHARS)
+  const enoughText = mergedText.replace(/\s+/g, '').length >= AI_OCR_MIN_TEXT_LENGTH
+  const ocrOnly = enoughText && isTextHeavyQuestion(text)
+  return {
+    mode: ocrOnly ? 'ocr_only' : 'ocr_assist',
+    text: mergedText,
+    confidence: bestConfidence
+  }
+}
+
 async function toOpenAIImageUrl(media) {
   if (!media) return ''
   const candidates = [media.localPath, media.file, media.url].filter(Boolean)
@@ -651,69 +835,15 @@ async function toOpenAIImageUrl(media) {
 
 async function sourceToBase64(src) {
   if (!src) return null
-  if (/^base64:\/\//i.test(src)) {
-    const data = src.replace(/^base64:\/\//i, '')
-    return { mime: 'application/octet-stream', data }
-  }
-  if (/^data:/i.test(src)) {
-    const i = src.indexOf(',')
-    if (i > 0) {
-      const head = src.slice(0, i)
-      const data = src.slice(i + 1)
-      const mimeMatch = head.match(/^data:([^;]+)/i)
-      const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream'
-      return { mime, data }
-    }
+  try {
+    const source = await sourceToBuffer(src, 'vision')
+    if (!source || !source.buf) return null
+    return { mime: source.mime, data: source.buf.toString('base64') }
+  } catch (e) {
+    const status = e && e.response && e.response.status
+    console.log('媒体下载失败', status || '')
     return null
   }
-  if (/^file:\/\//i.test(src)) {
-    try {
-      const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
-      const buf = fs.readFileSync(p)
-      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch {
-      return null
-    }
-  }
-  if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
-    try {
-      const p = decodeURIComponent(src)
-      const buf = fs.readFileSync(p)
-      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch {
-      // fallthrough
-    }
-  }
-  if (/^https?:\/\//i.test(src)) {
-    try {
-      const headers = { 'User-Agent': 'Mozilla/5.0' }
-      if (MEDIA_REFERER) {
-        headers.Referer = MEDIA_REFERER
-      } else {
-        try {
-          const u = new URL(src)
-          const host = u.hostname || ''
-          if (/qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host)) headers.Referer = 'https://gchat.qpic.cn'
-          else if (/qun\.qq\.com$/i.test(host)) headers.Referer = 'https://qun.qq.com'
-        } catch {}
-      }
-      const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
-      const ct = (res.headers && res.headers['content-type']) || ''
-      const buf = Buffer.from(res.data)
-      const mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch (e) {
-      const status = e && e.response && e.response.status
-      console.log('媒体下载失败', status || '')
-      return null
-    }
-  }
-  return null
 }
 process.on('SIGINT', () => {
   try { wss.close() } catch {}
