@@ -11,6 +11,7 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    shouldIgnoreText,
     shouldRespond,
     stripPrefix,
     getContext,
@@ -120,6 +121,7 @@ function createMessageHandler(deps) {
       if (cmdHandled) return
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
+      if (hasText && shouldIgnoreText(content.text)) return
       if (!hasText) {
         if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
         if (!hasMedia) return

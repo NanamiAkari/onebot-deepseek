@@ -18,6 +18,7 @@ function readSystemPrompt() {
 }
 
 const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+const DEFAULT_IGNORE_REGEX = /^(?:pjsk|b30|msa|msp|mysekai|tsearch|song|taikoupdate|taikorec|taikob|taikotrend|wlsk|sekai|qooapp|cnmusicupdate|cnmusicdiffupdate|sk预测|查房|分数线|段位进度|live订阅)(?:\s|$)/i
 
 module.exports = {
   PROJECT_ROOT,
@@ -36,7 +37,7 @@ module.exports = {
   HTTPS_AGENT: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
   REQUIRE_PREFIX: String(process.env.AI_REQUIRE_PREFIX || 'true').toLowerCase() === 'true',
   PREFIXES: (process.env.AI_PREFIXES || '/ai').split(',').map((s) => s.trim()).filter(Boolean),
-  IGNORE_REGEX: process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : null,
+  IGNORE_REGEX: process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : DEFAULT_IGNORE_REGEX,
   MAX_MEDIA_BYTES: parseInt(process.env.AI_MAX_MEDIA_BYTES || '5242880', 10),
   MEDIA_REFERER: process.env.AI_MEDIA_REFERER || '',
   OPENAI_KEY: process.env.OPENAI_API_KEY || '',

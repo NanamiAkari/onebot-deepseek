@@ -110,6 +110,7 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  shouldIgnoreText,
   shouldRespond,
   stripPrefix,
   getContext,
@@ -194,9 +195,15 @@ function checkMention(message, selfId) {
 function shouldRespond(text) {
   const t = String(text || '').trim()
   if (!t) return false
-  if (IGNORE_REGEX && IGNORE_REGEX.test(t)) return false
+  if (shouldIgnoreText(t)) return false
   if (!REQUIRE_PREFIX) return true
   return PREFIXES.some((p) => t.startsWith(p))
+}
+
+function shouldIgnoreText(text) {
+  const t = String(text || '').trim()
+  if (!t) return false
+  return Boolean(IGNORE_REGEX && IGNORE_REGEX.test(t))
 }
 
 function stripPrefix(text) {

@@ -197,13 +197,36 @@ sudo systemctl restart onebot-deepseek
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_PREFIXES=ai`：多个前缀用逗号分隔，如 `ai,chat`
-  - `AI_IGNORE_REGEX=`：忽略的命令正则，如 `^(pjsk|b30)\\b`
+  - `AI_IGNORE_REGEX=`：忽略其他 WS 服务命令的正则；群聊和私聊都会生效
 - 示例：仅对 `ai` 生效，并忽略 `pjsk b30`：
 ```
 AI_REQUIRE_PREFIX=true
 AI_PREFIXES=ai
 AI_IGNORE_REGEX=^(pjsk|b30)\b
 ```
+- 默认已内置一组较保守的 Sakura bot 常见命令前缀屏蔽，例如：
+  - `pjsk`
+  - `b30`
+  - `msa`
+  - `msp`
+  - `mysekai`
+  - `tsearch`
+  - `song`
+  - `taikoupdate`
+  - `taikorec`
+  - `taikob`
+  - `taikotrend`
+  - `wlsk`
+  - `sekai`
+  - `qooapp`
+  - `cnmusicupdate`
+  - `cnmusicdiffupdate`
+  - `sk预测`
+  - `查房`
+  - `分数线`
+  - `段位进度`
+  - `live订阅`
+- 如果你还有其他同机 WS 服务命令，可以继续追加到 `AI_IGNORE_REGEX`
 
 ## 多媒体与图片缓存
 - 支持图片输入；会在调用上游前把图片下载并转为 base64 / `image_url`
