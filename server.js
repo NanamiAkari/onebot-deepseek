@@ -141,6 +141,10 @@ function savePokeReplyTexts(list) {
   return items.slice()
 }
 
+function dedupeTextList(list) {
+  return Array.from(new Set(normalizeTextList(list)))
+}
+
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
 }
@@ -1059,6 +1063,47 @@ async function handleCommands(ws, payload, text) {
       items.push(content)
       const saved = savePokeReplyTexts(items)
       await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+      return true
+    }
+    const removeMatch = nt.match(/(?:回复|文案)(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+    if (removeMatch) {
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
+        return true
+      }
+      const content = String(removeMatch[1] || '').trim()
+      if (!content) {
+        await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
+        return true
+      }
+      const items = refreshPokeReplyTexts()
+      const nextItems = items.filter((item) => item !== content)
+      if (nextItems.length === items.length) {
+        await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
+        return true
+      }
+      const saved = savePokeReplyTexts(nextItems)
+      await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+      return true
+    }
+    if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt)) {
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能清空拍一拍文案')
+        return true
+      }
+      savePokeReplyTexts([])
+      await replyCommandMessage(ws, payload, '拍一拍文案已清空')
+      return true
+    }
+    if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt)) {
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能去重拍一拍文案')
+        return true
+      }
+      const items = refreshPokeReplyTexts()
+      const saved = savePokeReplyTexts(dedupeTextList(items))
+      const removedCount = items.length - saved.length
+      await replyCommandMessage(ws, payload, `拍一拍文案已去重，移除 ${removedCount} 条重复项，当前共 ${saved.length} 条`)
       return true
     }
     if (isAdminUser) {
