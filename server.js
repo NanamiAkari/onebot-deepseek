@@ -28,7 +28,9 @@ const {
   DEEPSEEK_MODEL,
   HTTPS_AGENT,
   REQUIRE_PREFIX,
+  GROUP_REQUIRE_MENTION,
   PREFIXES,
+  ADMIN_USER_IDS,
   IGNORE_REGEX,
   MAX_MEDIA_BYTES,
   MEDIA_REFERER,
@@ -42,7 +44,9 @@ const {
   OPENAI_TIMEOUT_MS,
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
+  AI_POKE_REPLY_FILE,
   AI_POKE_REPLY_TEXT,
+  AI_POKE_REPLY_TEXTS,
   AI_CONTEXT_ENABLE,
   AI_CONTEXT_WINDOW,
   AI_CONTEXT_TTL,
@@ -76,7 +80,7 @@ const {
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext } = sessionStore
+const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
 const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
@@ -89,6 +93,57 @@ const agentRunner = createAgentRunner({
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 const processedImageCache = new Map()
 const ocrTextCache = new Map()
+let currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+
+function resolveProjectFile(filePath) {
+  return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
+}
+
+function getPokeReplyFilePath() {
+  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.txt')
+}
+
+function normalizeTextList(lines) {
+  return lines.map((s) => String(s || '').trim()).filter((s) => s)
+}
+
+function loadPokeReplyTextsFromFile() {
+  try {
+    const filePath = getPokeReplyFilePath()
+    if (!fs.existsSync(filePath)) return []
+    return normalizeTextList(
+      fs.readFileSync(filePath, 'utf8')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s && !s.startsWith('#'))
+    )
+  } catch {
+    return []
+  }
+}
+
+function refreshPokeReplyTexts() {
+  const fileItems = loadPokeReplyTextsFromFile()
+  if (fileItems.length > 0) currentPokeReplyTexts = fileItems
+  else currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+  return currentPokeReplyTexts.slice()
+}
+
+function getPokeReplyTexts() {
+  return currentPokeReplyTexts.slice()
+}
+
+function savePokeReplyTexts(list) {
+  const items = normalizeTextList(list)
+  const filePath = getPokeReplyFilePath()
+  fs.writeFileSync(filePath, `${items.join('\n')}\n`, 'utf8')
+  currentPokeReplyTexts = items
+  return items.slice()
+}
+
+function isConfiguredAdmin(userId) {
+  return ADMIN_USER_IDS.includes(String(userId || ''))
+}
 
 const wss = new WebSocketServer({ port: PORT, path: WS_PATH })
 
@@ -111,6 +166,7 @@ const onMessage = createMessageHandler({
   checkModeration,
   handleCommands,
   shouldIgnoreText,
+  GROUP_REQUIRE_MENTION,
   shouldRespond,
   stripPrefix,
   getContext,
@@ -119,6 +175,8 @@ const onMessage = createMessageHandler({
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_TEXT,
+  AI_POKE_REPLY_TEXTS,
+  getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -931,6 +989,16 @@ async function getUserRole(ws, groupId, userId) {
   if (info && info.status === 'ok' && info.data && info.data.role) role = info.data.role
   return role
 }
+
+async function replyCommandMessage(ws, payload, text) {
+  const msg = [{ type: 'text', data: { text } }]
+  if (payload.message_type === 'group') {
+    await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
+  } else {
+    await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => {})
+  }
+}
+
 async function handleCommands(ws, payload, text) {
   const t = String(stripPrefix(text || '')).trim()
   const nt = t.replace(/\s+/g, ' ')
@@ -939,17 +1007,15 @@ async function handleCommands(ws, payload, text) {
   const isPoke = /^(poke|拍一拍)/i.test(nt)
   if (!isBanned && !isContext && !isPoke) return false
   const isGroup = payload.message_type === 'group'
-  const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'owner'
+  const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
+  const isAdminUser = roleUser === 'owner' || roleUser === 'admin' || isConfiguredAdmin(payload.user_id)
   if (isContext) {
     if (/重置|清空|reset/i.test(nt)) {
-      const k = getKey(payload)
-      sessionHist.set(k, [])
-      const msg = [{ type: 'text', data: { text: '上下文已重置' } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
+      clearHistory(payload)
+      await replyCommandMessage(ws, payload, '上下文已重置')
       return true
     }
-    if (roleUser === 'owner' || roleUser === 'admin') {
+    if (isAdminUser) {
       if (/开启|打开|on/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'true'
       if (/关闭|off/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'false'
       const mw = nt.match(/(窗口|window)\s+(\d+)/i)
@@ -961,23 +1027,48 @@ async function handleCommands(ws, payload, text) {
         const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
         process.env.AI_CONTEXT_TTL = String(Math.max(30, sec))
       }
-      const msg = [{ type: 'text', data: { text: `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW||AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL||AI_CONTEXT_TTL}s` } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
+      await replyCommandMessage(ws, payload, `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW || AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL || AI_CONTEXT_TTL}s`)
       return true
     }
-    return false
+    await replyCommandMessage(ws, payload, '需要管理员权限才能修改上下文配置')
+    return true
   }
   if (isPoke) {
-    if (roleUser === 'owner' || roleUser === 'admin') {
-      if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
-      if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
-      const msg = [{ type: 'text', data: { text: `拍一拍开关：${process.env.AI_POKE_ENABLE}` } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
+    if (/(回复列表|文案列表|list)/i.test(nt)) {
+      const items = refreshPokeReplyTexts()
+      const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
+      await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
       return true
     }
-    return false
+    const addMatch = nt.match(/(?:回复|文案)(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
+    if (addMatch) {
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
+        return true
+      }
+      const content = String(addMatch[1] || '').trim()
+      if (!content) {
+        await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
+        return true
+      }
+      const items = refreshPokeReplyTexts()
+      if (items.includes(content)) {
+        await replyCommandMessage(ws, payload, `该拍一拍文案已存在：${content}`)
+        return true
+      }
+      items.push(content)
+      const saved = savePokeReplyTexts(items)
+      await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+      return true
+    }
+    if (isAdminUser) {
+      if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
+      if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
+      await replyCommandMessage(ws, payload, `拍一拍开关：${process.env.AI_POKE_ENABLE}｜文案数=${getPokeReplyTexts().length}`)
+      return true
+    }
+    await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
+    return true
   }
   if (isBanned) {
     const list = loadBanned(payload.group_id)
@@ -986,7 +1077,7 @@ async function handleCommands(ws, payload, text) {
       await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
       return true
     }
-    if (!(roleUser === 'owner' || roleUser === 'admin')) {
+    if (!isAdminUser) {
       const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
       if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
       else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
