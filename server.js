@@ -145,17 +145,6 @@ function dedupeTextList(list) {
   return Array.from(new Set(normalizeTextList(list)))
 }
 
-function normalizeCommandText(text) {
-  return String(text || '')
-    .replace(/^[\s,，.。!！?？:：;；/\\|+-]+/, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function compactCommandText(text) {
-  return normalizeCommandText(text).replace(/\s+/g, '')
-}
-
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
 }
@@ -1016,10 +1005,15 @@ async function replyCommandMessage(ws, payload, text) {
 
 function normalizeCommandText(text) {
   return String(text || '')
+    .replace(/^[\s,，.。!！?？:：;；/\\|+-]+/, '')
     .replace(/\u3000/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^一拍一拍/, '拍一拍')
+}
+
+function compactCommandText(text) {
+  return normalizeCommandText(text).replace(/\s+/g, '')
 }
 
 function buildPokeCommandHelp(isAdminUser) {
@@ -1047,171 +1041,178 @@ async function handleCommands(ws, payload, text) {
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
   const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
-  if (!isBanned && !isContext && !isPoke) return false
-  const isGroup = payload.message_type === 'group'
-  const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
-  const isAdminUser = roleUser === 'owner' || roleUser === 'admin' || isConfiguredAdmin(payload.user_id)
-  if (isContext) {
-    if (/重置|清空|reset/i.test(nt)) {
-      clearHistory(payload)
-      await replyCommandMessage(ws, payload, '上下文已重置')
-      return true
-    }
-    if (isAdminUser) {
-      if (/开启|打开|on/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'true'
-      if (/关闭|off/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'false'
-      const mw = nt.match(/(窗口|window)\s+(\d+)/i)
-      if (mw && mw[2]) process.env.AI_CONTEXT_WINDOW = String(Math.max(1, parseInt(mw[2], 10)))
-      const mt = nt.match(/(时长|ttl)\s+(\d+)\s*(秒|分钟|分)?/i)
-      if (mt && mt[2]) {
-        const val = parseInt(mt[2], 10)
-        const unit = (mt[3] || '').trim()
-        const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
-        process.env.AI_CONTEXT_TTL = String(Math.max(30, sec))
+  const matchedCommand = isBanned || isContext || isPoke
+  if (!matchedCommand) return false
+  try {
+    const isGroup = payload.message_type === 'group'
+    const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
+    const isAdminUser = roleUser === 'owner' || roleUser === 'admin' || isConfiguredAdmin(payload.user_id)
+    if (isContext) {
+      if (/重置|清空|reset/i.test(nt)) {
+        clearHistory(payload)
+        await replyCommandMessage(ws, payload, '上下文已重置')
+        return true
       }
-      await replyCommandMessage(ws, payload, `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW || AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL || AI_CONTEXT_TTL}s`)
+      if (isAdminUser) {
+        if (/开启|打开|on/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'true'
+        if (/关闭|off/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'false'
+        const mw = nt.match(/(窗口|window)\s+(\d+)/i)
+        if (mw && mw[2]) process.env.AI_CONTEXT_WINDOW = String(Math.max(1, parseInt(mw[2], 10)))
+        const mt = nt.match(/(时长|ttl)\s+(\d+)\s*(秒|分钟|分)?/i)
+        if (mt && mt[2]) {
+          const val = parseInt(mt[2], 10)
+          const unit = (mt[3] || '').trim()
+          const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
+          process.env.AI_CONTEXT_TTL = String(Math.max(30, sec))
+        }
+        await replyCommandMessage(ws, payload, `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW || AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL || AI_CONTEXT_TTL}s`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, '需要管理员权限才能修改上下文配置')
       return true
     }
-    await replyCommandMessage(ws, payload, '需要管理员权限才能修改上下文配置')
-    return true
-  }
-  if (isPoke) {
-    if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
-      const items = refreshPokeReplyTexts()
-      const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
-      await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
+    if (isPoke) {
+      if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
+        const items = refreshPokeReplyTexts()
+        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
+        await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
+        return true
+      }
+      const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
+      if (addMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
+          return true
+        }
+        const content = String(addMatch[1] || '').trim()
+        if (!content) {
+          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        if (items.includes(content)) {
+          await replyCommandMessage(ws, payload, `该拍一拍文案已存在：${content}`)
+          return true
+        }
+        const saved = savePokeReplyTexts(items.concat(content))
+        await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        return true
+      }
+      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+      if (removeMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
+          return true
+        }
+        const content = String(removeMatch[1] || '').trim()
+        if (!content) {
+          await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        const nextItems = items.filter((item) => item !== content)
+        if (nextItems.length === items.length) {
+          await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
+          return true
+        }
+        const saved = savePokeReplyTexts(nextItems)
+        await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        return true
+      }
+      if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能清空拍一拍文案')
+          return true
+        }
+        savePokeReplyTexts([])
+        await replyCommandMessage(ws, payload, '拍一拍文案已清空')
+        return true
+      }
+      if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt) || /(回复去重|文案去重)/i.test(compact)) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能去重拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        const saved = savePokeReplyTexts(dedupeTextList(items))
+        const removedCount = items.length - saved.length
+        await replyCommandMessage(ws, payload, `拍一拍文案已去重，移除 ${removedCount} 条重复项，当前共 ${saved.length} 条`)
+        return true
+      }
+      if (isAdminUser) {
+        if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
+        if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
+        await replyCommandMessage(ws, payload, `拍一拍开关：${process.env.AI_POKE_ENABLE}｜文案数=${getPokeReplyTexts().length}`)
+        return true
+      }
+      if (/开启|打开|关闭|off|on/i.test(nt)) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
       return true
     }
-    const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
-    if (addMatch) {
+    if (isBanned) {
+      const list = loadBanned(payload.group_id)
+      if (/列表|查看|list/i.test(nt)) {
+        const msg = [{ type: 'text', data: { text: `违禁词列表：${list.join(',') || '（空）'}｜治理开关=${process.env.AI_MOD_ENABLE || AI_MOD_ENABLE}｜禁言时长=${process.env.AI_BAN_DURATION || AI_BAN_DURATION}s` } }]
+        await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
+        return true
+      }
       if (!isAdminUser) {
-        await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
+        const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
+        if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
+        else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
         return true
-      }
-      const content = String(addMatch[1] || '').trim()
-      if (!content) {
-        await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
-        return true
-      }
-      const items = refreshPokeReplyTexts()
-      if (items.includes(content)) {
-        await replyCommandMessage(ws, payload, `该拍一拍文案已存在：${content}`)
-        return true
-      }
-      items.push(content)
-      const saved = savePokeReplyTexts(items)
-      await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
-      return true
-    }
-    const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
-    if (removeMatch) {
-      if (!isAdminUser) {
-        await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
-        return true
-      }
-      const content = String(removeMatch[1] || '').trim()
-      if (!content) {
-        await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
-        return true
-      }
-      const items = refreshPokeReplyTexts()
-      const nextItems = items.filter((item) => item !== content)
-      if (nextItems.length === items.length) {
-        await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
-        return true
-      }
-      const saved = savePokeReplyTexts(nextItems)
-      await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
-      return true
-    }
-    if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
-      if (!isAdminUser) {
-        await replyCommandMessage(ws, payload, '需要管理员权限才能清空拍一拍文案')
-        return true
-      }
-      savePokeReplyTexts([])
-      await replyCommandMessage(ws, payload, '拍一拍文案已清空')
-      return true
-    }
-    if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt) || /(回复去重|文案去重)/i.test(compact)) {
-      if (!isAdminUser) {
-        await replyCommandMessage(ws, payload, '需要管理员权限才能去重拍一拍文案')
-        return true
-      }
-      const items = refreshPokeReplyTexts()
-      const saved = savePokeReplyTexts(dedupeTextList(items))
-      const removedCount = items.length - saved.length
-      await replyCommandMessage(ws, payload, `拍一拍文案已去重，移除 ${removedCount} 条重复项，当前共 ${saved.length} 条`)
-      return true
-    }
-    if (isAdminUser) {
-      if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
-      if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
-      await replyCommandMessage(ws, payload, `拍一拍开关：${process.env.AI_POKE_ENABLE}｜文案数=${getPokeReplyTexts().length}`)
-      return true
-    }
-    if (/开启|打开|关闭|off|on/i.test(nt)) {
-      await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
-      return true
-    }
-    await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
-    return true
-  }
-  if (isBanned) {
-    const list = loadBanned(payload.group_id)
-    if (/列表|查看|list/i.test(nt)) {
-      const msg = [{ type: 'text', data: { text: `违禁词列表：${list.join(',') || '（空）'}｜治理开关=${process.env.AI_MOD_ENABLE||AI_MOD_ENABLE}｜禁言时长=${process.env.AI_BAN_DURATION||AI_BAN_DURATION}s` } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
-      return true
-    }
-    if (!isAdminUser) {
-      const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
-      return true
-    } else if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
-      const m = nt.match(/add\s+(.+)/i) || nt.match(/(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i)
-      const w = m ? (m[4] || m[3] || m[1]).trim() : ''
-      if (w) {
-        if (!list.includes(w)) list.push(w)
+      } else if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
+        const m = nt.match(/add\s+(.+)/i) || nt.match(/(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i)
+        const w = m ? (m[4] || m[3] || m[1]).trim() : ''
+        if (w) {
+          if (!list.includes(w)) list.push(w)
+          saveBanned(payload.group_id, list)
+          const ok = [{ type: 'text', data: { text: `添加违禁词成功：${w}` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
+      } else if (/rm\s+(.+)/i.test(nt) || /(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i.test(nt)) {
+        const m = nt.match(/rm\s+(.+)/i) || nt.match(/(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i)
+        const w = m ? (m[4] || m[3] || m[1]).trim() : ''
+        if (w) {
+          const idx = list.indexOf(w)
+          if (idx >= 0) list.splice(idx, 1)
+          saveBanned(payload.group_id, list)
+          const ok = [{ type: 'text', data: { text: `删除违禁词成功：${w}` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
+      } else if (/clear|清空|全部删除|重置|reset|empty|purge/i.test(nt)) {
+        while (list.length) list.pop()
         saveBanned(payload.group_id, list)
-        const ok = [{ type: 'text', data: { text: `添加违禁词成功：${w}` } }]
+        const ok = [{ type: 'text', data: { text: '违禁词列表已清空' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-      }
-    } else if (/rm\s+(.+)/i.test(nt) || /(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i.test(nt)) {
-      const m = nt.match(/rm\s+(.+)/i) || nt.match(/(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i)
-      const w = m ? (m[4] || m[3] || m[1]).trim() : ''
-      if (w) {
-        const idx = list.indexOf(w)
-        if (idx >= 0) list.splice(idx, 1)
-        saveBanned(payload.group_id, list)
-        const ok = [{ type: 'text', data: { text: `删除违禁词成功：${w}` } }]
+      } else if (/治理(开启|打开)|moderation on/i.test(nt)) {
+        process.env.AI_MOD_ENABLE = 'true'
+        const ok = [{ type: 'text', data: { text: '违禁词治理已开启' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-      }
-    } else if (/clear|清空|全部删除|重置|reset|empty|purge/i.test(nt)) {
-      while (list.length) list.pop()
-      saveBanned(payload.group_id, list)
-      const ok = [{ type: 'text', data: { text: '违禁词列表已清空' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/治理(开启|打开)|moderation on/i.test(nt)) {
-      process.env.AI_MOD_ENABLE = 'true'
-      const ok = [{ type: 'text', data: { text: '违禁词治理已开启' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/治理关闭|moderation off/i.test(nt)) {
-      process.env.AI_MOD_ENABLE = 'false'
-      const ok = [{ type: 'text', data: { text: '违禁词治理已关闭' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i.test(nt)) {
-      const m = nt.match(/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i)
-      if (m && m[2]) {
-        const val = parseInt(m[2], 10)
-        const unit = (m[3] || '').trim()
-        const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
-        process.env.AI_BAN_DURATION = String(Math.max(30, sec))
-        const ok = [{ type: 'text', data: { text: `禁言时长已设置为：${process.env.AI_BAN_DURATION}s` } }]
+      } else if (/治理关闭|moderation off/i.test(nt)) {
+        process.env.AI_MOD_ENABLE = 'false'
+        const ok = [{ type: 'text', data: { text: '违禁词治理已关闭' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+      } else if (/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i.test(nt)) {
+        const m = nt.match(/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i)
+        if (m && m[2]) {
+          const val = parseInt(m[2], 10)
+          const unit = (m[3] || '').trim()
+          const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
+          process.env.AI_BAN_DURATION = String(Math.max(30, sec))
+          const ok = [{ type: 'text', data: { text: `禁言时长已设置为：${process.env.AI_BAN_DURATION}s` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
       }
+      return true
     }
+  } catch (error) {
+    const message = error && error.message ? String(error.message) : String(error)
+    console.log('命令处理失败', nt, message)
+    await replyCommandMessage(ws, payload, '命令处理失败，请稍后重试')
     return true
   }
   return false
