@@ -1,10 +1,7 @@
 const { WebSocketServer } = require('ws')
 const axios = require('axios')
-const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
-const sharp = require('sharp')
-const Tesseract = require('tesseract.js')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
 const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
@@ -59,23 +56,6 @@ const {
   AI_IMAGE_HINT_REGEX,
   AI_IMAGE_CONTEXT_MAX,
   AI_IMAGE_ONLY_NO_CALL,
-  AI_IMAGE_PREPROCESS_ENABLE,
-  AI_IMAGE_CACHE_ENABLE,
-  AI_IMAGE_CACHE_TTL,
-  AI_IMAGE_PREPROCESS_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_LONG_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_JPEG_QUALITY,
-  AI_IMAGE_PREPROCESS_WEBP_QUALITY,
-  AI_OCR_ENABLE,
-  AI_OCR_LANG,
-  AI_OCR_TIMEOUT_MS,
-  AI_OCR_CACHE_ENABLE,
-  AI_OCR_CACHE_TTL,
-  AI_OCR_MAX_CHARS,
-  AI_OCR_TRIGGER_REGEX,
-  AI_OCR_ONLY_TEXT_REGEX,
-  AI_OCR_MIN_TEXT_LENGTH,
   BANNED_PATH
 } = config
 
@@ -88,11 +68,9 @@ const agentRunner = createAgentRunner({
   toolExecutor,
   invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
   invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
-  maxSteps: 5
+  maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
-const processedImageCache = new Map()
-const ocrTextCache = new Map()
 let currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
 
 function resolveProjectFile(filePath) {
@@ -352,15 +330,7 @@ async function callGemini(text, media, opts) {
 
 async function callOpenAI(text, media, hist, opts) {
   if (!OPENAI_KEY) return null
-  let effectiveMedia = Array.isArray(media) ? media.slice() : []
-  const ocrContext = await buildOCRAssistContext(text, effectiveMedia)
-  const ocrOnly = ocrContext && ocrContext.mode === 'ocr_only'
-  if (ocrOnly) {
-    effectiveMedia = []
-    console.log(`OCR-first: 使用 OCR-only 路径 confidence=${ocrContext.confidence || 0}`)
-  } else if (ocrContext) {
-    console.log(`OCR-first: 使用 OCR-assist 路径 confidence=${ocrContext.confidence || 0}`)
-  }
+  const effectiveMedia = Array.isArray(media) ? media.slice() : []
   const imageCount = Array.isArray(effectiveMedia) ? effectiveMedia.filter((m) => m && m.kind === 'image').length : 0
   const requestTimeout = imageCount > 0 ? Math.max(OPENAI_TIMEOUT_MS, 60000) : OPENAI_TIMEOUT_MS
   try {
@@ -372,11 +342,6 @@ async function callOpenAI(text, media, hist, opts) {
     if (opts && opts.contextImage) {
       if (useResponses) content.push({ type: 'input_text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
       else content.push({ type: 'text', text: '若下方图片与问题无关，请忽略图片，仅回答文本问题。' })
-    }
-    if (ocrContext && ocrContext.text) {
-      const ocrPrompt = `以下是服务端 OCR 提取结果，可能存在少量识别误差。请优先利用这些文本进行判断；若仍附带图片，则以图片为最终校验依据。\n${ocrContext.text}`
-      if (useResponses) content.push({ type: 'input_text', text: ocrPrompt })
-      else content.push({ type: 'text', text: ocrPrompt })
     }
     if (useResponses) content.push({ type: 'input_text', text: text || 'Hello' })
     else content.push({ type: 'text', text: text || 'Hello' })
@@ -634,151 +599,7 @@ function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
 }
 
-function isLikelyScreenshot(meta, mime) {
-  if (!meta || !meta.width || !meta.height) return false
-  // Most QQ screenshots are PNG; treat as screenshot-like when PNG or very text-heavy ratio.
-  if (mime === 'image/png') return true
-  const ratio = meta.height / meta.width
-  return ratio >= 1.6
-}
-
-function isLongImage(meta) {
-  if (!meta || !meta.width || !meta.height) return false
-  const ratio = meta.height / meta.width
-  return ratio >= 2.6
-}
-
-function hashBuffer(buf) {
-  return crypto.createHash('sha1').update(buf).digest('hex')
-}
-
-function getCachedProcessed(key) {
-  if (!AI_IMAGE_CACHE_ENABLE) return null
-  const hit = processedImageCache.get(key)
-  if (!hit) return null
-  if (Date.now() - hit.ts > AI_IMAGE_CACHE_TTL * 1000) {
-    processedImageCache.delete(key)
-    return null
-  }
-  return hit
-}
-
-function setCachedProcessed(key, value) {
-  if (!AI_IMAGE_CACHE_ENABLE) return
-  processedImageCache.set(key, { ...value, ts: Date.now() })
-  // cheap bounded size
-  if (processedImageCache.size > 256) {
-    const firstKey = processedImageCache.keys().next().value
-    if (firstKey) processedImageCache.delete(firstKey)
-  }
-}
-
-function getCachedOcr(key) {
-  if (!AI_OCR_CACHE_ENABLE) return null
-  const hit = ocrTextCache.get(key)
-  if (!hit) return null
-  if (Date.now() - hit.ts > AI_OCR_CACHE_TTL * 1000) {
-    ocrTextCache.delete(key)
-    return null
-  }
-  return hit
-}
-
-function setCachedOcr(key, value) {
-  if (!AI_OCR_CACHE_ENABLE) return
-  ocrTextCache.set(key, { ...value, ts: Date.now() })
-  if (ocrTextCache.size > 256) {
-    const firstKey = ocrTextCache.keys().next().value
-    if (firstKey) ocrTextCache.delete(firstKey)
-  }
-}
-
-function withTimeout(promise, ms) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`ocr timeout ${ms}ms`)), ms)
-    promise.then((value) => {
-      clearTimeout(timer)
-      resolve(value)
-    }).catch((error) => {
-      clearTimeout(timer)
-      reject(error)
-    })
-  })
-}
-
-async function preprocessImageBuffer(buf, mime) {
-  if (!AI_IMAGE_PREPROCESS_ENABLE) return { buf, mime }
-  if (!buf || buf.length < 16) return { buf, mime }
-  if (!isImageMime(mime)) return { buf, mime }
-
-  // Cache by content hash + strategy parameters.
-  const cacheKey = `v1:${mime}:${AI_IMAGE_PREPROCESS_MAX_EDGE}:${AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE}:${AI_IMAGE_PREPROCESS_LONG_MAX_EDGE}:${AI_IMAGE_PREPROCESS_JPEG_QUALITY}:${AI_IMAGE_PREPROCESS_WEBP_QUALITY}:${hashBuffer(buf)}`
-  const cached = getCachedProcessed(cacheKey)
-  if (cached && cached.data && cached.mime) {
-    return { buf: Buffer.from(cached.data, 'base64'), mime: cached.mime }
-  }
-
-  let img = sharp(buf, { failOnError: false })
-  let meta
-  try {
-    meta = await img.metadata()
-  } catch {
-    return { buf, mime }
-  }
-
-  const maxEdge = AI_IMAGE_PREPROCESS_MAX_EDGE
-  const screenMax = AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE
-  const longMax = AI_IMAGE_PREPROCESS_LONG_MAX_EDGE
-  const targetMax = isLongImage(meta) ? longMax : (isLikelyScreenshot(meta, mime) ? screenMax : maxEdge)
-
-  const width = meta.width || 0
-  const height = meta.height || 0
-  const needResize = width > targetMax || height > targetMax
-  if (needResize) {
-    img = img.resize({ width: targetMax, height: targetMax, fit: 'inside', withoutEnlargement: true })
-  }
-
-  // Prefer jpeg for speed unless original is png and looks like screenshot (preserve text clarity).
-  let outMime = mime
-  let outBuf = buf
-  try {
-    if (mime === 'image/png' && isLikelyScreenshot(meta, mime)) {
-      outBuf = await img.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
-      outMime = 'image/png'
-    } else if (mime === 'image/webp') {
-      outBuf = await img.webp({ quality: AI_IMAGE_PREPROCESS_WEBP_QUALITY }).toBuffer()
-      outMime = 'image/webp'
-    } else {
-      outBuf = await img.jpeg({ quality: AI_IMAGE_PREPROCESS_JPEG_QUALITY, mozjpeg: true }).toBuffer()
-      outMime = 'image/jpeg'
-    }
-  } catch {
-    return { buf, mime }
-  }
-
-  setCachedProcessed(cacheKey, { mime: outMime, data: outBuf.toString('base64') })
-  return { buf: outBuf, mime: outMime }
-}
-
-async function preprocessOCRBuffer(buf, mime) {
-  if (!buf || buf.length < 16 || !isImageMime(mime)) return { buf, mime }
-  try {
-    let img = sharp(buf, { failOnError: false }).rotate()
-    const meta = await img.metadata()
-    const width = meta.width || 0
-    const height = meta.height || 0
-    const targetMax = isLongImage(meta) ? AI_IMAGE_PREPROCESS_LONG_MAX_EDGE : (isLikelyScreenshot(meta, mime) ? Math.max(AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE, 1600) : Math.max(AI_IMAGE_PREPROCESS_MAX_EDGE, 1600))
-    if (width > targetMax || height > targetMax) {
-      img = img.resize({ width: targetMax, height: targetMax, fit: 'inside', withoutEnlargement: true })
-    }
-    const outBuf = await img.grayscale().normalize().sharpen().png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
-    return { buf: outBuf, mime: 'image/png', meta }
-  } catch {
-    return { buf, mime }
-  }
-}
-
-async function sourceToBuffer(src, purpose = 'vision') {
+async function sourceToBuffer(src) {
   if (!src) return null
   let buf = null
   let mime = 'application/octet-stream'
@@ -820,70 +641,7 @@ async function sourceToBuffer(src, purpose = 'vision') {
   } else {
     return null
   }
-
-  const processed = purpose === 'ocr'
-    ? await preprocessOCRBuffer(buf, mime)
-    : await preprocessImageBuffer(buf, mime)
-  return { buf: processed.buf, mime: processed.mime, meta: processed.meta || null }
-}
-
-function isTextHeavyQuestion(text) {
-  return AI_OCR_ONLY_TEXT_REGEX.test(String(text || ''))
-}
-
-function shouldTryOCRFirst(text, media) {
-  if (!AI_OCR_ENABLE) return false
-  if (!Array.isArray(media) || media.length === 0) return false
-  const images = media.filter((m) => m && m.kind === 'image')
-  if (images.length === 0) return false
-  return AI_OCR_TRIGGER_REGEX.test(String(text || ''))
-}
-
-async function recognizeTextFromImageSource(src) {
-  const source = await sourceToBuffer(src, 'ocr')
-  if (!source || !source.buf || !isImageMime(source.mime)) return null
-  const cacheKey = `ocr:v1:${AI_OCR_LANG}:${hashBuffer(source.buf)}`
-  const cached = getCachedOcr(cacheKey)
-  if (cached) return cached
-  const ocrPromise = Tesseract.recognize(source.buf, AI_OCR_LANG, {})
-  const result = await withTimeout(ocrPromise, AI_OCR_TIMEOUT_MS)
-  const text = String(result && result.data && result.data.text || '').replace(/\n{3,}/g, '\n\n').trim()
-  const confidence = Number(result && result.data && result.data.confidence || 0)
-  const payload = {
-    text: text.slice(0, AI_OCR_MAX_CHARS),
-    confidence,
-    hasEnoughText: text.replace(/\s+/g, '').length >= AI_OCR_MIN_TEXT_LENGTH
-  }
-  setCachedOcr(cacheKey, payload)
-  return payload
-}
-
-async function buildOCRAssistContext(text, media) {
-  if (!shouldTryOCRFirst(text, media)) return null
-  const images = media.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
-  const chunks = []
-  let bestConfidence = 0
-  for (let i = 0; i < images.length; i += 1) {
-    const src = images[i].localPath || images[i].file || images[i].url
-    if (!src) continue
-    try {
-      const ocr = await recognizeTextFromImageSource(src)
-      if (!ocr || !ocr.text) continue
-      bestConfidence = Math.max(bestConfidence, ocr.confidence || 0)
-      chunks.push(`[图片${i + 1} OCR]\n${ocr.text}`)
-    } catch (error) {
-      console.log('OCR失败', error && error.message ? String(error.message) : String(error))
-    }
-  }
-  if (chunks.length === 0) return null
-  const mergedText = chunks.join('\n\n').slice(0, AI_OCR_MAX_CHARS)
-  const enoughText = mergedText.replace(/\s+/g, '').length >= AI_OCR_MIN_TEXT_LENGTH
-  const ocrOnly = enoughText && isTextHeavyQuestion(text)
-  return {
-    mode: ocrOnly ? 'ocr_only' : 'ocr_assist',
-    text: mergedText,
-    confidence: bestConfidence
-  }
+  return { buf, mime }
 }
 
 async function toOpenAIImageUrl(media) {
@@ -905,7 +663,7 @@ async function toOpenAIImageUrl(media) {
 async function sourceToBase64(src) {
   if (!src) return null
   try {
-    const source = await sourceToBuffer(src, 'vision')
+    const source = await sourceToBuffer(src)
     if (!source || !source.buf) return null
     return { mime: source.mime, data: source.buf.toString('base64') }
   } catch (e) {

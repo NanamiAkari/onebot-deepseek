@@ -26,12 +26,13 @@ function createAgentRunner(deps) {
     }
   }
 
-  function buildCallSignature(name, args) {
-    try {
-      return `${name}:${JSON.stringify(args || {})}`
-    } catch {
-      return `${name}:[unserializable]`
+  function buildToolBudgets(tools) {
+    const budgets = new Map()
+    for (const tool of tools || []) {
+      if (!tool || !tool.name) continue
+      budgets.set(tool.name, 1)
     }
+    return budgets
   }
 
   async function run(input) {
@@ -54,9 +55,7 @@ function createAgentRunner(deps) {
 
     const executedToolCalls = []
     let finalText = ''
-    const toolBudgets = new Map([['history', 1]])
-    let lastSignature = ''
-    let repeatCount = 0
+    const toolBudgets = buildToolBudgets(agentInput.tools)
 
     for (let step = 0; step < maxSteps; step += 1) {
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
@@ -81,29 +80,25 @@ function createAgentRunner(deps) {
       if (output.text) finalText = output.text
 
       const currentCall = output.toolCalls[0]
-      const signature = buildCallSignature(currentCall.name, currentCall.arguments || {})
       const usedCount = executedToolCalls.filter((x) => x.name === currentCall.name).length
       const toolBudget = toolBudgets.get(currentCall.name)
       if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
-        console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} 已达到调用上限，停止循环`)
-        return {
-          text: finalText || '工具调用次数达到限制，请简化问题后重试',
-          toolCalls: executedToolCalls,
-          steps: step + 1,
-          stoppedReason: `budget:${currentCall.name}`
+        console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} 已达到调用上限，跳过该工具并继续让模型回答`)
+        const toolEntry = {
+          id: currentCall.id || currentCall.name,
+          name: currentCall.name,
+          arguments: currentCall.arguments || {},
+          ok: false,
+          data: null,
+          error: `${currentCall.name} 工具已超限，请直接基于现有上下文回答，不要继续调用该工具`
         }
-      }
-      if (signature === lastSignature) repeatCount += 1
-      else repeatCount = 1
-      lastSignature = signature
-      if (repeatCount >= 2) {
-        console.log(`Agent step ${step + 1}/${maxSteps}: 检测到重复工具调用 ${currentCall.name}，停止循环`)
-        return {
-          text: finalText || '检测到重复工具调用，请换一种问法后重试',
-          toolCalls: executedToolCalls,
-          steps: step + 1,
-          stoppedReason: `repeat:${currentCall.name}`
-        }
+        executedToolCalls.push(toolEntry)
+        agentInput.toolResults = executedToolCalls.slice()
+        agentInput.history = agentInput.history.concat([
+          { role: 'system', content: formatToolResultForHistory(toolEntry) }
+        ])
+        agentInput.tools = agentInput.tools.filter((tool) => tool.name !== currentCall.name)
+        continue
       }
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用工具 ${currentCall.name} args=${summarizeArguments(currentCall.arguments || {})}`)
       const toolResult = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
