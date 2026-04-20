@@ -145,6 +145,17 @@ function dedupeTextList(list) {
   return Array.from(new Set(normalizeTextList(list)))
 }
 
+function normalizeCommandText(text) {
+  return String(text || '')
+    .replace(/^[\s,，.。!！?？:：;；/\\|+-]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function compactCommandText(text) {
+  return normalizeCommandText(text).replace(/\s+/g, '')
+}
+
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
 }
@@ -1003,12 +1014,39 @@ async function replyCommandMessage(ws, payload, text) {
   }
 }
 
+function normalizeCommandText(text) {
+  return String(text || '')
+    .replace(/\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^一拍一拍/, '拍一拍')
+}
+
+function buildPokeCommandHelp(isAdminUser) {
+  const lines = [
+    '拍一拍命令：',
+    '1. 拍一拍 文案列表'
+  ]
+  if (isAdminUser) {
+    lines.push('2. 拍一拍 文案添加 内容')
+    lines.push('3. 拍一拍 文案删除 内容')
+    lines.push('4. 拍一拍 文案清空')
+    lines.push('5. 拍一拍 文案去重')
+    lines.push('6. 拍一拍 开启')
+    lines.push('7. 拍一拍 关闭')
+  } else {
+    lines.push('其余文案管理和开关命令需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
-  const t = String(stripPrefix(text || '')).trim()
+  const t = normalizeCommandText(stripPrefix(text || ''))
   const nt = t.replace(/\s+/g, ' ')
+  const compact = compactCommandText(t)
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
-  const isPoke = /^(poke|拍一拍)/i.test(nt)
+  const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
   if (!isBanned && !isContext && !isPoke) return false
   const isGroup = payload.message_type === 'group'
   const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
@@ -1038,13 +1076,13 @@ async function handleCommands(ws, payload, text) {
     return true
   }
   if (isPoke) {
-    if (/(回复列表|文案列表|list)/i.test(nt)) {
+    if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
       const items = refreshPokeReplyTexts()
       const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
       await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
       return true
     }
-    const addMatch = nt.match(/(?:回复|文案)(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
+    const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
     if (addMatch) {
       if (!isAdminUser) {
         await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
@@ -1065,7 +1103,7 @@ async function handleCommands(ws, payload, text) {
       await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
       return true
     }
-    const removeMatch = nt.match(/(?:回复|文案)(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+    const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
     if (removeMatch) {
       if (!isAdminUser) {
         await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
@@ -1086,7 +1124,7 @@ async function handleCommands(ws, payload, text) {
       await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
       return true
     }
-    if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt)) {
+    if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
       if (!isAdminUser) {
         await replyCommandMessage(ws, payload, '需要管理员权限才能清空拍一拍文案')
         return true
@@ -1095,7 +1133,7 @@ async function handleCommands(ws, payload, text) {
       await replyCommandMessage(ws, payload, '拍一拍文案已清空')
       return true
     }
-    if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt)) {
+    if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt) || /(回复去重|文案去重)/i.test(compact)) {
       if (!isAdminUser) {
         await replyCommandMessage(ws, payload, '需要管理员权限才能去重拍一拍文案')
         return true
@@ -1112,7 +1150,11 @@ async function handleCommands(ws, payload, text) {
       await replyCommandMessage(ws, payload, `拍一拍开关：${process.env.AI_POKE_ENABLE}｜文案数=${getPokeReplyTexts().length}`)
       return true
     }
-    await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
+    if (/开启|打开|关闭|off|on/i.test(nt)) {
+      await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
+      return true
+    }
+    await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
     return true
   }
   if (isBanned) {
