@@ -26,6 +26,15 @@ function createAgentRunner(deps) {
     }
   }
 
+  function buildToolBudgets(tools) {
+    const budgets = new Map()
+    for (const tool of tools || []) {
+      if (!tool || !tool.name) continue
+      budgets.set(tool.name, 1)
+    }
+    return budgets
+  }
+
   async function run(input) {
     const tools = toolRegistry ? toolRegistry.list().map((tool) => ({
       name: tool.name,
@@ -46,6 +55,7 @@ function createAgentRunner(deps) {
 
     const executedToolCalls = []
     let finalText = ''
+    const toolBudgets = buildToolBudgets(agentInput.tools)
 
     for (let step = 0; step < maxSteps; step += 1) {
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
@@ -70,6 +80,26 @@ function createAgentRunner(deps) {
       if (output.text) finalText = output.text
 
       const currentCall = output.toolCalls[0]
+      const usedCount = executedToolCalls.filter((x) => x.name === currentCall.name).length
+      const toolBudget = toolBudgets.get(currentCall.name)
+      if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
+        console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} 已达到调用上限，跳过该工具并继续让模型回答`)
+        const toolEntry = {
+          id: currentCall.id || currentCall.name,
+          name: currentCall.name,
+          arguments: currentCall.arguments || {},
+          ok: false,
+          data: null,
+          error: `${currentCall.name} 工具已超限，请直接基于现有上下文回答，不要继续调用该工具`
+        }
+        executedToolCalls.push(toolEntry)
+        agentInput.toolResults = executedToolCalls.slice()
+        agentInput.history = agentInput.history.concat([
+          { role: 'system', content: formatToolResultForHistory(toolEntry) }
+        ])
+        agentInput.tools = agentInput.tools.filter((tool) => tool.name !== currentCall.name)
+        continue
+      }
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用工具 ${currentCall.name} args=${summarizeArguments(currentCall.arguments || {})}`)
       const toolResult = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
       const toolEntry = {

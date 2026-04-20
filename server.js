@@ -1,9 +1,7 @@
 const { WebSocketServer } = require('ws')
 const axios = require('axios')
-const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
-const sharp = require('sharp')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
 const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
@@ -27,7 +25,9 @@ const {
   DEEPSEEK_MODEL,
   HTTPS_AGENT,
   REQUIRE_PREFIX,
+  GROUP_REQUIRE_MENTION,
   PREFIXES,
+  ADMIN_USER_IDS,
   IGNORE_REGEX,
   MAX_MEDIA_BYTES,
   MEDIA_REFERER,
@@ -41,7 +41,9 @@ const {
   OPENAI_TIMEOUT_MS,
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
+  AI_POKE_REPLY_FILE,
   AI_POKE_REPLY_TEXT,
+  AI_POKE_REPLY_TEXTS,
   AI_CONTEXT_ENABLE,
   AI_CONTEXT_WINDOW,
   AI_CONTEXT_TTL,
@@ -54,19 +56,11 @@ const {
   AI_IMAGE_HINT_REGEX,
   AI_IMAGE_CONTEXT_MAX,
   AI_IMAGE_ONLY_NO_CALL,
-  AI_IMAGE_PREPROCESS_ENABLE,
-  AI_IMAGE_CACHE_ENABLE,
-  AI_IMAGE_CACHE_TTL,
-  AI_IMAGE_PREPROCESS_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_LONG_MAX_EDGE,
-  AI_IMAGE_PREPROCESS_JPEG_QUALITY,
-  AI_IMAGE_PREPROCESS_WEBP_QUALITY,
   BANNED_PATH
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext } = sessionStore
+const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
 const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
@@ -74,10 +68,64 @@ const agentRunner = createAgentRunner({
   toolExecutor,
   invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
   invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
-  maxSteps: 5
+  maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
-const processedImageCache = new Map()
+let currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+
+function resolveProjectFile(filePath) {
+  return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
+}
+
+function getPokeReplyFilePath() {
+  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.txt')
+}
+
+function normalizeTextList(lines) {
+  return lines.map((s) => String(s || '').trim()).filter((s) => s)
+}
+
+function loadPokeReplyTextsFromFile() {
+  try {
+    const filePath = getPokeReplyFilePath()
+    if (!fs.existsSync(filePath)) return []
+    return normalizeTextList(
+      fs.readFileSync(filePath, 'utf8')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s && !s.startsWith('#'))
+    )
+  } catch {
+    return []
+  }
+}
+
+function refreshPokeReplyTexts() {
+  const fileItems = loadPokeReplyTextsFromFile()
+  if (fileItems.length > 0) currentPokeReplyTexts = fileItems
+  else currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+  return currentPokeReplyTexts.slice()
+}
+
+function getPokeReplyTexts() {
+  return currentPokeReplyTexts.slice()
+}
+
+function savePokeReplyTexts(list) {
+  const items = normalizeTextList(list)
+  const filePath = getPokeReplyFilePath()
+  fs.writeFileSync(filePath, `${items.join('\n')}\n`, 'utf8')
+  currentPokeReplyTexts = items
+  return items.slice()
+}
+
+function dedupeTextList(list) {
+  return Array.from(new Set(normalizeTextList(list)))
+}
+
+function isConfiguredAdmin(userId) {
+  return ADMIN_USER_IDS.includes(String(userId || ''))
+}
 
 const wss = new WebSocketServer({ port: PORT, path: WS_PATH })
 
@@ -99,6 +147,8 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  shouldIgnoreText,
+  GROUP_REQUIRE_MENTION,
   shouldRespond,
   stripPrefix,
   getContext,
@@ -107,6 +157,8 @@ const onMessage = createMessageHandler({
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_TEXT,
+  AI_POKE_REPLY_TEXTS,
+  getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -183,9 +235,15 @@ function checkMention(message, selfId) {
 function shouldRespond(text) {
   const t = String(text || '').trim()
   if (!t) return false
-  if (IGNORE_REGEX && IGNORE_REGEX.test(t)) return false
+  if (shouldIgnoreText(t)) return false
   if (!REQUIRE_PREFIX) return true
   return PREFIXES.some((p) => t.startsWith(p))
+}
+
+function shouldIgnoreText(text) {
+  const t = String(text || '').trim()
+  if (!t) return false
+  return Boolean(IGNORE_REGEX && IGNORE_REGEX.test(t))
 }
 
 function stripPrefix(text) {
@@ -272,7 +330,8 @@ async function callGemini(text, media, opts) {
 
 async function callOpenAI(text, media, hist, opts) {
   if (!OPENAI_KEY) return null
-  const imageCount = Array.isArray(media) ? media.filter((m) => m && m.kind === 'image').length : 0
+  const effectiveMedia = Array.isArray(media) ? media.slice() : []
+  const imageCount = Array.isArray(effectiveMedia) ? effectiveMedia.filter((m) => m && m.kind === 'image').length : 0
   const requestTimeout = imageCount > 0 ? Math.max(OPENAI_TIMEOUT_MS, 60000) : OPENAI_TIMEOUT_MS
   try {
     console.log('调用OpenAI')
@@ -286,8 +345,8 @@ async function callOpenAI(text, media, hist, opts) {
     }
     if (useResponses) content.push({ type: 'input_text', text: text || 'Hello' })
     else content.push({ type: 'text', text: text || 'Hello' })
-    if (Array.isArray(media) && media.length > 0) {
-      const limited = media.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
+    if (Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
+      const limited = effectiveMedia.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
       for (const m of limited) {
         const imageUrl = await toOpenAIImageUrl(m)
         if (!imageUrl) continue
@@ -362,10 +421,10 @@ async function callOpenAI(text, media, hist, opts) {
     if (!contentText && toolCalls.length === 0) return null
     console.log('OpenAI成功')
     const txt = String(contentText || '').slice(0, 2000)
-    if (txt && Array.isArray(media) && media.length > 0) {
+    if (txt && Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
       const ignoreHints = /(未提供(对应)?图片|无法识别到你提供的图片|暂时无法解答|请你补充相关信息)/i
       if (ignoreHints.test(txt)) {
-        const again = await callGemini(text, media, opts)
+        const again = await callGemini(text, effectiveMedia, opts)
         if (again) return { text: String(again).slice(0, 2000), toolCalls }
       }
     }
@@ -540,97 +599,49 @@ function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
 }
 
-function isLikelyScreenshot(meta, mime) {
-  if (!meta || !meta.width || !meta.height) return false
-  // Most QQ screenshots are PNG; treat as screenshot-like when PNG or very text-heavy ratio.
-  if (mime === 'image/png') return true
-  const ratio = meta.height / meta.width
-  return ratio >= 1.6
-}
-
-function isLongImage(meta) {
-  if (!meta || !meta.width || !meta.height) return false
-  const ratio = meta.height / meta.width
-  return ratio >= 2.6
-}
-
-function hashBuffer(buf) {
-  return crypto.createHash('sha1').update(buf).digest('hex')
-}
-
-function getCachedProcessed(key) {
-  if (!AI_IMAGE_CACHE_ENABLE) return null
-  const hit = processedImageCache.get(key)
-  if (!hit) return null
-  if (Date.now() - hit.ts > AI_IMAGE_CACHE_TTL * 1000) {
-    processedImageCache.delete(key)
+async function sourceToBuffer(src) {
+  if (!src) return null
+  let buf = null
+  let mime = 'application/octet-stream'
+  if (/^base64:\/\//i.test(src)) {
+    buf = Buffer.from(src.replace(/^base64:\/\//i, ''), 'base64')
+    mime = detectMimeFromBuffer(buf, mime)
+  } else if (/^data:/i.test(src)) {
+    const i = src.indexOf(',')
+    if (i <= 0) return null
+    const head = src.slice(0, i)
+    const data = src.slice(i + 1)
+    const mimeMatch = head.match(/^data:([^;]+)/i)
+    mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream'
+    buf = Buffer.from(data, 'base64')
+  } else if (/^file:\/\//i.test(src)) {
+    const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
+    buf = fs.readFileSync(p)
+    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
+  } else if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
+    const p = decodeURIComponent(src)
+    buf = fs.readFileSync(p)
+    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
+  } else if (/^https?:\/\//i.test(src)) {
+    const headers = { 'User-Agent': 'Mozilla/5.0' }
+    if (MEDIA_REFERER) {
+      headers.Referer = MEDIA_REFERER
+    } else {
+      try {
+        const u = new URL(src)
+        const host = u.hostname || ''
+        if (/qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host)) headers.Referer = 'https://gchat.qpic.cn'
+        else if (/qun\.qq\.com$/i.test(host)) headers.Referer = 'https://qun.qq.com'
+      } catch {}
+    }
+    const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
+    buf = Buffer.from(res.data)
+    const ct = (res.headers && res.headers['content-type']) || ''
+    mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
+  } else {
     return null
   }
-  return hit
-}
-
-function setCachedProcessed(key, value) {
-  if (!AI_IMAGE_CACHE_ENABLE) return
-  processedImageCache.set(key, { ...value, ts: Date.now() })
-  // cheap bounded size
-  if (processedImageCache.size > 256) {
-    const firstKey = processedImageCache.keys().next().value
-    if (firstKey) processedImageCache.delete(firstKey)
-  }
-}
-
-async function preprocessImageBuffer(buf, mime) {
-  if (!AI_IMAGE_PREPROCESS_ENABLE) return { buf, mime }
-  if (!buf || buf.length < 16) return { buf, mime }
-  if (!isImageMime(mime)) return { buf, mime }
-
-  // Cache by content hash + strategy parameters.
-  const cacheKey = `v1:${mime}:${AI_IMAGE_PREPROCESS_MAX_EDGE}:${AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE}:${AI_IMAGE_PREPROCESS_LONG_MAX_EDGE}:${AI_IMAGE_PREPROCESS_JPEG_QUALITY}:${AI_IMAGE_PREPROCESS_WEBP_QUALITY}:${hashBuffer(buf)}`
-  const cached = getCachedProcessed(cacheKey)
-  if (cached && cached.data && cached.mime) {
-    return { buf: Buffer.from(cached.data, 'base64'), mime: cached.mime }
-  }
-
-  let img = sharp(buf, { failOnError: false })
-  let meta
-  try {
-    meta = await img.metadata()
-  } catch {
-    return { buf, mime }
-  }
-
-  const maxEdge = AI_IMAGE_PREPROCESS_MAX_EDGE
-  const screenMax = AI_IMAGE_PREPROCESS_SCREEN_MAX_EDGE
-  const longMax = AI_IMAGE_PREPROCESS_LONG_MAX_EDGE
-  const targetMax = isLongImage(meta) ? longMax : (isLikelyScreenshot(meta, mime) ? screenMax : maxEdge)
-
-  const width = meta.width || 0
-  const height = meta.height || 0
-  const needResize = width > targetMax || height > targetMax
-  if (needResize) {
-    img = img.resize({ width: targetMax, height: targetMax, fit: 'inside', withoutEnlargement: true })
-  }
-
-  // Prefer jpeg for speed unless original is png and looks like screenshot (preserve text clarity).
-  let outMime = mime
-  let outBuf = buf
-  try {
-    if (mime === 'image/png' && isLikelyScreenshot(meta, mime)) {
-      outBuf = await img.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
-      outMime = 'image/png'
-    } else if (mime === 'image/webp') {
-      outBuf = await img.webp({ quality: AI_IMAGE_PREPROCESS_WEBP_QUALITY }).toBuffer()
-      outMime = 'image/webp'
-    } else {
-      outBuf = await img.jpeg({ quality: AI_IMAGE_PREPROCESS_JPEG_QUALITY, mozjpeg: true }).toBuffer()
-      outMime = 'image/jpeg'
-    }
-  } catch {
-    return { buf, mime }
-  }
-
-  setCachedProcessed(cacheKey, { mime: outMime, data: outBuf.toString('base64') })
-  return { buf: outBuf, mime: outMime }
+  return { buf, mime }
 }
 
 async function toOpenAIImageUrl(media) {
@@ -651,69 +662,15 @@ async function toOpenAIImageUrl(media) {
 
 async function sourceToBase64(src) {
   if (!src) return null
-  if (/^base64:\/\//i.test(src)) {
-    const data = src.replace(/^base64:\/\//i, '')
-    return { mime: 'application/octet-stream', data }
-  }
-  if (/^data:/i.test(src)) {
-    const i = src.indexOf(',')
-    if (i > 0) {
-      const head = src.slice(0, i)
-      const data = src.slice(i + 1)
-      const mimeMatch = head.match(/^data:([^;]+)/i)
-      const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream'
-      return { mime, data }
-    }
+  try {
+    const source = await sourceToBuffer(src)
+    if (!source || !source.buf) return null
+    return { mime: source.mime, data: source.buf.toString('base64') }
+  } catch (e) {
+    const status = e && e.response && e.response.status
+    console.log('媒体下载失败', status || '')
     return null
   }
-  if (/^file:\/\//i.test(src)) {
-    try {
-      const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
-      const buf = fs.readFileSync(p)
-      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch {
-      return null
-    }
-  }
-  if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
-    try {
-      const p = decodeURIComponent(src)
-      const buf = fs.readFileSync(p)
-      const mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch {
-      // fallthrough
-    }
-  }
-  if (/^https?:\/\//i.test(src)) {
-    try {
-      const headers = { 'User-Agent': 'Mozilla/5.0' }
-      if (MEDIA_REFERER) {
-        headers.Referer = MEDIA_REFERER
-      } else {
-        try {
-          const u = new URL(src)
-          const host = u.hostname || ''
-          if (/qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host)) headers.Referer = 'https://gchat.qpic.cn'
-          else if (/qun\.qq\.com$/i.test(host)) headers.Referer = 'https://qun.qq.com'
-        } catch {}
-      }
-      const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
-      const ct = (res.headers && res.headers['content-type']) || ''
-      const buf = Buffer.from(res.data)
-      const mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
-      const processed = await preprocessImageBuffer(buf, mime)
-      return { mime: processed.mime, data: processed.buf.toString('base64') }
-    } catch (e) {
-      const status = e && e.response && e.response.status
-      console.log('媒体下载失败', status || '')
-      return null
-    }
-  }
-  return null
 }
 process.on('SIGINT', () => {
   try { wss.close() } catch {}
@@ -794,109 +751,226 @@ async function getUserRole(ws, groupId, userId) {
   if (info && info.status === 'ok' && info.data && info.data.role) role = info.data.role
   return role
 }
+
+async function replyCommandMessage(ws, payload, text) {
+  const msg = [{ type: 'text', data: { text } }]
+  if (payload.message_type === 'group') {
+    await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
+  } else {
+    await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => {})
+  }
+}
+
+function normalizeCommandText(text) {
+  return String(text || '')
+    .replace(/^[\s,，.。!！?？:：;；/\\|+-]+/, '')
+    .replace(/\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^一拍一拍/, '拍一拍')
+}
+
+function compactCommandText(text) {
+  return normalizeCommandText(text).replace(/\s+/g, '')
+}
+
+function buildPokeCommandHelp(isAdminUser) {
+  const lines = [
+    '拍一拍命令：',
+    '1. 拍一拍 文案列表'
+  ]
+  if (isAdminUser) {
+    lines.push('2. 拍一拍 文案添加 内容')
+    lines.push('3. 拍一拍 文案删除 内容')
+    lines.push('4. 拍一拍 文案清空')
+    lines.push('5. 拍一拍 文案去重')
+    lines.push('6. 拍一拍 开启')
+    lines.push('7. 拍一拍 关闭')
+  } else {
+    lines.push('其余文案管理和开关命令需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
-  const t = String(stripPrefix(text || '')).trim()
+  const t = normalizeCommandText(stripPrefix(text || ''))
   const nt = t.replace(/\s+/g, ' ')
+  const compact = compactCommandText(t)
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
-  const isPoke = /^(poke|拍一拍)/i.test(nt)
-  if (!isBanned && !isContext && !isPoke) return false
-  const isGroup = payload.message_type === 'group'
-  const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'owner'
-  if (isContext) {
-    if (/重置|清空|reset/i.test(nt)) {
-      const k = getKey(payload)
-      sessionHist.set(k, [])
-      const msg = [{ type: 'text', data: { text: '上下文已重置' } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
-      return true
-    }
-    if (roleUser === 'owner' || roleUser === 'admin') {
-      if (/开启|打开|on/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'true'
-      if (/关闭|off/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'false'
-      const mw = nt.match(/(窗口|window)\s+(\d+)/i)
-      if (mw && mw[2]) process.env.AI_CONTEXT_WINDOW = String(Math.max(1, parseInt(mw[2], 10)))
-      const mt = nt.match(/(时长|ttl)\s+(\d+)\s*(秒|分钟|分)?/i)
-      if (mt && mt[2]) {
-        const val = parseInt(mt[2], 10)
-        const unit = (mt[3] || '').trim()
-        const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
-        process.env.AI_CONTEXT_TTL = String(Math.max(30, sec))
+  const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
+  const matchedCommand = isBanned || isContext || isPoke
+  if (!matchedCommand) return false
+  try {
+    const isGroup = payload.message_type === 'group'
+    const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
+    const isAdminUser = roleUser === 'owner' || roleUser === 'admin' || isConfiguredAdmin(payload.user_id)
+    if (isContext) {
+      if (/重置|清空|reset/i.test(nt)) {
+        clearHistory(payload)
+        await replyCommandMessage(ws, payload, '上下文已重置')
+        return true
       }
-      const msg = [{ type: 'text', data: { text: `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW||AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL||AI_CONTEXT_TTL}s` } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
+      if (isAdminUser) {
+        if (/开启|打开|on/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'true'
+        if (/关闭|off/i.test(nt)) process.env.AI_CONTEXT_ENABLE = 'false'
+        const mw = nt.match(/(窗口|window)\s+(\d+)/i)
+        if (mw && mw[2]) process.env.AI_CONTEXT_WINDOW = String(Math.max(1, parseInt(mw[2], 10)))
+        const mt = nt.match(/(时长|ttl)\s+(\d+)\s*(秒|分钟|分)?/i)
+        if (mt && mt[2]) {
+          const val = parseInt(mt[2], 10)
+          const unit = (mt[3] || '').trim()
+          const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
+          process.env.AI_CONTEXT_TTL = String(Math.max(30, sec))
+        }
+        await replyCommandMessage(ws, payload, `上下文：开关=${process.env.AI_CONTEXT_ENABLE} 窗口=${process.env.AI_CONTEXT_WINDOW || AI_CONTEXT_WINDOW} 时长=${process.env.AI_CONTEXT_TTL || AI_CONTEXT_TTL}s`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, '需要管理员权限才能修改上下文配置')
       return true
     }
-    return false
-  }
-  if (isPoke) {
-    if (roleUser === 'owner' || roleUser === 'admin') {
-      if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
-      if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
-      const msg = [{ type: 'text', data: { text: `拍一拍开关：${process.env.AI_POKE_ENABLE}` } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg })
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg })
+    if (isPoke) {
+      if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
+        const items = refreshPokeReplyTexts()
+        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
+        await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
+        return true
+      }
+      const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
+      if (addMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
+          return true
+        }
+        const content = String(addMatch[1] || '').trim()
+        if (!content) {
+          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        if (items.includes(content)) {
+          await replyCommandMessage(ws, payload, `该拍一拍文案已存在：${content}`)
+          return true
+        }
+        const saved = savePokeReplyTexts(items.concat(content))
+        await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        return true
+      }
+      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+      if (removeMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
+          return true
+        }
+        const content = String(removeMatch[1] || '').trim()
+        if (!content) {
+          await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        const nextItems = items.filter((item) => item !== content)
+        if (nextItems.length === items.length) {
+          await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
+          return true
+        }
+        const saved = savePokeReplyTexts(nextItems)
+        await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        return true
+      }
+      if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能清空拍一拍文案')
+          return true
+        }
+        savePokeReplyTexts([])
+        await replyCommandMessage(ws, payload, '拍一拍文案已清空')
+        return true
+      }
+      if (/(回复|文案).*(去重)|(?:dedupe|unique)/i.test(nt) || /(回复去重|文案去重)/i.test(compact)) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能去重拍一拍文案')
+          return true
+        }
+        const items = refreshPokeReplyTexts()
+        const saved = savePokeReplyTexts(dedupeTextList(items))
+        const removedCount = items.length - saved.length
+        await replyCommandMessage(ws, payload, `拍一拍文案已去重，移除 ${removedCount} 条重复项，当前共 ${saved.length} 条`)
+        return true
+      }
+      if (isAdminUser) {
+        if (/开启|打开|on/i.test(nt)) process.env.AI_POKE_ENABLE = 'true'
+        if (/关闭|off/i.test(nt)) process.env.AI_POKE_ENABLE = 'false'
+        await replyCommandMessage(ws, payload, `拍一拍开关：${process.env.AI_POKE_ENABLE}｜文案数=${getPokeReplyTexts().length}`)
+        return true
+      }
+      if (/开启|打开|关闭|off|on/i.test(nt)) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理拍一拍配置')
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
       return true
     }
-    return false
-  }
-  if (isBanned) {
-    const list = loadBanned(payload.group_id)
-    if (/列表|查看|list/i.test(nt)) {
-      const msg = [{ type: 'text', data: { text: `违禁词列表：${list.join(',') || '（空）'}｜治理开关=${process.env.AI_MOD_ENABLE||AI_MOD_ENABLE}｜禁言时长=${process.env.AI_BAN_DURATION||AI_BAN_DURATION}s` } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
-      return true
-    }
-    if (!(roleUser === 'owner' || roleUser === 'admin')) {
-      const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
-      if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
-      else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
-      return true
-    } else if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
-      const m = nt.match(/add\s+(.+)/i) || nt.match(/(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i)
-      const w = m ? (m[4] || m[3] || m[1]).trim() : ''
-      if (w) {
-        if (!list.includes(w)) list.push(w)
+    if (isBanned) {
+      const list = loadBanned(payload.group_id)
+      if (/列表|查看|list/i.test(nt)) {
+        const msg = [{ type: 'text', data: { text: `违禁词列表：${list.join(',') || '（空）'}｜治理开关=${process.env.AI_MOD_ENABLE || AI_MOD_ENABLE}｜禁言时长=${process.env.AI_BAN_DURATION || AI_BAN_DURATION}s` } }]
+        await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
+        return true
+      }
+      if (!isAdminUser) {
+        const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
+        if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
+        else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
+        return true
+      } else if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
+        const m = nt.match(/add\s+(.+)/i) || nt.match(/(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i)
+        const w = m ? (m[4] || m[3] || m[1]).trim() : ''
+        if (w) {
+          if (!list.includes(w)) list.push(w)
+          saveBanned(payload.group_id, list)
+          const ok = [{ type: 'text', data: { text: `添加违禁词成功：${w}` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
+      } else if (/rm\s+(.+)/i.test(nt) || /(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i.test(nt)) {
+        const m = nt.match(/rm\s+(.+)/i) || nt.match(/(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i)
+        const w = m ? (m[4] || m[3] || m[1]).trim() : ''
+        if (w) {
+          const idx = list.indexOf(w)
+          if (idx >= 0) list.splice(idx, 1)
+          saveBanned(payload.group_id, list)
+          const ok = [{ type: 'text', data: { text: `删除违禁词成功：${w}` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
+      } else if (/clear|清空|全部删除|重置|reset|empty|purge/i.test(nt)) {
+        while (list.length) list.pop()
         saveBanned(payload.group_id, list)
-        const ok = [{ type: 'text', data: { text: `添加违禁词成功：${w}` } }]
+        const ok = [{ type: 'text', data: { text: '违禁词列表已清空' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-      }
-    } else if (/rm\s+(.+)/i.test(nt) || /(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i.test(nt)) {
-      const m = nt.match(/rm\s+(.+)/i) || nt.match(/(删除|移除|去除)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(删除|移除|去除)\s+(.+)/i)
-      const w = m ? (m[4] || m[3] || m[1]).trim() : ''
-      if (w) {
-        const idx = list.indexOf(w)
-        if (idx >= 0) list.splice(idx, 1)
-        saveBanned(payload.group_id, list)
-        const ok = [{ type: 'text', data: { text: `删除违禁词成功：${w}` } }]
+      } else if (/治理(开启|打开)|moderation on/i.test(nt)) {
+        process.env.AI_MOD_ENABLE = 'true'
+        const ok = [{ type: 'text', data: { text: '违禁词治理已开启' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-      }
-    } else if (/clear|清空|全部删除|重置|reset|empty|purge/i.test(nt)) {
-      while (list.length) list.pop()
-      saveBanned(payload.group_id, list)
-      const ok = [{ type: 'text', data: { text: '违禁词列表已清空' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/治理(开启|打开)|moderation on/i.test(nt)) {
-      process.env.AI_MOD_ENABLE = 'true'
-      const ok = [{ type: 'text', data: { text: '违禁词治理已开启' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/治理关闭|moderation off/i.test(nt)) {
-      process.env.AI_MOD_ENABLE = 'false'
-      const ok = [{ type: 'text', data: { text: '违禁词治理已关闭' } }]
-      await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
-    } else if (/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i.test(nt)) {
-      const m = nt.match(/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i)
-      if (m && m[2]) {
-        const val = parseInt(m[2], 10)
-        const unit = (m[3] || '').trim()
-        const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
-        process.env.AI_BAN_DURATION = String(Math.max(30, sec))
-        const ok = [{ type: 'text', data: { text: `禁言时长已设置为：${process.env.AI_BAN_DURATION}s` } }]
+      } else if (/治理关闭|moderation off/i.test(nt)) {
+        process.env.AI_MOD_ENABLE = 'false'
+        const ok = [{ type: 'text', data: { text: '违禁词治理已关闭' } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+      } else if (/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i.test(nt)) {
+        const m = nt.match(/(禁言时长|duration)\s+(\d+)\s*(秒|分钟|分)?/i)
+        if (m && m[2]) {
+          const val = parseInt(m[2], 10)
+          const unit = (m[3] || '').trim()
+          const sec = unit.includes('分') || unit.includes('分钟') ? val * 60 : val
+          process.env.AI_BAN_DURATION = String(Math.max(30, sec))
+          const ok = [{ type: 'text', data: { text: `禁言时长已设置为：${process.env.AI_BAN_DURATION}s` } }]
+          await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: ok }).catch(() => {})
+        }
       }
+      return true
     }
+  } catch (error) {
+    const message = error && error.message ? String(error.message) : String(error)
+    console.log('命令处理失败', nt, message)
+    await replyCommandMessage(ws, payload, '命令处理失败，请稍后重试')
     return true
   }
   return false

@@ -17,7 +17,21 @@ function readSystemPrompt() {
   return process.env.SYSTEM_PROMPT || '你是一个QQ群内的AI助手，回答简洁且有帮助。'
 }
 
+function readTextListFile(filePath) {
+  if (!filePath) return []
+  const p = path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
+  try {
+    return fs.readFileSync(p, 'utf8')
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('#'))
+  } catch {
+    return []
+  }
+}
+
 const PROXY_URL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+const DEFAULT_IGNORE_REGEX = /^(?:pjsk|b30|msa|msp|mysekai|tsearch|song|taikoupdate|taikorec|taikob|taikotrend|wlsk|sekai|qooapp|cnmusicupdate|cnmusicdiffupdate|sk预测|查房|分数线|段位进度|live订阅)(?:\s|$)/i
 
 module.exports = {
   PROJECT_ROOT,
@@ -35,8 +49,10 @@ module.exports = {
   PROXY_URL,
   HTTPS_AGENT: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
   REQUIRE_PREFIX: String(process.env.AI_REQUIRE_PREFIX || 'true').toLowerCase() === 'true',
+  GROUP_REQUIRE_MENTION: String(process.env.AI_GROUP_REQUIRE_MENTION || 'false').toLowerCase() === 'true',
   PREFIXES: (process.env.AI_PREFIXES || '/ai').split(',').map((s) => s.trim()).filter(Boolean),
-  IGNORE_REGEX: process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : null,
+  ADMIN_USER_IDS: (process.env.AI_ADMIN_USER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean),
+  IGNORE_REGEX: process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : DEFAULT_IGNORE_REGEX,
   MAX_MEDIA_BYTES: parseInt(process.env.AI_MAX_MEDIA_BYTES || '5242880', 10),
   MEDIA_REFERER: process.env.AI_MEDIA_REFERER || '',
   OPENAI_KEY: process.env.OPENAI_API_KEY || '',
@@ -49,7 +65,13 @@ module.exports = {
   OPENAI_TIMEOUT_MS: parseInt(process.env.OPENAI_TIMEOUT_MS || '12000', 10),
   AI_POKE_ENABLE: String(process.env.AI_POKE_ENABLE || 'true').toLowerCase() === 'true',
   AI_POKE_COOLDOWN: parseInt(process.env.AI_POKE_COOLDOWN || '10', 10),
+  AI_POKE_REPLY_FILE: process.env.AI_POKE_REPLY_FILE || 'poke_replies.txt',
   AI_POKE_REPLY_TEXT: process.env.AI_POKE_REPLY_TEXT || '拍了拍',
+  AI_POKE_REPLY_TEXTS: (() => {
+    const fileItems = readTextListFile(process.env.AI_POKE_REPLY_FILE || 'poke_replies.txt')
+    if (fileItems.length > 0) return fileItems
+    return (process.env.AI_POKE_REPLY_TEXTS || process.env.AI_POKE_REPLY_TEXT || '拍了拍').split('|').map((s) => s.trim()).filter(Boolean)
+  })(),
   AI_CONTEXT_ENABLE: String(process.env.AI_CONTEXT_ENABLE || 'true').toLowerCase() === 'true',
   AI_CONTEXT_WINDOW: parseInt(process.env.AI_CONTEXT_WINDOW || '6', 10),
   AI_CONTEXT_TTL: parseInt(process.env.AI_CONTEXT_TTL || '900', 10),
@@ -70,5 +92,14 @@ module.exports = {
   AI_IMAGE_PREPROCESS_LONG_MAX_EDGE: parseInt(process.env.AI_IMAGE_PREPROCESS_LONG_MAX_EDGE || '1080', 10),
   AI_IMAGE_PREPROCESS_JPEG_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_JPEG_QUALITY || '82', 10),
   AI_IMAGE_PREPROCESS_WEBP_QUALITY: parseInt(process.env.AI_IMAGE_PREPROCESS_WEBP_QUALITY || '86', 10),
+  AI_OCR_ENABLE: String(process.env.AI_OCR_ENABLE || 'true').toLowerCase() === 'true',
+  AI_OCR_LANG: process.env.AI_OCR_LANG || 'eng+jpn+chi_sim',
+  AI_OCR_TIMEOUT_MS: parseInt(process.env.AI_OCR_TIMEOUT_MS || '45000', 10),
+  AI_OCR_CACHE_ENABLE: String(process.env.AI_OCR_CACHE_ENABLE || 'true').toLowerCase() === 'true',
+  AI_OCR_CACHE_TTL: parseInt(process.env.AI_OCR_CACHE_TTL || '1800', 10),
+  AI_OCR_MAX_CHARS: parseInt(process.env.AI_OCR_MAX_CHARS || '3000', 10),
+  AI_OCR_TRIGGER_REGEX: process.env.AI_OCR_TRIGGER_REGEX ? new RegExp(process.env.AI_OCR_TRIGGER_REGEX, 'i') : /(写了什么|文字|识别|ocr|翻译|读图|内容|标题|地名|地图|哪个|哪一个|都道府县|县市|是什么字)/i,
+  AI_OCR_ONLY_TEXT_REGEX: process.env.AI_OCR_ONLY_TEXT_REGEX ? new RegExp(process.env.AI_OCR_ONLY_TEXT_REGEX, 'i') : /(写了什么|提取.*文字|识别.*文字|ocr|翻译|读出|图中.*字|图片.*字|截图.*字)/i,
+  AI_OCR_MIN_TEXT_LENGTH: parseInt(process.env.AI_OCR_MIN_TEXT_LENGTH || '12', 10),
   BANNED_PATH: path.join(PROJECT_ROOT, 'banned.json')
 }

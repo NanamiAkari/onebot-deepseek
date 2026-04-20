@@ -43,6 +43,11 @@ function createSessionStore(config) {
     return out.slice(-config.AI_CONTEXT_WINDOW * 2)
   }
 
+  function clearHistory(payload) {
+    const k = getKey(payload)
+    sessionHist.delete(k)
+  }
+
   return {
     pending,
     pokeCooldown,
@@ -52,7 +57,8 @@ function createSessionStore(config) {
     pushHistory,
     getHistoryRaw,
     needContext,
-    getContext
+    getContext,
+    clearHistory
   }
 }
 

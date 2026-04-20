@@ -193,17 +193,43 @@ sudo systemctl restart onebot-deepseek
   - 优先测试简单图片，再测信息密集型截图
 
 ## 触发控制
-- 默认群聊按 `@机器人` + 前缀控制；私聊默认可直接回复。
+- 默认群聊按前缀触发；私聊默认可直接回复。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
-  - `AI_PREFIXES=ai`：多个前缀用逗号分隔，如 `ai,chat`
-  - `AI_IGNORE_REGEX=`：忽略的命令正则，如 `^(pjsk|b30)\\b`
-- 示例：仅对 `ai` 生效，并忽略 `pjsk b30`：
+  - `AI_GROUP_REQUIRE_MENTION=true|false`：群聊是否必须 `@机器人`
+  - `AI_PREFIXES=阿卡林`：多个前缀用逗号分隔，如 `阿卡林,ai`
+  - `AI_ADMIN_USER_IDS=123456,234567`：额外管理员 QQ 号白名单，多个用英文逗号分隔
+  - `AI_IGNORE_REGEX=`：忽略其他 WS 服务命令的正则；群聊和私聊都会生效
+- 示例：群聊不要求 `@`，只要以前缀 `阿卡林` 开头就触发：
 ```
 AI_REQUIRE_PREFIX=true
-AI_PREFIXES=ai
+AI_GROUP_REQUIRE_MENTION=false
+AI_PREFIXES=阿卡林
 AI_IGNORE_REGEX=^(pjsk|b30)\b
 ```
+- 默认已内置一组较保守的 Sakura bot 常见命令前缀屏蔽，例如：
+  - `pjsk`
+  - `b30`
+  - `msa`
+  - `msp`
+  - `mysekai`
+  - `tsearch`
+  - `song`
+  - `taikoupdate`
+  - `taikorec`
+  - `taikob`
+  - `taikotrend`
+  - `wlsk`
+  - `sekai`
+  - `qooapp`
+  - `cnmusicupdate`
+  - `cnmusicdiffupdate`
+  - `sk预测`
+  - `查房`
+  - `分数线`
+  - `段位进度`
+  - `live订阅`
+- 如果你还有其他同机 WS 服务命令，可以继续追加到 `AI_IGNORE_REGEX`
 
 ## 多媒体与图片缓存
 - 支持图片输入；会在调用上游前把图片下载并转为 base64 / `image_url`
@@ -242,24 +268,52 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 监听 OneBot `notice.notify.poke`
 - 仅当拍一拍目标是机器人自身时才响应（`AI_POKE_ONLY_SELF=true`）
 - 平台支持时尝试 `send_group_poke` 反拍；不支持则发送文本回复
+- 支持配置独立文案文件，按行维护多条备选文案并随机回复其中一条
+- 默认优先读取 `AI_POKE_REPLY_FILE` 指向的文本文件；如果文件不存在或为空，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
+- 支持通过管理员命令动态查看和新增文案，写回文件后立即生效
 - 配置项：
   - `AI_POKE_ENABLE`
   - `AI_POKE_COOLDOWN`
+  - `AI_POKE_REPLY_FILE`
   - `AI_POKE_REPLY_TEXT`
+  - `AI_POKE_REPLY_TEXTS`
   - `AI_POKE_ONLY_SELF`
+- 管理命令：
+  - `阿卡林 拍一拍 文案列表`
+  - `阿卡林 拍一拍 文案添加 你好呀`
+  - `阿卡林 拍一拍 文案删除 你好呀`
+  - `阿卡林 拍一拍 文案清空`
+  - `阿卡林 拍一拍 文案去重`
+  - `阿卡林 拍一拍 开启`
+  - `阿卡林 拍一拍 关闭`
+- 权限规则：
+  - `文案列表` 任何人可查看
+  - `文案添加/删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
+
+## 管理员权限
+- 除了 QQ 群内原生 `owner` / `admin`，还支持通过 `.env` 配置额外管理员账号：
+```env
+AI_ADMIN_USER_IDS=123456789,987654321
+```
+- 配置后的账号在私聊和群聊里都可使用管理命令
+- 当前已接入的管理员能力：
+  - 拍一拍文案新增
+  - 拍一拍开关管理
+  - 上下文配置修改
+  - 违禁词治理管理
 
 ## 违禁词治理
 - 违禁词按群持久化保存在 `banned.json`
-- 列表命令任何人可查看；添加/删除/清空/治理开关/禁言时长仅群主或管理员可执行
+- 列表命令任何人可查看；添加/删除/清空/治理开关/禁言时长仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
 - 命中违禁词时，若机器人在群内有管理员权限，将执行禁言
 - 常用命令：
-  - `@机器人 ai 违禁词列表`
-  - `@机器人 ai 违禁词添加 词语`
-  - `@机器人 ai 违禁词删除 词语`
-  - `@机器人 ai 违禁词清空`
-  - `@机器人 ai 违禁词治理开启`
-  - `@机器人 ai 违禁词治理关闭`
-  - `@机器人 ai 禁言时长 10分钟`
+  - `阿卡林 违禁词列表`
+  - `阿卡林 违禁词添加 词语`
+  - `阿卡林 违禁词删除 词语`
+  - `阿卡林 违禁词清空`
+  - `阿卡林 违禁词治理开启`
+  - `阿卡林 违禁词治理关闭`
+  - `阿卡林 禁言时长 10分钟`
 
 ## 提示词文件
 - 默认优先读取 `PROMPT_FILE` 指向的纯文本文件

@@ -11,6 +11,8 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    shouldIgnoreText,
+    GROUP_REQUIRE_MENTION,
     shouldRespond,
     stripPrefix,
     getContext,
@@ -19,6 +21,8 @@ function createMessageHandler(deps) {
     AI_POKE_ENABLE,
     AI_POKE_COOLDOWN,
     AI_POKE_REPLY_TEXT,
+    AI_POKE_REPLY_TEXTS,
+    getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -28,6 +32,16 @@ function createMessageHandler(deps) {
     AI_IMAGE_CONTEXT_MAX,
     AI_IMAGE_ONLY_NO_CALL
   } = deps
+
+  function pickPokeReply() {
+    const dynamicList = typeof getPokeReplyTexts === 'function' ? getPokeReplyTexts() : null
+    const list = Array.isArray(dynamicList) && dynamicList.length > 0
+      ? dynamicList
+      : Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0
+      ? AI_POKE_REPLY_TEXTS
+      : [AI_POKE_REPLY_TEXT]
+    return list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT
+  }
 
   return async function onMessage(ws, data) {
     try {
@@ -60,13 +74,13 @@ function createMessageHandler(deps) {
           try {
             const r = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
             if (!(r && r.status === 'ok')) {
-              const msg = [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
+              const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
               await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg })
             }
           } catch {}
         } else {
           try {
-            const msg = [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
+            const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
             await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
           } catch {}
         }
@@ -94,7 +108,9 @@ function createMessageHandler(deps) {
         }
       }
       const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-      if (!mentioned) return
+      const prefixTriggered = shouldRespond(raw.text)
+      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned) return
+      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered) return
       const content = raw
       if ((!content.media || content.media.length === 0) && content.replyId) {
         const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
@@ -120,6 +136,7 @@ function createMessageHandler(deps) {
       if (cmdHandled) return
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
+      if (hasText && shouldIgnoreText(content.text)) return
       if (!hasText) {
         if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
         if (!hasMedia) return
