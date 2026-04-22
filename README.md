@@ -191,6 +191,19 @@ sudo systemctl restart onebot-deepseek
   - 先提高 `OPENAI_TIMEOUT_MS`
   - 确认图片预处理已开启
   - 优先测试简单图片，再测信息密集型截图
+- 拍一拍文案文件无法写入：
+  - 若 `文案列表` 能用，但 `文案添加` 提示“命令处理失败，请稍后重试”，优先检查 `AI_POKE_REPLY_FILE` 的写权限
+  - systemd 场景下，服务运行用户由 `onebot-deepseek.service` 的 `User=` / `Group=` 决定；文案文件需对该用户可写
+  - 可先查看服务配置，确认实际运行用户：
+```bash
+systemctl cat onebot-deepseek
+```
+  - 重点查看输出中的 `User=` 和 `Group=`
+  - 例如服务以 `www-data:www-data` 运行时，可执行：
+```bash
+sudo chown www-data:www-data /opt/onebot-deepseek/poke_replies.json
+sudo chmod 664 /opt/onebot-deepseek/poke_replies.json
+```
 
 ## 触发控制
 - 默认群聊按前缀触发；私聊默认可直接回复。
@@ -272,6 +285,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 默认优先读取 `AI_POKE_REPLY_FILE` 指向的 JSON 文件；如果文件不存在、为空，或仍是旧的按行文本格式，则回退兼容旧格式，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
 - JSON 数组中的每一项代表一条完整文案，所以单条文案内部可以包含换行
 - 支持通过管理员命令动态查看和新增文案，写回文件后立即生效
+- 若 `文案列表` 正常但 `文案添加/删除/清空/去重` 返回“命令处理失败，请稍后重试”，通常是 `AI_POKE_REPLY_FILE` 对服务运行用户只有读权限没有写权限；systemd 部署时请确认该文件归属与 `User=` 一致
 - 配置项：
   - `AI_POKE_ENABLE`
   - `AI_POKE_COOLDOWN`
@@ -289,6 +303,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 ```
 - 管理命令：
   - `阿卡林 拍一拍 文案列表`
+  - `阿卡林 拍一拍 文案查看 3`
   - `阿卡林 拍一拍 文案添加 你好呀`
   - `阿卡林 拍一拍 文案删除 你好呀`
   - `阿卡林 拍一拍 文案清空`
@@ -297,6 +312,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `阿卡林 拍一拍 关闭`
 - 权限规则：
   - `文案列表` 任何人可查看
+  - `文案查看 序号` 任何人可查看单条完整文案
   - `文案添加/删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
 
 ## 管理员权限

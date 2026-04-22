@@ -129,6 +129,15 @@ function dedupeTextList(list) {
   return Array.from(new Set(normalizeTextList(list)))
 }
 
+function previewPokeReplyText(text) {
+  const normalized = String(text || '').replace(/\r/g, '').trim()
+  if (!normalized) return '（空）'
+  const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean)
+  const firstLines = lines.slice(0, 2).join(' ↵ ')
+  const compact = firstLines.replace(/\s+/g, ' ').trim()
+  return compact.length > 60 ? `${compact.slice(0, 60)}...` : compact
+}
+
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
 }
@@ -783,15 +792,16 @@ function compactCommandText(text) {
 function buildPokeCommandHelp(isAdminUser) {
   const lines = [
     '拍一拍命令：',
-    '1. 拍一拍 文案列表'
+    '1. 拍一拍 文案列表',
+    '2. 拍一拍 文案查看 序号'
   ]
   if (isAdminUser) {
-    lines.push('2. 拍一拍 文案添加 内容')
-    lines.push('3. 拍一拍 文案删除 内容')
-    lines.push('4. 拍一拍 文案清空')
-    lines.push('5. 拍一拍 文案去重')
-    lines.push('6. 拍一拍 开启')
-    lines.push('7. 拍一拍 关闭')
+    lines.push('3. 拍一拍 文案添加 内容')
+    lines.push('4. 拍一拍 文案删除 内容')
+    lines.push('5. 拍一拍 文案清空')
+    lines.push('6. 拍一拍 文案去重')
+    lines.push('7. 拍一拍 开启')
+    lines.push('8. 拍一拍 关闭')
   } else {
     lines.push('其余文案管理和开关命令需要管理员权限')
   }
@@ -838,8 +848,23 @@ async function handleCommands(ws, payload, text) {
     if (isPoke) {
       if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
         const items = refreshPokeReplyTexts()
-        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
+        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${previewPokeReplyText(s)}`).join('\n') : '（空）'
         await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
+        return true
+      }
+      const viewMatch = nt.match(/(?:回复|文案)\s*(?:查看|详情|明细)\s*(\d+)/i) || nt.match(/(?:view|show)\s+(\d+)/i)
+      if (viewMatch) {
+        const items = refreshPokeReplyTexts()
+        const index = parseInt(viewMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请提供正确的文案编号，例如：拍一拍 文案查看 3')
+          return true
+        }
+        if (index > items.length) {
+          await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：\n${items[index - 1]}`)
         return true
       }
       const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
