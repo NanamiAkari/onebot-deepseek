@@ -78,7 +78,7 @@ function resolveProjectFile(filePath) {
 }
 
 function getPokeReplyFilePath() {
-  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.txt')
+  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
 }
 
 function normalizeTextList(lines) {
@@ -89,8 +89,14 @@ function loadPokeReplyTextsFromFile() {
   try {
     const filePath = getPokeReplyFilePath()
     if (!fs.existsSync(filePath)) return []
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) return normalizeTextList(parsed)
+    } catch {}
     return normalizeTextList(
-      fs.readFileSync(filePath, 'utf8')
+      raw
         .split(/\r?\n/)
         .map((s) => s.trim())
         .filter((s) => s && !s.startsWith('#'))
@@ -114,7 +120,7 @@ function getPokeReplyTexts() {
 function savePokeReplyTexts(list) {
   const items = normalizeTextList(list)
   const filePath = getPokeReplyFilePath()
-  fs.writeFileSync(filePath, `${items.join('\n')}\n`, 'utf8')
+  fs.writeFileSync(filePath, `${JSON.stringify(items, null, 2)}\n`, 'utf8')
   currentPokeReplyTexts = items
   return items.slice()
 }

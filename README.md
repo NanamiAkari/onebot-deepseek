@@ -268,8 +268,9 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 监听 OneBot `notice.notify.poke`
 - 仅当拍一拍目标是机器人自身时才响应（`AI_POKE_ONLY_SELF=true`）
 - 平台支持时尝试 `send_group_poke` 反拍；不支持则发送文本回复
-- 支持配置独立文案文件，按行维护多条备选文案并随机回复其中一条
-- 默认优先读取 `AI_POKE_REPLY_FILE` 指向的文本文件；如果文件不存在或为空，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
+- 支持配置独立文案文件，推荐使用 JSON 数组格式维护多条备选文案并随机回复其中一条
+- 默认优先读取 `AI_POKE_REPLY_FILE` 指向的 JSON 文件；如果文件不存在、为空，或仍是旧的按行文本格式，则回退兼容旧格式，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
+- JSON 数组中的每一项代表一条完整文案，所以单条文案内部可以包含换行
 - 支持通过管理员命令动态查看和新增文案，写回文件后立即生效
 - 配置项：
   - `AI_POKE_ENABLE`
@@ -278,6 +279,14 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_POKE_REPLY_TEXT`
   - `AI_POKE_REPLY_TEXTS`
   - `AI_POKE_ONLY_SELF`
+- JSON 文件示例：
+```json
+[
+  "何意味",
+  "第一行\n第二行",
+  "阿卡林在呢"
+]
+```
 - 管理命令：
   - `阿卡林 拍一拍 文案列表`
   - `阿卡林 拍一拍 文案添加 你好呀`

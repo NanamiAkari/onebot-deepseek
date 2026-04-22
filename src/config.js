@@ -21,7 +21,15 @@ function readTextListFile(filePath) {
   if (!filePath) return []
   const p = path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
   try {
-    return fs.readFileSync(p, 'utf8')
+    const raw = fs.readFileSync(p, 'utf8').trim()
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        return parsed.map((s) => String(s || '').trim()).filter(Boolean)
+      }
+    } catch {}
+    return raw
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter((s) => s && !s.startsWith('#'))
@@ -65,10 +73,10 @@ module.exports = {
   OPENAI_TIMEOUT_MS: parseInt(process.env.OPENAI_TIMEOUT_MS || '12000', 10),
   AI_POKE_ENABLE: String(process.env.AI_POKE_ENABLE || 'true').toLowerCase() === 'true',
   AI_POKE_COOLDOWN: parseInt(process.env.AI_POKE_COOLDOWN || '10', 10),
-  AI_POKE_REPLY_FILE: process.env.AI_POKE_REPLY_FILE || 'poke_replies.txt',
+  AI_POKE_REPLY_FILE: process.env.AI_POKE_REPLY_FILE || 'poke_replies.json',
   AI_POKE_REPLY_TEXT: process.env.AI_POKE_REPLY_TEXT || '拍了拍',
   AI_POKE_REPLY_TEXTS: (() => {
-    const fileItems = readTextListFile(process.env.AI_POKE_REPLY_FILE || 'poke_replies.txt')
+    const fileItems = readTextListFile(process.env.AI_POKE_REPLY_FILE || 'poke_replies.json')
     if (fileItems.length > 0) return fileItems
     return (process.env.AI_POKE_REPLY_TEXTS || process.env.AI_POKE_REPLY_TEXT || '拍了拍').split('|').map((s) => s.trim()).filter(Boolean)
   })(),
