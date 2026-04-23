@@ -239,11 +239,11 @@ const onMessage = createMessageHandler({
   AI_POKE_REPLY_TEXTS,
   getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
+  buildPokeReplyMessageSegments: buildPokeReplyMessageSegmentsAsync,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
   AI_IMAGE_HINT_REGEX,
   AI_IMAGE_CONTEXT_MODE,
-  AI_IMAGE_CONTEXT_REQUIRE_SAME_USER,
   AI_IMAGE_CONTEXT_MAX,
   AI_IMAGE_ONLY_NO_CALL
 })
@@ -848,6 +848,28 @@ function buildPokeReplyMessageSegments(item, headerText = '') {
   return segments
 }
 
+async function buildPokeReplyMessageSegmentsAsync(item, headerText = '') {
+  const normalizedItem = normalizePokeReplyItem(item)
+  const segments = []
+  if (headerText) segments.push({ type: 'text', data: { text: headerText } })
+  if (!normalizedItem) {
+    segments.push({ type: 'text', data: { text: '（空）' } })
+    return segments
+  }
+  if (normalizedItem.type === 'image') {
+    const base64 = await sourceToBase64(normalizedItem.source).catch(() => null)
+    if (base64 && base64.data) {
+      segments.push({ type: 'image', data: { file: `base64://${base64.data}` } })
+      return segments
+    }
+    const file = toOutboundImageFile(normalizedItem.source)
+    segments.push({ type: 'image', data: { file } })
+    return segments
+  }
+  segments.push({ type: 'text', data: { text: normalizedItem.content } })
+  return segments
+}
+
 async function replyCommandMessage(ws, payload, text) {
   const msg = Array.isArray(text) ? text : [{ type: 'text', data: { text } }]
   if (payload.message_type === 'group') {
@@ -952,7 +974,7 @@ async function handleCommands(ws, payload, text) {
         const targetItem = normalizePokeReplyItem(items[index - 1])
         if (targetItem && targetItem.type === 'image') {
           await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：[图片回复]`)
-          await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem))
+          await replyCommandMessage(ws, payload, await buildPokeReplyMessageSegmentsAsync(targetItem))
           return true
         }
         await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem, `拍一拍文案 #${index}：\n`))
@@ -981,7 +1003,7 @@ async function handleCommands(ws, payload, text) {
         return true
       }
       const imageAddMatch = nt.match(/(?:图片|图)\s*(?:添加|增加|新增)(?:\s+(.+))?/i)
-        || nt.match(/(?:添加图片|加图)(?:\s+(.+))?/i)
+        || nt.match(/(?:添加图片|加图|加图片)(?:\s+(.+))?/i)
         || nt.match(/(?:imageadd|imgadd|addimage)(?:\s+(.+))?/i)
       if (imageAddMatch) {
         if (!isAdminUser) {
@@ -998,7 +1020,7 @@ async function handleCommands(ws, payload, text) {
           }
         }
         const rawImageAddMatch = String(rawCommandText || '').match(/(?:图片|图)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
-          || String(rawCommandText || '').match(/(?:添加图片|加图)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:添加图片|加图|加图片)\s+([\s\S]+)/i)
           || String(rawCommandText || '').match(/(?:imageadd|imgadd|addimage)\s+([\s\S]+)/i)
         const source = String(
           (imageMedia && pickPokeImageSource(imageMedia))

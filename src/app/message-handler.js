@@ -24,6 +24,7 @@ function createMessageHandler(deps) {
     AI_POKE_REPLY_TEXTS,
     getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
+    buildPokeReplyMessageSegments,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
     AI_IMAGE_HINT_REGEX,
@@ -32,18 +33,7 @@ function createMessageHandler(deps) {
     AI_IMAGE_CONTEXT_MAX,
     AI_IMAGE_ONLY_NO_CALL
   } = deps
-
-  function toOutboundImageFile(source) {
-    const value = String(source || '').trim()
-    if (!value) return ''
-    if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^base64:\/\//i.test(value) || /^file:\/\//i.test(value)) return value
-    if (/^[\\/]/.test(value)) return `file://${encodeURI(value.replace(/\\/g, '/'))}`
-    if (/^[a-zA-Z]:[\\/]/.test(value)) {
-      const normalized = value.replace(/\\/g, '/')
-      return `file:///${encodeURI(normalized)}`
-    }
-    return value
-  }
+  let sendGroupPokeSupported = true
 
   function normalizePokeReplyItem(item) {
     if (typeof item === 'string') {
@@ -67,13 +57,6 @@ function createMessageHandler(deps) {
       ? AI_POKE_REPLY_TEXTS
       : [AI_POKE_REPLY_TEXT]
     return normalizePokeReplyItem(list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT) || { type: 'text', content: AI_POKE_REPLY_TEXT }
-  }
-
-  function buildPokeReplyMessage(item) {
-    const normalizedItem = normalizePokeReplyItem(item)
-    if (!normalizedItem) return [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
-    if (normalizedItem.type === 'image') return [{ type: 'image', data: { file: toOutboundImageFile(normalizedItem.source) } }]
-    return [{ type: 'text', data: { text: normalizedItem.content } }]
   }
 
   return async function onMessage(ws, data) {
@@ -106,13 +89,20 @@ function createMessageHandler(deps) {
         const pokeReply = pickPokeReply()
         if (gid) {
           try {
-            await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
-            const msg = buildPokeReplyMessage(pokeReply)
+            if (sendGroupPokeSupported) {
+              const pokeResult = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
+              if (!(pokeResult && pokeResult.status === 'ok')) sendGroupPokeSupported = false
+            }
+            const msg = typeof buildPokeReplyMessageSegments === 'function'
+              ? await buildPokeReplyMessageSegments(pokeReply)
+              : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
             await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => {})
           } catch {}
         } else {
           try {
-            const msg = buildPokeReplyMessage(pokeReply)
+            const msg = typeof buildPokeReplyMessageSegments === 'function'
+              ? await buildPokeReplyMessageSegments(pokeReply)
+              : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
             await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
           } catch {}
         }
