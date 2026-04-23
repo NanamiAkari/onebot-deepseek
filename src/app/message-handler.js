@@ -33,6 +33,32 @@ function createMessageHandler(deps) {
     AI_IMAGE_ONLY_NO_CALL
   } = deps
 
+  function toOutboundImageFile(source) {
+    const value = String(source || '').trim()
+    if (!value) return ''
+    if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^base64:\/\//i.test(value) || /^file:\/\//i.test(value)) return value
+    if (/^[\\/]/.test(value)) return `file://${encodeURI(value.replace(/\\/g, '/'))}`
+    if (/^[a-zA-Z]:[\\/]/.test(value)) {
+      const normalized = value.replace(/\\/g, '/')
+      return `file:///${encodeURI(normalized)}`
+    }
+    return value
+  }
+
+  function normalizePokeReplyItem(item) {
+    if (typeof item === 'string') {
+      const content = String(item || '').replace(/\r/g, '').trim()
+      return content ? { type: 'text', content } : null
+    }
+    if (!item || typeof item !== 'object') return null
+    if (item.type === 'image') {
+      const source = String(item.source || item.file || item.url || item.localPath || '').trim()
+      return source ? { type: 'image', source } : null
+    }
+    const content = String(item.content || item.text || '').replace(/\r/g, '').trim()
+    return content ? { type: 'text', content } : null
+  }
+
   function pickPokeReply() {
     const dynamicList = typeof getPokeReplyTexts === 'function' ? getPokeReplyTexts() : null
     const list = Array.isArray(dynamicList) && dynamicList.length > 0
@@ -40,7 +66,14 @@ function createMessageHandler(deps) {
       : Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0
       ? AI_POKE_REPLY_TEXTS
       : [AI_POKE_REPLY_TEXT]
-    return list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT
+    return normalizePokeReplyItem(list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT) || { type: 'text', content: AI_POKE_REPLY_TEXT }
+  }
+
+  function buildPokeReplyMessage(item) {
+    const normalizedItem = normalizePokeReplyItem(item)
+    if (!normalizedItem) return [{ type: 'text', data: { text: AI_POKE_REPLY_TEXT } }]
+    if (normalizedItem.type === 'image') return [{ type: 'image', data: { file: toOutboundImageFile(normalizedItem.source) } }]
+    return [{ type: 'text', data: { text: normalizedItem.content } }]
   }
 
   return async function onMessage(ws, data) {
@@ -70,17 +103,16 @@ function createMessageHandler(deps) {
         const last = pokeCooldown.get(key) || 0
         if (now - last < AI_POKE_COOLDOWN * 1000) return
         pokeCooldown.set(key, now)
+        const pokeReply = pickPokeReply()
         if (gid) {
           try {
-            const r = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
-            if (!(r && r.status === 'ok')) {
-              const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
-              await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg })
-            }
+            await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
+            const msg = buildPokeReplyMessage(pokeReply)
+            await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => {})
           } catch {}
         } else {
           try {
-            const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
+            const msg = buildPokeReplyMessage(pokeReply)
             await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
           } catch {}
         }

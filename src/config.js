@@ -26,7 +26,13 @@ function readTextListFile(filePath) {
     try {
       const parsed = JSON.parse(raw)
       if (Array.isArray(parsed)) {
-        return parsed.map((s) => String(s || '').trim()).filter(Boolean)
+        return parsed.map((item) => {
+          if (typeof item === 'string') return String(item || '').trim()
+          if (item && typeof item === 'object' && item.type !== 'image') {
+            return String(item.content || item.text || '').trim()
+          }
+          return ''
+        }).filter(Boolean)
       }
     } catch {}
     return raw

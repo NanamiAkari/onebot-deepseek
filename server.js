@@ -71,7 +71,7 @@ const agentRunner = createAgentRunner({
   maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
-let currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+let currentPokeReplyTexts = []
 
 function resolveProjectFile(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
@@ -81,8 +81,59 @@ function getPokeReplyFilePath() {
   return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
 }
 
-function normalizeTextList(lines) {
-  return lines.map((s) => String(s || '').trim()).filter((s) => s)
+function toOutboundImageFile(source) {
+  const value = String(source || '').trim()
+  if (!value) return ''
+  if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^base64:\/\//i.test(value) || /^file:\/\//i.test(value)) return value
+  if (/^[\\/]/.test(value)) return `file://${encodeURI(value.replace(/\\/g, '/'))}`
+  if (/^[a-zA-Z]:[\\/]/.test(value)) {
+    const normalized = value.replace(/\\/g, '/')
+    return `file:///${encodeURI(normalized)}`
+  }
+  return value
+}
+
+function pickPokeImageSource(item) {
+  if (!item || typeof item !== 'object') return ''
+  return String(item.url || item.source || item.file || item.localPath || '').trim()
+}
+
+function normalizePokeReplyItem(item) {
+  if (typeof item === 'string') {
+    const content = String(item || '').replace(/\r/g, '').trim()
+    return content ? { type: 'text', content } : null
+  }
+  if (!item || typeof item !== 'object') return null
+  if (item.type === 'image') {
+    const source = pickPokeImageSource(item)
+    if (!source) return null
+    const name = String(item.name || '').trim()
+    return name ? { type: 'image', source, name } : { type: 'image', source }
+  }
+  const content = String(item.content || item.text || '').replace(/\r/g, '').trim()
+  return content ? { type: 'text', content } : null
+}
+
+function normalizePokeReplyList(items) {
+  return (Array.isArray(items) ? items : []).map(normalizePokeReplyItem).filter(Boolean)
+}
+
+function serializePokeReplyItem(item) {
+  if (!item || typeof item !== 'object') return null
+  if (item.type === 'image') {
+    const source = String(item.source || '').trim()
+    if (!source) return null
+    const name = String(item.name || '').trim()
+    return name ? { type: 'image', source, name } : { type: 'image', source }
+  }
+  const content = String(item.content || '').replace(/\r/g, '').trim()
+  return content ? { type: 'text', content } : null
+}
+
+function pokeReplySignature(item) {
+  if (!item || typeof item !== 'object') return ''
+  if (item.type === 'image') return `image:${String(item.source || '').trim()}`
+  return `text:${String(item.content || '').replace(/\r/g, '').trim()}`
 }
 
 function loadPokeReplyTextsFromFile() {
@@ -93,9 +144,9 @@ function loadPokeReplyTextsFromFile() {
     if (!raw) return []
     try {
       const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) return normalizeTextList(parsed)
+      if (Array.isArray(parsed)) return normalizePokeReplyList(parsed)
     } catch {}
-    return normalizeTextList(
+    return normalizePokeReplyList(
       raw
         .split(/\r?\n/)
         .map((s) => s.trim())
@@ -109,28 +160,41 @@ function loadPokeReplyTextsFromFile() {
 function refreshPokeReplyTexts() {
   const fileItems = loadPokeReplyTextsFromFile()
   if (fileItems.length > 0) currentPokeReplyTexts = fileItems
-  else currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+  else currentPokeReplyTexts = normalizePokeReplyList(Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS : [AI_POKE_REPLY_TEXT])
   return currentPokeReplyTexts.slice()
 }
 
 function getPokeReplyTexts() {
+  if (!Array.isArray(currentPokeReplyTexts) || currentPokeReplyTexts.length === 0) return refreshPokeReplyTexts()
   return currentPokeReplyTexts.slice()
 }
 
 function savePokeReplyTexts(list) {
-  const items = normalizeTextList(list)
+  const items = normalizePokeReplyList(list)
   const filePath = getPokeReplyFilePath()
-  fs.writeFileSync(filePath, `${JSON.stringify(items, null, 2)}\n`, 'utf8')
+  const serialized = items.map(serializePokeReplyItem).filter(Boolean)
+  fs.writeFileSync(filePath, `${JSON.stringify(serialized, null, 2)}\n`, 'utf8')
   currentPokeReplyTexts = items
   return items.slice()
 }
 
 function dedupeTextList(list) {
-  return Array.from(new Set(normalizeTextList(list)))
+  const seen = new Set()
+  const out = []
+  for (const item of normalizePokeReplyList(list)) {
+    const key = pokeReplySignature(item)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(item)
+  }
+  return out
 }
 
-function previewPokeReplyText(text) {
-  const normalized = String(text || '').replace(/\r/g, '').trim()
+function previewPokeReplyText(item) {
+  const normalizedItem = normalizePokeReplyItem(item)
+  if (!normalizedItem) return '（空）'
+  if (normalizedItem.type === 'image') return '[图片回复]'
+  const normalized = String(normalizedItem.content || '').replace(/\r/g, '').trim()
   if (!normalized) return '（空）'
   const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean)
   const firstLines = lines.slice(0, 2).join(' ↵ ')
@@ -767,8 +831,25 @@ async function getUserRole(ws, groupId, userId) {
   return role
 }
 
+function buildPokeReplyMessageSegments(item, headerText = '') {
+  const normalizedItem = normalizePokeReplyItem(item)
+  const segments = []
+  if (headerText) segments.push({ type: 'text', data: { text: headerText } })
+  if (!normalizedItem) {
+    segments.push({ type: 'text', data: { text: '（空）' } })
+    return segments
+  }
+  if (normalizedItem.type === 'image') {
+    const file = toOutboundImageFile(normalizedItem.source)
+    segments.push({ type: 'image', data: { file } })
+    return segments
+  }
+  segments.push({ type: 'text', data: { text: normalizedItem.content } })
+  return segments
+}
+
 async function replyCommandMessage(ws, payload, text) {
-  const msg = [{ type: 'text', data: { text } }]
+  const msg = Array.isArray(text) ? text : [{ type: 'text', data: { text } }]
   if (payload.message_type === 'group') {
     await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
   } else {
@@ -797,11 +878,12 @@ function buildPokeCommandHelp(isAdminUser) {
   ]
   if (isAdminUser) {
     lines.push('3. 拍一拍 文案添加 内容')
-    lines.push('4. 拍一拍 文案删除 内容')
-    lines.push('5. 拍一拍 文案清空')
-    lines.push('6. 拍一拍 文案去重')
-    lines.push('7. 拍一拍 开启')
-    lines.push('8. 拍一拍 关闭')
+    lines.push('4. 拍一拍 图片添加 / 加图 / 添加图片')
+    lines.push('5. 拍一拍 文案删除 序号')
+    lines.push('6. 拍一拍 文案清空')
+    lines.push('7. 拍一拍 文案去重')
+    lines.push('8. 拍一拍 开启')
+    lines.push('9. 拍一拍 关闭')
   } else {
     lines.push('其余文案管理和开关命令需要管理员权限')
   }
@@ -809,7 +891,8 @@ function buildPokeCommandHelp(isAdminUser) {
 }
 
 async function handleCommands(ws, payload, text) {
-  const t = normalizeCommandText(stripPrefix(text || ''))
+  const rawCommandText = stripPrefix(text || '')
+  const t = normalizeCommandText(rawCommandText)
   const nt = t.replace(/\s+/g, ' ')
   const compact = compactCommandText(t)
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
@@ -846,6 +929,8 @@ async function handleCommands(ws, payload, text) {
       return true
     }
     if (isPoke) {
+      const commandContent = extractContent(payload.message)
+      const commandMedia = await resolveMediaSources(ws, commandContent.media)
       if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
         const items = refreshPokeReplyTexts()
         const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${previewPokeReplyText(s)}`).join('\n') : '（空）'
@@ -864,7 +949,13 @@ async function handleCommands(ws, payload, text) {
           await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
           return true
         }
-        await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：\n${items[index - 1]}`)
+        const targetItem = normalizePokeReplyItem(items[index - 1])
+        if (targetItem && targetItem.type === 'image') {
+          await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：[图片回复]`)
+          await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem))
+          return true
+        }
+        await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem, `拍一拍文案 #${index}：\n`))
         return true
       }
       const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
@@ -873,7 +964,9 @@ async function handleCommands(ws, payload, text) {
           await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
           return true
         }
-        const content = String(addMatch[1] || '').trim()
+        const rawAddMatch = String(rawCommandText || '').match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:add|replyadd)\s+([\s\S]+)/i)
+        const content = String((rawAddMatch && rawAddMatch[1]) || addMatch[1] || '').trim()
         if (!content) {
           await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
           return true
@@ -884,28 +977,69 @@ async function handleCommands(ws, payload, text) {
           return true
         }
         const saved = savePokeReplyTexts(items.concat(content))
-        await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        await replyCommandMessage(ws, payload, `已添加拍一拍文案 #${saved.length}：${previewPokeReplyText(saved[saved.length - 1])}\n当前共 ${saved.length} 条`)
         return true
       }
-      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+      const imageAddMatch = nt.match(/(?:图片|图)\s*(?:添加|增加|新增)(?:\s+(.+))?/i)
+        || nt.match(/(?:添加图片|加图)(?:\s+(.+))?/i)
+        || nt.match(/(?:imageadd|imgadd|addimage)(?:\s+(.+))?/i)
+      if (imageAddMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍图片回复')
+          return true
+        }
+        let imageMedia = (commandMedia || []).find((item) => item && item.kind === 'image')
+        if (!imageMedia && commandContent.replyId) {
+          const replied = await sendAction(ws, 'get_msg', { message_id: commandContent.replyId }).catch(() => null)
+          if (replied && replied.status === 'ok' && replied.data && replied.data.message) {
+            const repliedContent = extractContent(replied.data.message)
+            const repliedMedia = await resolveMediaSources(ws, repliedContent.media)
+            imageMedia = (repliedMedia || []).find((item) => item && item.kind === 'image') || null
+          }
+        }
+        const rawImageAddMatch = String(rawCommandText || '').match(/(?:图片|图)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:添加图片|加图)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:imageadd|imgadd|addimage)\s+([\s\S]+)/i)
+        const source = String(
+          (imageMedia && pickPokeImageSource(imageMedia))
+          || (rawImageAddMatch && rawImageAddMatch[1])
+          || imageAddMatch[1]
+          || ''
+        ).trim()
+        if (!source) {
+          await replyCommandMessage(ws, payload, '请在命令消息中附带图片、引用一条带图片的消息，或在命令后提供图片地址/路径')
+          return true
+        }
+        const item = normalizePokeReplyItem({ type: 'image', source })
+        const items = refreshPokeReplyTexts()
+        if (item && items.some((existing) => pokeReplySignature(existing) === pokeReplySignature(item))) {
+          await replyCommandMessage(ws, payload, '该拍一拍图片回复已存在')
+          return true
+        }
+        const saved = savePokeReplyTexts(items.concat(item))
+        await replyCommandMessage(ws, payload, `已添加拍一拍图片回复 #${saved.length}：[图片回复]\n当前共 ${saved.length} 条`)
+        return true
+      }
+      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s*(\d+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(\d+)/i)
       if (removeMatch) {
         if (!isAdminUser) {
           await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
           return true
         }
-        const content = String(removeMatch[1] || '').trim()
-        if (!content) {
-          await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
+        const index = parseInt(removeMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请提供正确的文案编号，例如：拍一拍 文案删除 3')
           return true
         }
         const items = refreshPokeReplyTexts()
-        const nextItems = items.filter((item) => item !== content)
-        if (nextItems.length === items.length) {
-          await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
+        if (index > items.length) {
+          await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
           return true
         }
+        const removed = items[index - 1]
+        const nextItems = items.slice(0, index - 1).concat(items.slice(index))
         const saved = savePokeReplyTexts(nextItems)
-        await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        await replyCommandMessage(ws, payload, `已删除拍一拍文案 #${index}：${previewPokeReplyText(removed)}\n当前共 ${saved.length} 条`)
         return true
       }
       if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
