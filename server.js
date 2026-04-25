@@ -352,21 +352,21 @@ async function callLLM(text, media, hist, opts) {
 
 function sanitizeText(s) {
   let t = String(s || '')
-  t = t.replace(/```[\s\S]*?```/g, ' ')
-  t = t.replace(/`+/g, '')
+  t = t.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, _lang, body) => `${body}\n`)
+  t = t.replace(/`([^`]*)`/g, '$1')
   t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '')
   t = t.replace(/^\s*([-*+]|(\d+[\.\)]))\s+/gm, '')
-  t = t.replace(/(\*\*|__)(.*?)\1/g, '$2')
-  t = t.replace(/(\*|_)(.*?)\1/g, '$2')
-  t = t.replace(/\$\$[\s\S]*?\$\$/g, ' ')
-  t = t.replace(/\\\[[\s\S]*?\\\]/g, ' ')
-  t = t.replace(/\\\([\s\S]*?\\\)/g, ' ')
-  t = t.replace(/\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}/g, ' ')
+  t = t.replace(/\*\*([\s\S]*?)\*\*/g, '$1')
+  t = t.replace(/\*([\s\S]*?)\*/g, '$1')
+  t = t.replace(/\$\$([\s\S]*?)\$\$/g, '\n$1\n')
+  t = t.replace(/\\\[([\s\S]*?)\\\]/g, '\n$1\n')
+  t = t.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+  t = t.replace(/\\begin\{([^}]+)\}([\s\S]*?)\\end\{\1\}/g, '\n$2\n')
   t = t.replace(/<[^>]+>/g, ' ')
+  t = t.replace(/[ \t]{2,}/g, ' ')
   t = t.replace(/[ \t]+\n/g, '\n')
   t = t.replace(/\n{3,}/g, '\n\n')
-  t = t.trim()
-  return t.slice(0, 2000)
+  return t.trim()
 }
 
 async function callGemini(text, media, opts) {
