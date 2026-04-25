@@ -39,6 +39,8 @@ const {
   OPENAI_NETWORK_ACCESS,
   AI_SIMPLE_MODE,
   OPENAI_TIMEOUT_MS,
+  AI_REPLY_MAX_CHARS,
+  AI_REPLY_CHUNK_CHARS,
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_FILE,
@@ -240,6 +242,7 @@ const onMessage = createMessageHandler({
   getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
   buildPokeReplyMessageSegments: buildPokeReplyMessageSegmentsAsync,
+  AI_REPLY_CHUNK_CHARS,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
   AI_IMAGE_HINT_REGEX,
@@ -563,11 +566,63 @@ async function callDeepseek(text) {
   }
 }
 
-function buildReplySegments(messageId, content) {
-  return [
-    { type: 'reply', data: { id: messageId } },
-    { type: 'text', data: { text: content } }
-  ]
+function splitLongText(text, chunkSize = AI_REPLY_CHUNK_CHARS) {
+  const normalized = String(text || '').replace(/\r/g, '').trim()
+  if (!normalized) return []
+  const chunks = []
+  const paragraphs = normalized.split('\n')
+  let current = ''
+  for (const rawPart of paragraphs) {
+    const part = String(rawPart || '')
+    const candidate = current ? `${current}\n${part}` : part
+    if (candidate.length <= chunkSize) {
+      current = candidate
+      continue
+    }
+    if (current) chunks.push(current)
+    if (part.length <= chunkSize) {
+      current = part
+      continue
+    }
+    for (let i = 0; i < part.length; i += chunkSize) {
+      chunks.push(part.slice(i, i + chunkSize))
+    }
+    current = ''
+  }
+  if (current) chunks.push(current)
+  return chunks.filter(Boolean)
+}
+
+function truncateReplyText(text, maxChars = AI_REPLY_MAX_CHARS) {
+  const normalized = String(text || '').replace(/\r/g, '').trim()
+  if (!normalized) return ''
+  if (normalized.length <= maxChars) return normalized
+  const suffix = '\n\n[后续内容已截断]'
+  const keep = Math.max(0, maxChars - suffix.length)
+  return `${normalized.slice(0, keep)}${suffix}`
+}
+
+function buildReplySegments(messageId, content, options = {}) {
+  const includeReply = options.includeReply !== false
+  const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : AI_REPLY_MAX_CHARS
+  const chunkSize = Number.isFinite(options.chunkSize) ? options.chunkSize : AI_REPLY_CHUNK_CHARS
+  const safeText = truncateReplyText(content, maxChars)
+  const chunks = splitLongText(safeText, chunkSize)
+  if (chunks.length === 0) {
+    return [[
+      ...(includeReply ? [{ type: 'reply', data: { id: messageId } }] : []),
+      { type: 'text', data: { text: '（空）' } }
+    ]]
+  }
+  return chunks.map((chunk, index) => {
+    if (includeReply && index === 0) {
+      return [
+        { type: 'reply', data: { id: messageId } },
+        { type: 'text', data: { text: chunk } }
+      ]
+    }
+    return [{ type: 'text', data: { text: chunk } }]
+  })
 }
 
 function sendAction(ws, action, params) {

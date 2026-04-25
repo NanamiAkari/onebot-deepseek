@@ -25,6 +25,7 @@ function createMessageHandler(deps) {
     getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
     buildPokeReplyMessageSegments,
+    AI_REPLY_CHUNK_CHARS,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
     AI_IMAGE_HINT_REGEX,
@@ -57,6 +58,41 @@ function createMessageHandler(deps) {
       ? AI_POKE_REPLY_TEXTS
       : [AI_POKE_REPLY_TEXT]
     return normalizePokeReplyItem(list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT) || { type: 'text', content: AI_POKE_REPLY_TEXT }
+  }
+
+  function extractTextFromSegments(segments) {
+    if (!Array.isArray(segments)) return ''
+    return segments
+      .filter((seg) => seg && seg.type === 'text' && seg.data && typeof seg.data.text === 'string')
+      .map((seg) => seg.data.text)
+      .join('')
+  }
+
+  function extractRemainingText(batches, startIndex) {
+    if (!Array.isArray(batches)) return ''
+    return batches
+      .slice(startIndex)
+      .map((segments) => extractTextFromSegments(segments))
+      .filter(Boolean)
+      .join('\n')
+      .trim()
+  }
+
+  async function sendReplyBatches(ws, action, payload, batches) {
+    const sentTexts = []
+    for (let index = 0; index < batches.length; index += 1) {
+      const messageSegments = batches[index]
+      const params = action === 'send_group_msg'
+        ? { group_id: payload.group_id, message: messageSegments }
+        : { user_id: payload.user_id, message: messageSegments }
+      const sendResult = await sendAction(ws, action, params).catch(() => null)
+      if (!(sendResult && sendResult.status === 'ok')) {
+        return { ok: false, failedIndex: index, sentTexts }
+      }
+      const textPart = extractTextFromSegments(messageSegments)
+      if (textPart) sentTexts.push(textPart)
+    }
+    return { ok: true, failedIndex: -1, sentTexts }
   }
 
   return async function onMessage(ws, data) {
@@ -182,16 +218,45 @@ function createMessageHandler(deps) {
       })
       const aiText = result && result.text
       if (!aiText) return
-      const messageSegments = buildReplySegments(payload.message_id, aiText)
       const action = isGroup ? 'send_group_msg' : 'send_private_msg'
-      const params = isGroup
-        ? { group_id: payload.group_id, message: messageSegments }
-        : { user_id: payload.user_id, message: messageSegments }
-      const frame = { action, params, echo: String(Date.now()) }
-      try {
-        ws.send(JSON.stringify(frame))
-      } catch {}
-      pushHistory(payload, stripped, aiText)
+      const sentTexts = []
+      const messageBatches = buildReplySegments(payload.message_id, aiText)
+      const firstAttempt = await sendReplyBatches(ws, action, payload, messageBatches)
+      sentTexts.push(...firstAttempt.sentTexts)
+      if (!firstAttempt.ok) {
+        console.log(`AI回复发送失败，尝试去掉引用重发 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
+        const remainingText = extractRemainingText(messageBatches, firstAttempt.failedIndex)
+        if (remainingText) {
+          const retryBatches = buildReplySegments(payload.message_id, remainingText, {
+            includeReply: false,
+            maxChars: Math.max(remainingText.length + 32, 64),
+            chunkSize: AI_REPLY_CHUNK_CHARS
+          })
+          const secondAttempt = await sendReplyBatches(ws, action, payload, retryBatches)
+          sentTexts.push(...secondAttempt.sentTexts)
+          if (!secondAttempt.ok) {
+            const fallbackText = extractRemainingText(retryBatches, secondAttempt.failedIndex)
+            const smallerChunkChars = Math.max(250, Math.min(AI_REPLY_CHUNK_CHARS - 1, Math.floor(AI_REPLY_CHUNK_CHARS * 0.6)))
+            console.log(`AI回复发送失败，尝试更小分段重发 chunk=${smallerChunkChars}`)
+            if (fallbackText) {
+              const thirdBatches = buildReplySegments(payload.message_id, fallbackText, {
+                includeReply: false,
+                maxChars: Math.max(fallbackText.length + 32, 64),
+                chunkSize: smallerChunkChars
+              })
+              const thirdAttempt = await sendReplyBatches(ws, action, payload, thirdBatches)
+              sentTexts.push(...thirdAttempt.sentTexts)
+              if (!thirdAttempt.ok) {
+                console.log(`AI回复发送最终失败 index=${thirdAttempt.failedIndex + 1}/${thirdBatches.length}`)
+              }
+            }
+          }
+        } else {
+          console.log('AI回复发送失败，未提取到可重发的剩余文本')
+        }
+      }
+      const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
+      pushHistory(payload, stripped, deliveredText)
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)

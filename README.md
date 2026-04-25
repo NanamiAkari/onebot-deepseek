@@ -158,6 +158,9 @@ sudo systemctl restart onebot-deepseek
   - `OpenAI媒体数量: 1`
   - `OpenAI成功`
   - `OpenAI失败 media=1 timeout=...`
+- AI 回复发送保护：
+  - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
+  - `AI_REPLY_CHUNK_CHARS=750`：单条消息的分段长度，超长回复会按段拆开发送
 - Agent loop：
   - `Agent step 1/5: 调用模型`
   - `Agent step 1/5: 调用工具 get_msg args=...`

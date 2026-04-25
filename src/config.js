@@ -77,6 +77,8 @@ module.exports = {
   OPENAI_NETWORK_ACCESS: process.env.OPENAI_NETWORK_ACCESS || '',
   AI_SIMPLE_MODE: String(process.env.AI_SIMPLE_MODE || 'false').toLowerCase() === 'true',
   OPENAI_TIMEOUT_MS: parseInt(process.env.OPENAI_TIMEOUT_MS || '12000', 10),
+  AI_REPLY_MAX_CHARS: parseInt(process.env.AI_REPLY_MAX_CHARS || '3200', 10),
+  AI_REPLY_CHUNK_CHARS: parseInt(process.env.AI_REPLY_CHUNK_CHARS || '750', 10),
   AI_POKE_ENABLE: String(process.env.AI_POKE_ENABLE || 'true').toLowerCase() === 'true',
   AI_POKE_COOLDOWN: parseInt(process.env.AI_POKE_COOLDOWN || '10', 10),
   AI_POKE_REPLY_FILE: process.env.AI_POKE_REPLY_FILE || 'poke_replies.json',
