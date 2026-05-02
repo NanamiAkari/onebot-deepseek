@@ -45,6 +45,7 @@ const {
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_FILE,
+  AI_CUSTOM_REPLY_FILE,
   AI_POKE_REPLY_TEXT,
   AI_POKE_REPLY_TEXTS,
   AI_CONTEXT_ENABLE,
@@ -63,7 +64,7 @@ const {
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
+const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
 const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
@@ -82,6 +83,10 @@ function resolveProjectFile(filePath) {
 
 function getPokeReplyFilePath() {
   return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
+}
+
+function getCustomReplyFilePath() {
+  return resolveProjectFile(AI_CUSTOM_REPLY_FILE || 'custom_replies.json')
 }
 
 function toOutboundImageFile(source) {
@@ -225,6 +230,204 @@ function previewPokeReplyText(item) {
   return compact.length > 60 ? `${compact.slice(0, 60)}...` : compact
 }
 
+function normalizeCustomReplyTrigger(text) {
+  return String(text || '').replace(/\r/g, '').trim()
+}
+
+function normalizeCustomReplySegment(segment) {
+  if (!segment || typeof segment !== 'object') return null
+  if (segment.type === 'text') {
+    const text = String(segment.data && segment.data.text || segment.text || '').replace(/\r/g, '')
+    return text ? { type: 'text', data: { text } } : null
+  }
+  if (segment.type === 'image') {
+    const source = String(segment.source || (segment.data && (segment.data.source || segment.data.file || segment.data.url)) || '').trim()
+    return source ? { type: 'image', source } : null
+  }
+  if (segment.type === 'face' || segment.type === 'emoji' || segment.type === 'mface') {
+    return { type: segment.type, data: { ...(segment.data || {}) } }
+  }
+  return null
+}
+
+function normalizeCustomReplyEntry(entry) {
+  const rawSegments = Array.isArray(entry) ? entry : (entry && Array.isArray(entry.segments) ? entry.segments : [])
+  const segments = rawSegments.map(normalizeCustomReplySegment).filter(Boolean)
+  return segments.length > 0 ? { segments } : null
+}
+
+function customReplyEntrySignature(entry) {
+  const normalized = normalizeCustomReplyEntry(entry)
+  return normalized ? JSON.stringify(normalized.segments) : ''
+}
+
+function previewCustomReplyEntry(entry) {
+  const normalized = normalizeCustomReplyEntry(entry)
+  if (!normalized) return '（空）'
+  const parts = []
+  for (const segment of normalized.segments) {
+    if (segment.type === 'text') {
+      const text = String(segment.data && segment.data.text || '').replace(/\s+/g, ' ').trim()
+      if (text) parts.push(text)
+    } else if (segment.type === 'image') {
+      parts.push('[图片]')
+    } else if (segment.type === 'face' || segment.type === 'emoji' || segment.type === 'mface') {
+      parts.push('[表情]')
+    }
+  }
+  const compact = parts.join(' ').trim() || '（空）'
+  return compact.length > 60 ? `${compact.slice(0, 60)}...` : compact
+}
+
+function loadCustomReplyStore() {
+  const filePath = getCustomReplyFilePath()
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const store = {}
+    for (const [groupId, groupValue] of Object.entries(parsed)) {
+      if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue
+      const groupStore = {}
+      for (const [trigger, replies] of Object.entries(groupValue)) {
+        const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+        if (!normalizedTrigger) continue
+        const normalizedReplies = (Array.isArray(replies) ? replies : [])
+          .map(normalizeCustomReplyEntry)
+          .filter(Boolean)
+        if (normalizedReplies.length > 0) groupStore[normalizedTrigger] = normalizedReplies
+      }
+      if (Object.keys(groupStore).length > 0) store[String(groupId)] = groupStore
+    }
+    return store
+  } catch {
+    return {}
+  }
+}
+
+function saveCustomReplyStore(store) {
+  const filePath = getCustomReplyFilePath()
+  const normalizedStore = {}
+  for (const [groupId, groupValue] of Object.entries(store || {})) {
+    if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue
+    const groupStore = {}
+    for (const [trigger, replies] of Object.entries(groupValue)) {
+      const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+      if (!normalizedTrigger) continue
+      const normalizedReplies = (Array.isArray(replies) ? replies : [])
+        .map(normalizeCustomReplyEntry)
+        .filter(Boolean)
+      if (normalizedReplies.length > 0) groupStore[normalizedTrigger] = normalizedReplies
+    }
+    if (Object.keys(groupStore).length > 0) normalizedStore[String(groupId)] = groupStore
+  }
+  fs.writeFileSync(filePath, `${JSON.stringify(normalizedStore, null, 2)}\n`, 'utf8')
+  return normalizedStore
+}
+
+function listCustomReplyTriggers(groupId) {
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  return Object.entries(groupStore).map(([trigger, replies]) => ({
+    trigger,
+    replies: Array.isArray(replies) ? replies : []
+  }))
+}
+
+function getCustomReplyEntries(groupId, trigger) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger) return []
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
+  return replies.map(normalizeCustomReplyEntry).filter(Boolean)
+}
+
+function addCustomReply(groupId, trigger, entry) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  const normalizedEntry = normalizeCustomReplyEntry(entry)
+  if (!normalizedTrigger || !normalizedEntry) return { ok: false, reason: 'invalid' }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey] && typeof store[groupKey] === 'object' ? store[groupKey] : {}
+  const currentReplies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger].slice() : []
+  const signature = customReplyEntrySignature(normalizedEntry)
+  if (signature && currentReplies.some((item) => customReplyEntrySignature(item) === signature)) {
+    return { ok: false, reason: 'duplicate', count: currentReplies.length }
+  }
+  currentReplies.push(normalizedEntry)
+  groupStore[normalizedTrigger] = currentReplies
+  store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, count: currentReplies.length, totalTriggers: Object.keys(groupStore).length, entry: normalizedEntry }
+}
+
+function removeCustomReply(groupId, trigger) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger) return { ok: false }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  if (!groupStore || !groupStore[normalizedTrigger]) return { ok: false }
+  const removed = groupStore[normalizedTrigger]
+  delete groupStore[normalizedTrigger]
+  if (Object.keys(groupStore).length === 0) delete store[groupKey]
+  else store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, removedCount: Array.isArray(removed) ? removed.length : 0 }
+}
+
+function removeCustomReplyEntry(groupId, trigger, index) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger || !Number.isInteger(index) || index < 1) return { ok: false, reason: 'invalid' }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  const replies = groupStore && Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger].slice() : null
+  if (!replies || index > replies.length) return { ok: false, reason: 'missing' }
+  const removed = normalizeCustomReplyEntry(replies[index - 1])
+  replies.splice(index - 1, 1)
+  if (replies.length === 0) delete groupStore[normalizedTrigger]
+  else groupStore[normalizedTrigger] = replies
+  if (Object.keys(groupStore).length === 0) delete store[groupKey]
+  else store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, removed, remainingCount: replies.length }
+}
+
+function clearCustomReplies(groupId) {
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  if (!groupStore || typeof groupStore !== 'object') return { ok: false, removedTriggers: 0, removedReplies: 0 }
+  const removedTriggers = Object.keys(groupStore).length
+  const removedReplies = Object.values(groupStore).reduce((sum, replies) => sum + (Array.isArray(replies) ? replies.length : 0), 0)
+  delete store[groupKey]
+  saveCustomReplyStore(store)
+  return { ok: true, removedTriggers, removedReplies }
+}
+
+function pickCustomReply(groupId, text) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(text)
+  if (!normalizedTrigger) return null
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
+  if (replies.length === 0) return null
+  return normalizeCustomReplyEntry(replies[Math.floor(Math.random() * replies.length)])
+}
+
+function hasCustomReplyTrigger(groupId, text) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(text)
+  if (!normalizedTrigger) return false
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
+  return replies.length > 0
+}
+
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
 }
@@ -249,6 +452,9 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  handleCustomReplyDraftInput,
+  handleCustomReplyMatch,
+  hasCustomReplyTrigger,
   shouldIgnoreText,
   GROUP_REQUIRE_MENTION,
   shouldRespond,
@@ -868,6 +1074,181 @@ async function sourceToBase64(src) {
     return null
   }
 }
+
+async function captureCustomReplySegments(ws, message) {
+  const segments = []
+  if (typeof message === 'string') {
+    const text = String(message || '').replace(/\r/g, '')
+    if (text.trim()) segments.push({ type: 'text', data: { text } })
+    return segments
+  }
+  if (!Array.isArray(message)) return segments
+  for (const seg of message) {
+    if (!seg || typeof seg !== 'object') continue
+    if (seg.type === 'text') {
+      const text = String(seg.data && seg.data.text || '').replace(/\r/g, '')
+      if (text) segments.push({ type: 'text', data: { text } })
+      continue
+    }
+    if (seg.type === 'image' && seg.data) {
+      let source = pickPokeImageSource(seg.data)
+      const fileRef = seg.data.file || ''
+      if ((!source || !isDirectMediaSource(source)) && fileRef && !isDirectMediaSource(fileRef)) {
+        const resp = await sendAction(ws, 'get_image', { file: fileRef }).catch(() => null)
+        if (resp && resp.status === 'ok' && resp.data) {
+          source = pickPokeImageSource({ ...resp.data, file: fileRef })
+        }
+      }
+      const persistedSource = await persistPokeImageSource(source).catch(() => source)
+      const normalized = normalizeCustomReplySegment({ type: 'image', source: persistedSource || source })
+      if (normalized) segments.push(normalized)
+      continue
+    }
+    if (seg.type === 'face' || seg.type === 'emoji' || seg.type === 'mface') {
+      const normalized = normalizeCustomReplySegment({ type: seg.type, data: { ...(seg.data || {}) } })
+      if (normalized) segments.push(normalized)
+    }
+  }
+  return segments
+}
+
+async function buildImageMessageVariants(source) {
+  const actualSource = await persistPokeImageSource(source).catch(() => source)
+  const variants = []
+  const seen = new Set()
+  const pushVariant = (segment) => {
+    const key = JSON.stringify(segment)
+    if (seen.has(key)) return
+    seen.add(key)
+    variants.push(segment)
+  }
+  if (isLocalFileSource(actualSource)) {
+    const file = toOutboundImageFile(actualSource)
+    if (file) pushVariant({ type: 'image', data: { file } })
+  }
+  const base64 = await sourceToBase64(actualSource).catch(() => null)
+  if (base64 && base64.data) pushVariant({ type: 'image', data: { file: `base64://${base64.data}` } })
+  const file = toOutboundImageFile(actualSource)
+  if (file) pushVariant({ type: 'image', data: { file } })
+  return variants
+}
+
+function combineCustomReplyVariants(variantSets, limit = 8) {
+  let combined = [[]]
+  for (const variants of variantSets) {
+    const next = []
+    for (const current of combined) {
+      for (const variant of variants) {
+        next.push(current.concat([variant]))
+        if (next.length >= limit) break
+      }
+      if (next.length >= limit) break
+    }
+    combined = next
+    if (combined.length >= limit) break
+  }
+  return combined
+}
+
+async function buildCustomReplyMessageVariants(entry, headerText = '') {
+  const normalized = normalizeCustomReplyEntry(entry)
+  const prefix = headerText ? [{ type: 'text', data: { text: headerText } }] : []
+  if (!normalized) return [prefix.concat([{ type: 'text', data: { text: '（空）' } }])]
+  const variantSets = []
+  for (const segment of normalized.segments) {
+    if (segment.type === 'image') {
+      const variants = await buildImageMessageVariants(segment.source)
+      if (variants.length > 0) variantSets.push(variants)
+      continue
+    }
+    variantSets.push([segment])
+  }
+  if (variantSets.length === 0) return [prefix.concat([{ type: 'text', data: { text: '（空）' } }])]
+  return combineCustomReplyVariants(variantSets).map((segments) => prefix.concat(segments))
+}
+
+function getCustomReplyDraftKey(payload) {
+  return `g:${payload.group_id || ''}:u:${payload.user_id || ''}`
+}
+
+const CUSTOM_REPLY_DRAFT_TTL_MS = 10 * 60 * 1000
+
+function createCustomReplyDraft(stage, extra = {}) {
+  return {
+    stage,
+    ...extra,
+    updatedAt: Date.now(),
+    expiresAt: Date.now() + CUSTOM_REPLY_DRAFT_TTL_MS
+  }
+}
+
+function isCustomReplyDraftExpired(draft) {
+  if (!draft || typeof draft !== 'object') return true
+  return Number(draft.expiresAt || 0) > 0 && Date.now() > Number(draft.expiresAt || 0)
+}
+
+function purgeExpiredCustomReplyDrafts() {
+  for (const [key, draft] of customReplyDrafts.entries()) {
+    if (isCustomReplyDraftExpired(draft)) customReplyDrafts.delete(key)
+  }
+}
+
+async function handleCustomReplyDraftInput(ws, payload) {
+  if (!payload || payload.message_type !== 'group') return false
+  purgeExpiredCustomReplyDrafts()
+  const draftKey = getCustomReplyDraftKey(payload)
+  const draft = customReplyDrafts.get(draftKey)
+  if (!draft) return false
+  if (isCustomReplyDraftExpired(draft)) {
+    customReplyDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '创建自定义回复已超时，请重新发送“阿卡林 创建自定义回复”开始')
+    return true
+  }
+  const content = extractContent(payload.message)
+  const triggerText = normalizeCustomReplyTrigger(content.text)
+  if (triggerText === '取消') {
+    customReplyDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '已取消创建自定义回复')
+    return true
+  }
+  if (draft.stage === 'await_trigger') {
+    if (!triggerText) {
+      customReplyDrafts.set(draftKey, createCustomReplyDraft('await_trigger'))
+      await replyCommandMessage(ws, payload, '请输入要被触发的文本内容，例如：测试')
+      return true
+    }
+    customReplyDrafts.set(draftKey, createCustomReplyDraft('await_reply', { trigger: triggerText }))
+    await replyCommandMessage(ws, payload, `已记录被回复内容：${triggerText}\n请发送回复内容，可包含文本、图片、表情等；发送“取消”可退出`)
+    return true
+  }
+  if (draft.stage === 'await_reply') {
+    const replySegments = await captureCustomReplySegments(ws, payload.message)
+    if (replySegments.length === 0) {
+      customReplyDrafts.set(draftKey, createCustomReplyDraft('await_reply', { trigger: draft.trigger }))
+      await replyCommandMessage(ws, payload, '未识别到可保存的回复内容，请发送文本、图片或表情，或发送“取消”退出')
+      return true
+    }
+    const added = addCustomReply(payload.group_id, draft.trigger, { segments: replySegments })
+    customReplyDrafts.delete(draftKey)
+    if (!added.ok && added.reason === 'duplicate') {
+      await replyCommandMessage(ws, payload, `该自定义回复已存在：${draft.trigger} => ${previewCustomReplyEntry({ segments: replySegments })}`)
+      return true
+    }
+    await replyCommandMessage(ws, payload, `已创建自定义回复：${draft.trigger} => ${previewCustomReplyEntry(added.entry)}\n当前该关键词共有 ${added.count} 条回复`)
+    return true
+  }
+  customReplyDrafts.delete(draftKey)
+  return false
+}
+
+async function handleCustomReplyMatch(ws, payload, text) {
+  if (!payload || payload.message_type !== 'group') return false
+  const entry = pickCustomReply(payload.group_id, text)
+  if (!entry) return false
+  await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(entry))
+  return true
+}
+
 process.on('SIGINT', () => {
   try { wss.close() } catch {}
   process.exit(0)
@@ -1050,6 +1431,22 @@ function buildPokeCommandHelp(isAdminUser) {
   return lines.join('\n')
 }
 
+function buildCustomReplyHelp(isAdminUser) {
+  const lines = [
+    '自定义回复命令：',
+    '1. 创建自定义回复',
+    '2. 自定义回复 添加 触发词 => 回复文本',
+    '3. 自定义回复 列表',
+    '4. 自定义回复 查看 触发词',
+    '5. 自定义回复 删除 触发词',
+    '6. 自定义回复 删除 触发词 第N条',
+    '7. 自定义回复 清空',
+    '8. 交互创建过程中发送“取消”可退出'
+  ]
+  if (!isAdminUser) lines.push('以上命令需要管理员权限')
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
   const rawCommandText = stripPrefix(text || '')
   const t = normalizeCommandText(rawCommandText)
@@ -1058,7 +1455,9 @@ async function handleCommands(ws, payload, text) {
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
   const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
-  const matchedCommand = isBanned || isContext || isPoke
+  const isCustomReply = /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(nt)
+    || /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(compact)
+  const matchedCommand = isBanned || isContext || isPoke || isCustomReply
   if (!matchedCommand) return false
   try {
     const isGroup = payload.message_type === 'group'
@@ -1234,6 +1633,129 @@ async function handleCommands(ws, payload, text) {
         return true
       }
       await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
+      return true
+    }
+    if (isCustomReply) {
+      if (!isGroup) {
+        await replyCommandMessage(ws, payload, '自定义回复目前仅支持群聊')
+        return true
+      }
+      const draftKey = getCustomReplyDraftKey(payload)
+      purgeExpiredCustomReplyDrafts()
+      const currentDraft = customReplyDrafts.get(draftKey)
+      const startInteractive = /^(创建自定义回复|自定义回复创建|自定义回复新建)$/i.test(nt) || /^(创建自定义回复|自定义回复创建|自定义回复新建)$/i.test(compact)
+      const cancelInteractive = /^(取消自定义回复|取消创建自定义回复|自定义回复取消)$/i.test(nt) || /^(取消自定义回复|取消创建自定义回复|自定义回复取消)$/i.test(compact)
+      const listRules = /^(自定义回复|关键词回复|关键字回复).*(列表|list)$/i.test(nt) || /(自定义回复列表|关键词回复列表|关键字回复列表)/i.test(compact)
+      const viewMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:查看|详情|明细|show|view)\s+([\s\S]+)$/i)
+      const removeEntryMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:删除|移除|去除)\s+([\s\S]+?)\s*(?:第\s*)?(\d+)\s*条?$/i)
+      const removeMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:删除|移除|去除)\s+(.+)$/i)
+      const clearRules = /^(?:自定义回复|关键词回复|关键字回复).*(清空|重置|clear|reset|empty|purge)$/i.test(nt)
+        || /(自定义回复清空|关键词回复清空|关键字回复清空|自定义回复重置)/i.test(compact)
+      const rawAddMatch = String(rawCommandText || '').match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:添加|新增|创建)\s+([\s\S]+?)\s*(?:=>|->|＝>|→)\s*([\s\S]+)$/i)
+
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理自定义回复')
+        return true
+      }
+      if (cancelInteractive) {
+        if (currentDraft) {
+          customReplyDrafts.delete(draftKey)
+          await replyCommandMessage(ws, payload, '已取消创建自定义回复')
+        } else {
+          await replyCommandMessage(ws, payload, '当前没有正在进行的自定义回复创建流程')
+        }
+        return true
+      }
+      if (startInteractive) {
+        customReplyDrafts.set(draftKey, createCustomReplyDraft('await_trigger'))
+        await replyCommandMessage(ws, payload, '请输入被回复内容\n10分钟内未继续将自动取消')
+        return true
+      }
+      if (rawAddMatch) {
+        const trigger = normalizeCustomReplyTrigger(rawAddMatch[1])
+        const replyText = String(rawAddMatch[2] || '').replace(/\r/g, '').trim()
+        if (!trigger || !replyText) {
+          await replyCommandMessage(ws, payload, '请使用：自定义回复 添加 触发词 => 回复文本')
+          return true
+        }
+        const added = addCustomReply(payload.group_id, trigger, {
+          segments: [{ type: 'text', data: { text: replyText } }]
+        })
+        if (!added.ok && added.reason === 'duplicate') {
+          await replyCommandMessage(ws, payload, `该自定义回复已存在：${trigger} => ${replyText}`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建自定义回复：${trigger} => ${replyText}\n当前该关键词共有 ${added.count} 条回复`)
+        return true
+      }
+      if (listRules) {
+        const rules = listCustomReplyTriggers(payload.group_id)
+        if (rules.length === 0) {
+          await replyCommandMessage(ws, payload, '当前群还没有自定义回复')
+          return true
+        }
+        const body = rules
+          .map((rule, index) => `${index + 1}. ${rule.trigger}（${rule.replies.length} 条） 示例：${previewCustomReplyEntry(rule.replies[0])}`)
+          .join('\n')
+        await replyCommandMessage(ws, payload, `当前群自定义回复列表：\n${body}`)
+        return true
+      }
+      if (viewMatch) {
+        const trigger = normalizeCustomReplyTrigger(viewMatch[1])
+        if (!trigger) {
+          await replyCommandMessage(ws, payload, '请提供要查看的触发词，例如：自定义回复 查看 测试')
+          return true
+        }
+        const entries = getCustomReplyEntries(payload.group_id, trigger)
+        if (entries.length === 0) {
+          await replyCommandMessage(ws, payload, `未找到触发词为“${trigger}”的自定义回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `自定义回复：${trigger}\n共 ${entries.length} 条`)
+        for (let index = 0; index < entries.length; index += 1) {
+          await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(entries[index], `#${index + 1}：\n`))
+        }
+        return true
+      }
+      if (removeEntryMatch) {
+        const trigger = normalizeCustomReplyTrigger(removeEntryMatch[1])
+        const index = parseInt(removeEntryMatch[2], 10)
+        if (!trigger || !Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请使用：自定义回复 删除 触发词 第2条')
+          return true
+        }
+        const removed = removeCustomReplyEntry(payload.group_id, trigger, index)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, `未找到“${trigger}”的第 ${index} 条回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除自定义回复：${trigger} 第 ${index} 条\n内容：${previewCustomReplyEntry(removed.removed)}\n剩余 ${removed.remainingCount} 条`)
+        return true
+      }
+      if (removeMatch) {
+        const trigger = normalizeCustomReplyTrigger(removeMatch[1])
+        if (!trigger) {
+          await replyCommandMessage(ws, payload, '请提供要删除的触发词，例如：自定义回复 删除 测试')
+          return true
+        }
+        const removed = removeCustomReply(payload.group_id, trigger)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, `未找到触发词为“${trigger}”的自定义回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除自定义回复：${trigger}（共 ${removed.removedCount} 条回复）`)
+        return true
+      }
+      if (clearRules) {
+        const cleared = clearCustomReplies(payload.group_id)
+        if (!cleared.ok) {
+          await replyCommandMessage(ws, payload, '当前群没有可清空的自定义回复')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已清空当前群自定义回复：移除 ${cleared.removedTriggers} 个触发词，共 ${cleared.removedReplies} 条回复`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildCustomReplyHelp(isAdminUser))
       return true
     }
     if (isBanned) {

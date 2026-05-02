@@ -11,6 +11,9 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    handleCustomReplyDraftInput,
+    handleCustomReplyMatch,
+    hasCustomReplyTrigger,
     shouldIgnoreText,
     GROUP_REQUIRE_MENTION,
     shouldRespond,
@@ -179,10 +182,6 @@ function createMessageHandler(deps) {
           }
         }
       }
-      const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-      const prefixTriggered = shouldRespond(raw.text)
-      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned) return
-      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered) return
       const content = raw
       if ((!content.media || content.media.length === 0) && content.replyId) {
         const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
@@ -200,12 +199,23 @@ function createMessageHandler(deps) {
           if (!content.text && q.text) content.text = q.text
         }
       }
+      const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
+      if (customDraftHandled) return
+      const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
+      const prefixTriggered = shouldRespond(raw.text)
+      const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
+        ? hasCustomReplyTrigger(payload.group_id, raw.text)
+        : false
+      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned && !customReplyTriggered) return
+      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       if (isGroup) {
         const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
         if (ban) return
       }
       const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
+      const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
+      if (customMatched) return
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
       if (hasText && shouldIgnoreText(content.text)) return

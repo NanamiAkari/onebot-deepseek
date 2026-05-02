@@ -4,6 +4,7 @@ function createSessionStore(config) {
   const sessionHist = new Map()
   const roleCache = new Map()
   const mediaCache = new Map()
+  const customReplyDrafts = new Map()
 
   function getKey(payload) {
     const isGroup = payload.message_type === 'group'
@@ -53,6 +54,7 @@ function createSessionStore(config) {
     pokeCooldown,
     roleCache,
     mediaCache,
+    customReplyDrafts,
     getKey,
     pushHistory,
     getHistoryRaw,
