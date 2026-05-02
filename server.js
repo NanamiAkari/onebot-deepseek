@@ -1,5 +1,6 @@
 const { WebSocketServer } = require('ws')
 const axios = require('axios')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const config = require('./src/config')
@@ -95,9 +96,29 @@ function toOutboundImageFile(source) {
   return value
 }
 
+function isTransientQqCachePath(source) {
+  const value = String(source || '').trim().replace(/\\/g, '/')
+  if (!value) return false
+  return /\/\.config\/QQ\//i.test(value)
+    || /\/nt_data\/Pic\//i.test(value)
+    || /\/NapCat\/temp\//i.test(value)
+}
+
 function pickPokeImageSource(item) {
   if (!item || typeof item !== 'object') return ''
-  return String(item.url || item.source || item.file || item.localPath || '').trim()
+  const localPath = String(item.localPath || '').trim()
+  const source = String(item.source || '').trim()
+  const url = String(item.url || '').trim()
+  if (localPath && !isTransientQqCachePath(localPath)) return localPath
+  if (source && !isTransientQqCachePath(source)) return source
+  if (url && !isQqImageUrl(url)) return url
+  if (url) return url
+  if (localPath) return localPath
+  if (source) return source
+
+  const file = String(item.file || '').trim()
+  if (isDirectMediaSource(file)) return file
+  return file
 }
 
 function normalizePokeReplyItem(item) {
@@ -729,8 +750,49 @@ function detectMimeFromExt(filePath) {
     : 'application/octet-stream'
 }
 
+function detectImageExtFromMime(mime) {
+  const normalized = String(mime || '').toLowerCase()
+  return normalized === 'image/jpeg' ? '.jpg'
+    : normalized === 'image/png' ? '.png'
+    : normalized === 'image/gif' ? '.gif'
+    : normalized === 'image/webp' ? '.webp'
+    : '.img'
+}
+
 function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
+}
+
+function isLocalFileSource(src) {
+  const value = String(src || '').trim()
+  return /^file:\/\//i.test(value) || /^[\\/]/.test(value) || /^[a-zA-Z]:[\\/]/.test(value)
+}
+
+async function persistPokeImageSource(source) {
+  const value = String(source || '').trim()
+  if (!value) return ''
+
+  const ownedDir = path.join(PROJECT_ROOT, 'poke_media')
+  const normalizedOwnedDir = path.resolve(ownedDir)
+  if (isLocalFileSource(value)) {
+    try {
+      const localPath = /^file:\/\//i.test(value)
+        ? decodeURIComponent(value.replace(/^file:\/\//i, ''))
+        : value
+      const normalizedLocalPath = path.resolve(localPath)
+      if (normalizedLocalPath.startsWith(normalizedOwnedDir) && fs.existsSync(normalizedLocalPath)) return normalizedLocalPath
+    } catch {}
+  }
+
+  const downloaded = await sourceToBuffer(value).catch(() => null)
+  if (!downloaded || !downloaded.buf || !isImageMime(downloaded.mime)) return value
+
+  fs.mkdirSync(ownedDir, { recursive: true })
+  const hash = crypto.createHash('sha1').update(downloaded.buf).digest('hex')
+  const ext = detectImageExtFromMime(downloaded.mime)
+  const filePath = path.join(ownedDir, `${hash}${ext}`)
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, downloaded.buf)
+  return filePath
 }
 
 async function sourceToBuffer(src) {
@@ -905,32 +967,53 @@ function buildPokeReplyMessageSegments(item, headerText = '') {
 
 async function buildPokeReplyMessageSegmentsAsync(item, headerText = '') {
   const normalizedItem = normalizePokeReplyItem(item)
-  const segments = []
-  if (headerText) segments.push({ type: 'text', data: { text: headerText } })
+  const textPrefix = headerText ? [{ type: 'text', data: { text: headerText } }] : []
+  const withHeader = (messageSegments) => textPrefix.concat(Array.isArray(messageSegments) ? messageSegments : [])
   if (!normalizedItem) {
-    segments.push({ type: 'text', data: { text: '（空）' } })
-    return segments
+    return [withHeader([{ type: 'text', data: { text: '（空）' } }])]
   }
   if (normalizedItem.type === 'image') {
-    const base64 = await sourceToBase64(normalizedItem.source).catch(() => null)
-    if (base64 && base64.data) {
-      segments.push({ type: 'image', data: { file: `base64://${base64.data}` } })
-      return segments
+    const actualSource = await persistPokeImageSource(normalizedItem.source).catch(() => normalizedItem.source)
+    const variants = []
+    const seen = new Set()
+    const pushVariant = (messageSegments) => {
+      const variant = withHeader(messageSegments)
+      const key = JSON.stringify(variant)
+      if (seen.has(key)) return
+      seen.add(key)
+      variants.push(variant)
     }
-    const file = toOutboundImageFile(normalizedItem.source)
-    segments.push({ type: 'image', data: { file } })
-    return segments
+    if (isLocalFileSource(actualSource)) {
+      const file = toOutboundImageFile(actualSource)
+      pushVariant([{ type: 'image', data: { file } }])
+    }
+    const base64 = await sourceToBase64(actualSource).catch(() => null)
+    if (base64 && base64.data) {
+      pushVariant([{ type: 'image', data: { file: `base64://${base64.data}` } }])
+    }
+    const file = toOutboundImageFile(actualSource)
+    if (file) pushVariant([{ type: 'image', data: { file } }])
+    return variants.length > 0
+      ? variants
+      : [withHeader([{ type: 'text', data: { text: '[图片发送失败]' } }])]
   }
-  segments.push({ type: 'text', data: { text: normalizedItem.content } })
-  return segments
+  return [withHeader([{ type: 'text', data: { text: normalizedItem.content } }])]
+}
+
+function normalizeMessageVariants(message) {
+  if (!Array.isArray(message)) return [[{ type: 'text', data: { text: String(message || '') } }]]
+  if (message.length > 0 && Array.isArray(message[0])) return message
+  return [message]
 }
 
 async function replyCommandMessage(ws, payload, text) {
-  const msg = Array.isArray(text) ? text : [{ type: 'text', data: { text } }]
-  if (payload.message_type === 'group') {
-    await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
-  } else {
-    await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => {})
+  const baseMessage = Array.isArray(text) ? text : [{ type: 'text', data: { text } }]
+  const variants = normalizeMessageVariants(baseMessage)
+  for (const msg of variants) {
+    const result = payload.message_type === 'group'
+      ? await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => null)
+      : await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => null)
+    if (result && result.status === 'ok') return
   }
 }
 
@@ -1087,7 +1170,8 @@ async function handleCommands(ws, payload, text) {
           await replyCommandMessage(ws, payload, '请在命令消息中附带图片、引用一条带图片的消息，或在命令后提供图片地址/路径')
           return true
         }
-        const item = normalizePokeReplyItem({ type: 'image', source })
+        const persistedSource = await persistPokeImageSource(source).catch(() => source)
+        const item = normalizePokeReplyItem({ type: 'image', source: persistedSource || source })
         const items = refreshPokeReplyTexts()
         if (item && items.some((existing) => pokeReplySignature(existing) === pokeReplySignature(item))) {
           await replyCommandMessage(ws, payload, '该拍一拍图片回复已存在')

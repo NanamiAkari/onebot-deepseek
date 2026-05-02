@@ -78,6 +78,12 @@ function createMessageHandler(deps) {
       .trim()
   }
 
+  function normalizeMessageVariants(message) {
+    if (!Array.isArray(message)) return [[{ type: 'text', data: { text: String(message || '') } }]]
+    if (message.length > 0 && Array.isArray(message[0])) return message
+    return [message]
+  }
+
   async function sendReplyBatches(ws, action, payload, batches) {
     const sentTexts = []
     for (let index = 0; index < batches.length; index += 1) {
@@ -129,17 +135,25 @@ function createMessageHandler(deps) {
               const pokeResult = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
               if (!(pokeResult && pokeResult.status === 'ok')) sendGroupPokeSupported = false
             }
-            const msg = typeof buildPokeReplyMessageSegments === 'function'
+            const built = typeof buildPokeReplyMessageSegments === 'function'
               ? await buildPokeReplyMessageSegments(pokeReply)
               : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
-            await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => {})
+            const variants = normalizeMessageVariants(built)
+            for (const msg of variants) {
+              const result = await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => null)
+              if (result && result.status === 'ok') break
+            }
           } catch {}
         } else {
           try {
-            const msg = typeof buildPokeReplyMessageSegments === 'function'
+            const built = typeof buildPokeReplyMessageSegments === 'function'
               ? await buildPokeReplyMessageSegments(pokeReply)
               : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
-            await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
+            const variants = normalizeMessageVariants(built)
+            for (const msg of variants) {
+              const result = await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg }).catch(() => null)
+              if (result && result.status === 'ok') break
+            }
           } catch {}
         }
         return
