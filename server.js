@@ -409,23 +409,26 @@ function clearCustomReplies(groupId) {
   return { ok: true, removedTriggers, removedReplies }
 }
 
-function pickCustomReply(groupId, text) {
-  const normalizedTrigger = normalizeCustomReplyTrigger(text)
-  if (!normalizedTrigger) return null
+function findCustomReplyMatches(groupId, text) {
+  const normalizedText = normalizeCustomReplyTrigger(text)
+  if (!normalizedText) return []
   const store = loadCustomReplyStore()
   const groupStore = store[String(groupId)] || {}
-  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
+  return Object.entries(groupStore)
+    .filter(([trigger, replies]) => trigger && normalizedText.includes(trigger) && Array.isArray(replies) && replies.length > 0)
+    .sort((a, b) => b[0].length - a[0].length)
+}
+
+function pickCustomReply(groupId, text) {
+  const matches = findCustomReplyMatches(groupId, text)
+  if (matches.length === 0) return null
+  const [, replies] = matches[0]
   if (replies.length === 0) return null
   return normalizeCustomReplyEntry(replies[Math.floor(Math.random() * replies.length)])
 }
 
 function hasCustomReplyTrigger(groupId, text) {
-  const normalizedTrigger = normalizeCustomReplyTrigger(text)
-  if (!normalizedTrigger) return false
-  const store = loadCustomReplyStore()
-  const groupStore = store[String(groupId)] || {}
-  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
-  return replies.length > 0
+  return findCustomReplyMatches(groupId, text).length > 0
 }
 
 function isConfiguredAdmin(userId) {
