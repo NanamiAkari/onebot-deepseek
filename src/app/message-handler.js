@@ -183,10 +183,11 @@ function createMessageHandler(deps) {
         }
       }
       const content = raw
-      if ((!content.media || content.media.length === 0) && content.replyId) {
+      if (content.replyId) {
         const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
         if (resp && resp.status === 'ok' && resp.data && resp.data.message) {
           const q = extractContent(resp.data.message)
+          const quotedText = String(q.text || '').trim()
           q.media = await resolveMediaSources(ws, q.media)
           const merged = content.media ? content.media.slice() : []
           if (q.media && q.media.length) {
@@ -196,7 +197,8 @@ function createMessageHandler(deps) {
             }
             content.media = merged
           }
-          if (!content.text && q.text) content.text = q.text
+          if (quotedText) content.quotedText = quotedText
+          if (!content.text && quotedText) content.text = quotedText
         }
       }
       const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
@@ -226,9 +228,13 @@ function createMessageHandler(deps) {
       const wantsReply = isGroup ? shouldRespond(content.text) : hasText
       if (!wantsReply) return
       const stripped = stripPrefix(content.text || '') || (hasMedia ? '请描述这张图片' : '')
-      const hist = getContext(payload, stripped)
+      const quotedText = String(content.quotedText || '').trim()
+      const modelInput = quotedText && quotedText !== stripped
+        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${stripped || '请结合被引用消息继续回答'}`
+        : stripped
+      const hist = getContext(payload, modelInput)
       const result = await agentRunner.run({
-        message: stripped,
+        message: modelInput,
         media: content.media,
         history: hist,
         contextImage: ctxImgUsed,

@@ -1401,6 +1401,17 @@ async function replyCommandMessage(ws, payload, text) {
   }
 }
 
+async function getReplyMessageContent(ws, replyId) {
+  const normalizedReplyId = String(replyId || '').trim()
+  if (!normalizedReplyId) return null
+  const replied = await sendAction(ws, 'get_msg', { message_id: normalizedReplyId }).catch(() => null)
+  if (!(replied && replied.status === 'ok' && replied.data && replied.data.message)) return null
+  const repliedContent = extractContent(replied.data.message)
+  repliedContent.media = await resolveMediaSources(ws, repliedContent.media)
+  repliedContent.message = replied.data.message
+  return repliedContent
+}
+
 function normalizeCommandText(text) {
   return String(text || '')
     .replace(/^[\s,，.。!！?？:：;；/\\|+-]+/, '')
@@ -1439,12 +1450,14 @@ function buildCustomReplyHelp(isAdminUser) {
     '自定义回复命令：',
     '1. 创建自定义回复',
     '2. 自定义回复 添加 触发词 => 回复文本',
-    '3. 自定义回复 列表',
-    '4. 自定义回复 查看 触发词',
-    '5. 自定义回复 删除 触发词',
-    '6. 自定义回复 删除 触发词 第N条',
-    '7. 自定义回复 清空',
-    '8. 交互创建过程中发送“取消”可退出'
+    '3. 可引用一条消息后发送：自定义回复 添加 触发词',
+    '4. 可引用一条消息后发送：创建自定义回复 触发词',
+    '5. 自定义回复 列表',
+    '6. 自定义回复 查看 触发词',
+    '7. 自定义回复 删除 触发词',
+    '8. 自定义回复 删除 触发词 第N条',
+    '9. 自定义回复 清空',
+    '10. 交互创建过程中发送“取消”可退出'
   ]
   if (!isAdminUser) lines.push('以上命令需要管理员权限')
   return lines.join('\n')
@@ -1493,6 +1506,7 @@ async function handleCommands(ws, payload, text) {
     if (isPoke) {
       const commandContent = extractContent(payload.message)
       const commandMedia = await resolveMediaSources(ws, commandContent.media)
+      let repliedContent = null
       if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
         const items = refreshPokeReplyTexts()
         const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${previewPokeReplyText(s)}`).join('\n') : '（空）'
@@ -1528,9 +1542,13 @@ async function handleCommands(ws, payload, text) {
         }
         const rawAddMatch = String(rawCommandText || '').match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
           || String(rawCommandText || '').match(/(?:add|replyadd)\s+([\s\S]+)/i)
-        const content = String((rawAddMatch && rawAddMatch[1]) || addMatch[1] || '').trim()
+        let content = String((rawAddMatch && rawAddMatch[1]) || addMatch[1] || '').trim()
+        if (!content && commandContent.replyId) {
+          repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
+          content = String((repliedContent && repliedContent.text) || '').trim()
+        }
         if (!content) {
-          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
+          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案，或引用一条带文本的消息')
           return true
         }
         const items = refreshPokeReplyTexts()
@@ -1552,12 +1570,8 @@ async function handleCommands(ws, payload, text) {
         }
         let imageMedia = (commandMedia || []).find((item) => item && item.kind === 'image')
         if (!imageMedia && commandContent.replyId) {
-          const replied = await sendAction(ws, 'get_msg', { message_id: commandContent.replyId }).catch(() => null)
-          if (replied && replied.status === 'ok' && replied.data && replied.data.message) {
-            const repliedContent = extractContent(replied.data.message)
-            const repliedMedia = await resolveMediaSources(ws, repliedContent.media)
-            imageMedia = (repliedMedia || []).find((item) => item && item.kind === 'image') || null
-          }
+          repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
+          imageMedia = ((repliedContent && repliedContent.media) || []).find((item) => item && item.kind === 'image') || null
         }
         const rawImageAddMatch = String(rawCommandText || '').match(/(?:图片|图)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
           || String(rawCommandText || '').match(/(?:添加图片|加图|加图片)\s+([\s\S]+)/i)
@@ -1643,6 +1657,7 @@ async function handleCommands(ws, payload, text) {
         await replyCommandMessage(ws, payload, '自定义回复目前仅支持群聊')
         return true
       }
+      const commandContent = extractContent(payload.message)
       const draftKey = getCustomReplyDraftKey(payload)
       purgeExpiredCustomReplyDrafts()
       const currentDraft = customReplyDrafts.get(draftKey)
@@ -1655,6 +1670,8 @@ async function handleCommands(ws, payload, text) {
       const clearRules = /^(?:自定义回复|关键词回复|关键字回复).*(清空|重置|clear|reset|empty|purge)$/i.test(nt)
         || /(自定义回复清空|关键词回复清空|关键字回复清空|自定义回复重置)/i.test(compact)
       const rawAddMatch = String(rawCommandText || '').match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:添加|新增|创建)\s+([\s\S]+?)\s*(?:=>|->|＝>|→)\s*([\s\S]+)$/i)
+      const quotedAddTriggerMatch = String(rawCommandText || '').match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:添加|新增|创建)\s+([\s\S]+)$/i)
+      const quotedCreateTriggerMatch = String(rawCommandText || '').match(/^(?:创建自定义回复|自定义回复创建|自定义回复新建)\s+([\s\S]+)$/i)
 
       if (!isAdminUser) {
         await replyCommandMessage(ws, payload, '需要管理员权限才能管理自定义回复')
@@ -1689,6 +1706,27 @@ async function handleCommands(ws, payload, text) {
           return true
         }
         await replyCommandMessage(ws, payload, `已创建自定义回复：${trigger} => ${replyText}\n当前该关键词共有 ${added.count} 条回复`)
+        return true
+      }
+      const quotedTriggerRaw = (quotedAddTriggerMatch && quotedAddTriggerMatch[1]) || (quotedCreateTriggerMatch && quotedCreateTriggerMatch[1]) || ''
+      const quotedTrigger = normalizeCustomReplyTrigger(quotedTriggerRaw)
+      if (quotedTrigger && commandContent.replyId) {
+        const repliedContent = await getReplyMessageContent(ws, commandContent.replyId)
+        const replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+        if (replySegments.length === 0) {
+          await replyCommandMessage(ws, payload, '引用消息里没有可保存的回复内容，请引用一条带文本、图片或表情的消息')
+          return true
+        }
+        const added = addCustomReply(payload.group_id, quotedTrigger, { segments: replySegments })
+        if (!added.ok && added.reason === 'duplicate') {
+          await replyCommandMessage(ws, payload, `该自定义回复已存在：${quotedTrigger} => ${previewCustomReplyEntry({ segments: replySegments })}`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建自定义回复：${quotedTrigger} => ${previewCustomReplyEntry(added.entry)}\n当前该关键词共有 ${added.count} 条回复`)
+        return true
+      }
+      if (quotedTriggerRaw) {
+        await replyCommandMessage(ws, payload, '请引用一条消息作为回复内容，或使用：自定义回复 添加 触发词 => 回复内容')
         return true
       }
       if (listRules) {
