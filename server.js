@@ -46,6 +46,7 @@ const {
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_FILE,
   AI_CUSTOM_REPLY_FILE,
+  AI_SCHEDULE_FILE,
   AI_POKE_REPLY_TEXT,
   AI_POKE_REPLY_TEXTS,
   AI_CONTEXT_ENABLE,
@@ -64,7 +65,7 @@ const {
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
+const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
 const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
@@ -87,6 +88,10 @@ function getPokeReplyFilePath() {
 
 function getCustomReplyFilePath() {
   return resolveProjectFile(AI_CUSTOM_REPLY_FILE || 'custom_replies.json')
+}
+
+function getScheduleFilePath() {
+  return resolveProjectFile(AI_SCHEDULE_FILE || 'scheduled_tasks.json')
 }
 
 function toOutboundImageFile(source) {
@@ -409,6 +414,397 @@ function clearCustomReplies(groupId) {
   return { ok: true, removedTriggers, removedReplies }
 }
 
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+function normalizeWeeklyDay(value) {
+  const key = String(value || '').trim()
+  if (key === '1' || key === '一') return 1
+  if (key === '2' || key === '二') return 2
+  if (key === '3' || key === '三') return 3
+  if (key === '4' || key === '四') return 4
+  if (key === '5' || key === '五') return 5
+  if (key === '6' || key === '六') return 6
+  if (key === '7' || key === '日' || key === '天') return 0
+  return null
+}
+
+function formatWeeklyDay(weekday) {
+  return weekday === 0 ? '日' : weekday === 1 ? '一' : weekday === 2 ? '二' : weekday === 3 ? '三' : weekday === 4 ? '四' : weekday === 5 ? '五' : weekday === 6 ? '六' : '?'
+}
+
+function parseScheduleSpec(input) {
+  const text = String(input || '').trim()
+  if (!text) return null
+  const dailyMatch = text.match(/^(?:每天|每日)\s*(\d{1,2}):(\d{2})$/)
+  if (dailyMatch) {
+    const hour = parseInt(dailyMatch[1], 10)
+    const minute = parseInt(dailyMatch[2], 10)
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'daily',
+      hour,
+      minute,
+      specText: `每天 ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const weeklyMatch = text.match(/^(?:每周|每星期)\s*([一二三四五六日天1-7])\s*(\d{1,2}):(\d{2})$/)
+  if (weeklyMatch) {
+    const weekday = normalizeWeeklyDay(weeklyMatch[1])
+    const hour = parseInt(weeklyMatch[2], 10)
+    const minute = parseInt(weeklyMatch[3], 10)
+    if (weekday === null || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'weekly',
+      weekday,
+      hour,
+      minute,
+      specText: `每周${formatWeeklyDay(weekday)} ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const monthlyMatch = text.match(/^每月\s*(\d{1,2})(?:号|日)\s*(\d{1,2}):(\d{2})$/)
+  if (monthlyMatch) {
+    const day = parseInt(monthlyMatch[1], 10)
+    const hour = parseInt(monthlyMatch[2], 10)
+    const minute = parseInt(monthlyMatch[3], 10)
+    if (day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'monthly',
+      day,
+      hour,
+      minute,
+      specText: `每月 ${day}号 ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const onceMatch = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$/)
+  if (!onceMatch) return null
+  const year = parseInt(onceMatch[1], 10)
+  const month = parseInt(onceMatch[2], 10)
+  const day = parseInt(onceMatch[3], 10)
+  const hour = parseInt(onceMatch[4], 10)
+  const minute = parseInt(onceMatch[5], 10)
+  const runAt = new Date(year, month - 1, day, hour, minute, 0, 0)
+  if (runAt.getFullYear() !== year || runAt.getMonth() !== month - 1 || runAt.getDate() !== day || hour > 23 || minute > 59) return null
+  return {
+    mode: 'once',
+    runAt: runAt.getTime(),
+    specText: `${year}-${pad2(month)}-${pad2(day)} ${pad2(hour)}:${pad2(minute)}`
+  }
+}
+
+function computeDailyNextRunAt(hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0)
+  if (target.getTime() <= nowTs + 1000) target.setDate(target.getDate() + 1)
+  return target.getTime()
+}
+
+function computeWeeklyNextRunAt(weekday, hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0)
+  let offset = weekday - now.getDay()
+  if (offset < 0 || (offset === 0 && target.getTime() <= nowTs + 1000)) offset += 7
+  target.setDate(target.getDate() + offset)
+  return target.getTime()
+}
+
+function buildMonthlyCandidate(year, monthIndex, day, hour, minute) {
+  const target = new Date(year, monthIndex, day, hour, minute, 0, 0)
+  if (target.getFullYear() !== year || target.getMonth() !== monthIndex || target.getDate() !== day) return null
+  return target
+}
+
+function computeMonthlyNextRunAt(day, hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  for (let offset = 0; offset < 24; offset += 1) {
+    const year = now.getFullYear() + Math.floor((now.getMonth() + offset) / 12)
+    const monthIndex = (now.getMonth() + offset) % 12
+    const candidate = buildMonthlyCandidate(year, monthIndex, day, hour, minute)
+    if (!candidate) continue
+    if (candidate.getTime() > nowTs + 1000) return candidate.getTime()
+  }
+  return 0
+}
+
+function formatScheduleTime(ts) {
+  const date = new Date(Number(ts || 0))
+  if (!Number.isFinite(date.getTime())) return '未知时间'
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+}
+
+function normalizeScheduledTask(task) {
+  if (!task || typeof task !== 'object') return null
+  const id = String(task.id || '').trim() || crypto.randomBytes(8).toString('hex')
+  const groupId = String(task.groupId || '').trim()
+  const mode = task.mode === 'once' ? 'once'
+    : task.mode === 'daily' ? 'daily'
+    : task.mode === 'weekly' ? 'weekly'
+    : task.mode === 'monthly' ? 'monthly'
+    : ''
+  const content = normalizeCustomReplyEntry(task.content || task.entry)
+  if (!groupId || !mode || !content) return null
+  if (mode === 'daily') {
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeDailyNextRunAt(hour, minute)
+    return {
+      id,
+      groupId,
+      mode,
+      hour,
+      minute,
+      specText: `每天 ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  if (mode === 'weekly') {
+    const weekday = parseInt(task.weekday, 10)
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (![0, 1, 2, 3, 4, 5, 6].includes(weekday) || !Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeWeeklyNextRunAt(weekday, hour, minute)
+    return {
+      id,
+      groupId,
+      mode,
+      weekday,
+      hour,
+      minute,
+      specText: `每周${formatWeeklyDay(weekday)} ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  if (mode === 'monthly') {
+    const day = parseInt(task.day, 10)
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (!Number.isInteger(day) || day < 1 || day > 31 || !Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeMonthlyNextRunAt(day, hour, minute)
+    if (!nextRunAt) return null
+    return {
+      id,
+      groupId,
+      mode,
+      day,
+      hour,
+      minute,
+      specText: `每月 ${day}号 ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  const runAt = Number(task.runAt)
+  if (!Number.isFinite(runAt) || runAt <= 0) return null
+  return {
+    id,
+    groupId,
+    mode,
+    runAt,
+    specText: String(task.specText || formatScheduleTime(runAt)),
+    nextRunAt: Number.isFinite(Number(task.nextRunAt)) ? Number(task.nextRunAt) : runAt,
+    createdAt: Number(task.createdAt || Date.now()),
+    createdBy: String(task.createdBy || ''),
+    lastRunAt: Number(task.lastRunAt || 0),
+    content
+  }
+}
+
+function loadScheduledTaskStore() {
+  const filePath = getScheduleFilePath()
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out = {}
+    for (const [groupId, tasks] of Object.entries(parsed)) {
+      const normalizedTasks = (Array.isArray(tasks) ? tasks : [])
+        .map(normalizeScheduledTask)
+        .filter(Boolean)
+        .filter((task) => task.mode === 'daily' || task.mode === 'weekly' || task.mode === 'monthly' || task.nextRunAt > Date.now() - 60000)
+      if (normalizedTasks.length > 0) out[String(groupId)] = normalizedTasks
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveScheduledTaskStore(store) {
+  const filePath = getScheduleFilePath()
+  const normalizedStore = {}
+  for (const [groupId, tasks] of Object.entries(store || {})) {
+    const normalizedTasks = (Array.isArray(tasks) ? tasks : [])
+      .map(normalizeScheduledTask)
+      .filter(Boolean)
+    if (normalizedTasks.length > 0) normalizedStore[String(groupId)] = normalizedTasks
+  }
+  fs.writeFileSync(filePath, `${JSON.stringify(normalizedStore, null, 2)}\n`, 'utf8')
+  return normalizedStore
+}
+
+function listScheduledTasks(groupId) {
+  const store = loadScheduledTaskStore()
+  return ((store[String(groupId)] || []).slice()).sort((a, b) => a.nextRunAt - b.nextRunAt)
+}
+
+function addScheduledTask(groupId, scheduleSpec, entry, createdBy) {
+  const parsed = typeof scheduleSpec === 'string' ? parseScheduleSpec(scheduleSpec) : scheduleSpec
+  const content = normalizeCustomReplyEntry(entry)
+  if (!parsed || !content) return { ok: false, reason: 'invalid' }
+  if (parsed.mode === 'once' && parsed.runAt <= Date.now()) return { ok: false, reason: 'past' }
+  const task = normalizeScheduledTask({
+    id: crypto.randomBytes(8).toString('hex'),
+    groupId: String(groupId || ''),
+    mode: parsed.mode,
+    weekday: parsed.weekday,
+    day: parsed.day,
+    hour: parsed.hour,
+    minute: parsed.minute,
+    runAt: parsed.runAt,
+    specText: parsed.specText,
+    nextRunAt: parsed.mode === 'daily' ? computeDailyNextRunAt(parsed.hour, parsed.minute)
+      : parsed.mode === 'weekly' ? computeWeeklyNextRunAt(parsed.weekday, parsed.hour, parsed.minute)
+      : parsed.mode === 'monthly' ? computeMonthlyNextRunAt(parsed.day, parsed.hour, parsed.minute)
+      : parsed.runAt,
+    createdAt: Date.now(),
+    createdBy: String(createdBy || ''),
+    content
+  })
+  if (!task) return { ok: false, reason: 'invalid' }
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const current = Array.isArray(store[groupKey]) ? store[groupKey].slice() : []
+  current.push(task)
+  store[groupKey] = current
+  saveScheduledTaskStore(store)
+  return { ok: true, task, count: current.length }
+}
+
+function removeScheduledTask(groupId, index) {
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const tasks = ((store[groupKey] || []).slice()).sort((a, b) => a.nextRunAt - b.nextRunAt)
+  if (!Number.isInteger(index) || index < 1 || index > tasks.length) return { ok: false }
+  const removed = tasks[index - 1]
+  const remaining = tasks.filter((task) => task.id !== removed.id)
+  if (remaining.length > 0) store[groupKey] = remaining
+  else delete store[groupKey]
+  saveScheduledTaskStore(store)
+  return { ok: true, removed, count: remaining.length }
+}
+
+function clearScheduledTasks(groupId) {
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const tasks = Array.isArray(store[groupKey]) ? store[groupKey] : []
+  if (tasks.length === 0) return { ok: false, removedCount: 0 }
+  delete store[groupKey]
+  saveScheduledTaskStore(store)
+  return { ok: true, removedCount: tasks.length }
+}
+
+function previewScheduledTask(task) {
+  if (!task) return '（空）'
+  return `${task.specText || formatScheduleTime(task.nextRunAt)} | ${previewCustomReplyEntry(task.content)}`
+}
+
+async function sendScheduledTaskMessage(ws, task) {
+  const variants = await buildCustomReplyMessageVariants(task.content)
+  for (const msg of variants) {
+    const result = await sendAction(ws, 'send_group_msg', { group_id: Number(task.groupId), message: msg }).catch(() => null)
+    if (result && result.status === 'ok') return true
+  }
+  return false
+}
+
+let activeWsClient = null
+let scheduledTaskRunnerBusy = false
+
+function isWsClientReady(ws) {
+  return Boolean(ws && ws.readyState === 1)
+}
+
+async function runScheduledTasksTick() {
+  if (scheduledTaskRunnerBusy || !isWsClientReady(activeWsClient)) return
+  scheduledTaskRunnerBusy = true
+  try {
+    const now = Date.now()
+    const store = loadScheduledTaskStore()
+    let changed = false
+    for (const [groupId, tasks] of Object.entries(store)) {
+      const nextTasks = []
+      for (const task of Array.isArray(tasks) ? tasks : []) {
+        const normalized = normalizeScheduledTask(task)
+        if (!normalized) {
+          changed = true
+          continue
+        }
+        if (normalized.nextRunAt > now + 1000) {
+          nextTasks.push(normalized)
+          continue
+        }
+        const sent = await sendScheduledTaskMessage(activeWsClient, normalized).catch(() => false)
+        if (normalized.mode === 'daily') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeDailyNextRunAt(normalized.hour, normalized.minute, now + 1000)
+          nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        if (normalized.mode === 'weekly') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeWeeklyNextRunAt(normalized.weekday, normalized.hour, normalized.minute, now + 1000)
+          nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        if (normalized.mode === 'monthly') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeMonthlyNextRunAt(normalized.day, normalized.hour, normalized.minute, now + 1000)
+          if (normalized.nextRunAt) nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        changed = true
+        if (!sent) console.log(`一次性定时任务发送失败，仍按已执行移除 group=${groupId} id=${normalized.id}`)
+      }
+      if (nextTasks.length > 0) store[groupId] = nextTasks
+      else delete store[groupId]
+    }
+    if (changed) saveScheduledTaskStore(store)
+  } finally {
+    scheduledTaskRunnerBusy = false
+  }
+}
+
+setInterval(() => {
+  runScheduledTasksTick().catch((err) => console.log('runScheduledTasksTick', err && err.stack ? err.stack : err))
+}, 15000)
+
 function findCustomReplyMatches(groupId, text) {
   const normalizedText = normalizeCustomReplyTrigger(text)
   if (!normalizedText) return []
@@ -455,6 +851,7 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  handleScheduleTaskDraftInput,
   handleCustomReplyDraftInput,
   handleCustomReplyMatch,
   hasCustomReplyTrigger,
@@ -482,7 +879,14 @@ const onMessage = createMessageHandler({
 })
 
 wss.on('connection', (ws) => {
+  activeWsClient = ws
   ws.on('message', (data) => onMessage(ws, data))
+  ws.on('close', () => {
+    if (activeWsClient === ws) {
+      const nextClient = Array.from(wss.clients || []).find((client) => client && client.readyState === 1 && client !== ws) || null
+      activeWsClient = nextClient
+    }
+  })
 })
 
 process.on('unhandledRejection', (reason) => {
@@ -1244,6 +1648,94 @@ async function handleCustomReplyDraftInput(ws, payload) {
   return false
 }
 
+function getScheduleTaskDraftKey(payload) {
+  return `g:${payload.group_id || ''}:u:${payload.user_id || ''}`
+}
+
+const SCHEDULE_TASK_DRAFT_TTL_MS = 10 * 60 * 1000
+
+function createScheduleTaskDraft(stage, extra = {}) {
+  return {
+    stage,
+    ...extra,
+    updatedAt: Date.now(),
+    expiresAt: Date.now() + SCHEDULE_TASK_DRAFT_TTL_MS
+  }
+}
+
+function isScheduleTaskDraftExpired(draft) {
+  if (!draft || typeof draft !== 'object') return true
+  return Number(draft.expiresAt || 0) > 0 && Date.now() > Number(draft.expiresAt || 0)
+}
+
+function purgeExpiredScheduleTaskDrafts() {
+  for (const [key, draft] of scheduleTaskDrafts.entries()) {
+    if (isScheduleTaskDraftExpired(draft)) scheduleTaskDrafts.delete(key)
+  }
+}
+
+async function handleScheduleTaskDraftInput(ws, payload) {
+  if (!payload || payload.message_type !== 'group') return false
+  purgeExpiredScheduleTaskDrafts()
+  const draftKey = getScheduleTaskDraftKey(payload)
+  const draft = scheduleTaskDrafts.get(draftKey)
+  if (!draft) return false
+  if (isScheduleTaskDraftExpired(draft)) {
+    scheduleTaskDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '创建定时任务已超时，请重新发送“阿卡林 创建定时任务”开始')
+    return true
+  }
+  const content = extractContent(payload.message)
+  const inputText = normalizeCommandText(content.text)
+  if (inputText === '取消') {
+    scheduleTaskDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '已取消创建定时任务')
+    return true
+  }
+  if (draft.stage === 'await_spec') {
+    const parsed = parseScheduleSpec(inputText)
+    if (!parsed) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+      await replyCommandMessage(ws, payload, '请输入定时规则，例如：每天 08:30、每周一 08:30、每月 1号 08:30、2026-05-07 08:30')
+      return true
+    }
+    if (parsed.mode === 'once' && parsed.runAt <= Date.now()) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+      await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间，请重新输入')
+      return true
+    }
+    scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_content', { scheduleSpec: parsed }))
+    await replyCommandMessage(ws, payload, `已记录定时规则：${parsed.specText}\n请发送定时内容\n可包含文本、图片、表情，或引用一条消息\n发送“取消”可退出`)
+    return true
+  }
+  if (draft.stage === 'await_content') {
+    let replySegments = await captureCustomReplySegments(ws, payload.message)
+    if (replySegments.length === 0 && content.replyId) {
+      const repliedContent = await getReplyMessageContent(ws, content.replyId)
+      replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+    }
+    if (replySegments.length === 0) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_content', { scheduleSpec: draft.scheduleSpec }))
+      await replyCommandMessage(ws, payload, '未识别到可保存的定时内容，请发送文本、图片、表情，或引用一条消息')
+      return true
+    }
+    const added = addScheduledTask(payload.group_id, draft.scheduleSpec, { segments: replySegments }, payload.user_id)
+    scheduleTaskDrafts.delete(draftKey)
+    if (!added.ok && added.reason === 'past') {
+      await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间，请重新创建')
+      return true
+    }
+    if (!added.ok) {
+      await replyCommandMessage(ws, payload, '定时任务创建失败，请重新创建')
+      return true
+    }
+    await replyCommandMessage(ws, payload, `已创建定时任务 #${added.count}：${previewScheduledTask(added.task)}\n下次执行：${formatScheduleTime(added.task.nextRunAt)}`)
+    return true
+  }
+  scheduleTaskDrafts.delete(draftKey)
+  return false
+}
+
 async function handleCustomReplyMatch(ws, payload, text) {
   if (!payload || payload.message_type !== 'group') return false
   const entry = pickCustomReply(payload.group_id, text)
@@ -1463,6 +1955,27 @@ function buildCustomReplyHelp(isAdminUser) {
   return lines.join('\n')
 }
 
+function buildScheduleCommandHelp(isAdminUser) {
+  const lines = [
+    '定时任务命令：',
+    '1. 定时任务 列表',
+    '2. 定时任务 查看 序号'
+  ]
+  if (isAdminUser) {
+    lines.push('3. 定时任务 添加 每天 08:30 => 文本内容')
+    lines.push('4. 定时任务 添加 每周一 08:30 => 文本内容')
+    lines.push('5. 定时任务 添加 每月 1号 08:30 => 文本内容')
+    lines.push('6. 定时任务 添加 2026-05-07 08:30 => 文本内容')
+    lines.push('7. 可引用一条消息后发送：定时任务 添加 每天 08:30')
+    lines.push('8. 创建定时任务')
+    lines.push('9. 定时任务 删除 序号')
+    lines.push('10. 定时任务 清空')
+  } else {
+    lines.push('其余定时任务管理命令需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
   const rawCommandText = stripPrefix(text || '')
   const t = normalizeCommandText(rawCommandText)
@@ -1471,9 +1984,10 @@ async function handleCommands(ws, payload, text) {
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
   const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
+  const isSchedule = /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(nt) || /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(compact)
   const isCustomReply = /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(nt)
     || /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(compact)
-  const matchedCommand = isBanned || isContext || isPoke || isCustomReply
+  const matchedCommand = isBanned || isContext || isPoke || isSchedule || isCustomReply
   if (!matchedCommand) return false
   try {
     const isGroup = payload.message_type === 'group'
@@ -1650,6 +2164,122 @@ async function handleCommands(ws, payload, text) {
         return true
       }
       await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
+      return true
+    }
+    if (isSchedule) {
+      if (!isGroup) {
+        await replyCommandMessage(ws, payload, '定时任务目前仅支持群聊')
+        return true
+      }
+      const commandContent = extractContent(payload.message)
+      const draftKey = getScheduleTaskDraftKey(payload)
+      purgeExpiredScheduleTaskDrafts()
+      const currentDraft = scheduleTaskDrafts.get(draftKey)
+      const startInteractive = /^(创建定时任务|定时任务创建|定时任务新建)$/i.test(nt) || /^(创建定时任务|定时任务创建|定时任务新建)$/i.test(compact)
+      const cancelInteractive = /^(取消定时任务|取消创建定时任务|定时任务取消)$/i.test(nt) || /^(取消定时任务|取消创建定时任务|定时任务取消)$/i.test(compact)
+      const listMatch = /^(?:定时任务|定时|计划任务|定时提醒).*(列表|list)$/i.test(nt) || /(定时任务列表|计划任务列表)/i.test(compact)
+      const viewMatch = nt.match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:查看|详情|明细|show|view)\s+(\d+)$/i)
+      const deleteMatch = nt.match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:删除|移除|取消)\s+(\d+)$/i)
+      const clearMatch = /^(?:定时任务|定时|计划任务|定时提醒).*(清空|clear|reset)$/i.test(nt)
+      const textAddMatch = String(rawCommandText || '').match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:添加|新增|创建)\s+(.+?)\s*(?:=>|->|＝>|→)\s*([\s\S]+)$/i)
+      const quotedAddMatch = String(rawCommandText || '').match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:添加|新增|创建)\s+([\s\S]+)$/i)
+
+      if (listMatch) {
+        const tasks = listScheduledTasks(payload.group_id)
+        if (tasks.length === 0) {
+          await replyCommandMessage(ws, payload, '当前群还没有定时任务')
+          return true
+        }
+        const body = tasks.map((task, index) => `${index + 1}. ${previewScheduledTask(task)} | 下次执行：${formatScheduleTime(task.nextRunAt)}`).join('\n')
+        await replyCommandMessage(ws, payload, `当前群定时任务列表：\n${body}`)
+        return true
+      }
+      if (viewMatch) {
+        const tasks = listScheduledTasks(payload.group_id)
+        const index = parseInt(viewMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1 || index > tasks.length) {
+          await replyCommandMessage(ws, payload, '请提供正确的任务编号，例如：定时任务 查看 1')
+          return true
+        }
+        const task = tasks[index - 1]
+        await replyCommandMessage(ws, payload, `定时任务 #${index}\n时间：${task.specText}\n下次执行：${formatScheduleTime(task.nextRunAt)}`)
+        await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(task.content))
+        return true
+      }
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理定时任务')
+        return true
+      }
+      if (cancelInteractive) {
+        if (currentDraft) {
+          scheduleTaskDrafts.delete(draftKey)
+          await replyCommandMessage(ws, payload, '已取消创建定时任务')
+        } else {
+          await replyCommandMessage(ws, payload, '当前没有正在进行的定时任务创建流程')
+        }
+        return true
+      }
+      if (startInteractive) {
+        scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+        await replyCommandMessage(ws, payload, '请输入定时规则\n例如：每天 08:30、每周一 08:30、每月 1号 08:30、2026-05-07 08:30\n10分钟内未继续将自动取消')
+        return true
+      }
+      if (deleteMatch) {
+        const index = parseInt(deleteMatch[1], 10)
+        const removed = removeScheduledTask(payload.group_id, index)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, '未找到对应的定时任务编号')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除定时任务 #${index}：${previewScheduledTask(removed.removed)}\n当前共 ${removed.count} 条`)
+        return true
+      }
+      if (clearMatch) {
+        const cleared = clearScheduledTasks(payload.group_id)
+        if (!cleared.ok) {
+          await replyCommandMessage(ws, payload, '当前群没有可清空的定时任务')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已清空当前群定时任务，共移除 ${cleared.removedCount} 条`)
+        return true
+      }
+      if (textAddMatch || quotedAddMatch) {
+        const scheduleRaw = String((textAddMatch && textAddMatch[1]) || (quotedAddMatch && quotedAddMatch[1]) || '').trim()
+        const schedule = parseScheduleSpec(scheduleRaw)
+        if (!schedule) {
+          await replyCommandMessage(ws, payload, '请使用正确的时间格式，例如：定时任务 添加 每天 08:30 => 早安、定时任务 添加 每周一 08:30 => 周会、定时任务 添加 每月 1号 08:30 => 月初提醒、定时任务 添加 2026-05-07 08:30 => 开会提醒')
+          return true
+        }
+        let entry = null
+        if (textAddMatch) {
+          const contentText = String(textAddMatch[2] || '').replace(/\r/g, '').trim()
+          if (!contentText) {
+            await replyCommandMessage(ws, payload, '请在 => 后提供文本内容，或改用引用消息的方式创建定时任务')
+            return true
+          }
+          entry = { segments: [{ type: 'text', data: { text: contentText } }] }
+        } else if (commandContent.replyId) {
+          const repliedContent = await getReplyMessageContent(ws, commandContent.replyId)
+          const replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+          if (replySegments.length > 0) entry = { segments: replySegments }
+        }
+        if (!entry) {
+          await replyCommandMessage(ws, payload, '请在命令中使用 => 提供文本内容，或引用一条带文本/图片/表情的消息作为定时发送内容')
+          return true
+        }
+        const added = addScheduledTask(payload.group_id, schedule, entry, payload.user_id)
+        if (!added.ok && added.reason === 'past') {
+          await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间')
+          return true
+        }
+        if (!added.ok) {
+          await replyCommandMessage(ws, payload, '定时任务创建失败，请检查时间格式和发送内容')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建定时任务 #${added.count}：${previewScheduledTask(added.task)}\n下次执行：${formatScheduleTime(added.task.nextRunAt)}`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildScheduleCommandHelp(isAdminUser))
       return true
     }
     if (isCustomReply) {

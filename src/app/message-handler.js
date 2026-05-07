@@ -11,6 +11,7 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    handleScheduleTaskDraftInput,
     handleCustomReplyDraftInput,
     handleCustomReplyMatch,
     hasCustomReplyTrigger,
@@ -201,6 +202,8 @@ function createMessageHandler(deps) {
           if (!content.text && quotedText) content.text = quotedText
         }
       }
+      const scheduleDraftHandled = await handleScheduleTaskDraftInput(ws, payload).catch(() => false)
+      if (scheduleDraftHandled) return
       const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
       if (customDraftHandled) return
       const mentioned = !isGroup || checkMention(payload.message, payload.self_id)

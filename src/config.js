@@ -83,6 +83,7 @@ module.exports = {
   AI_POKE_COOLDOWN: parseInt(process.env.AI_POKE_COOLDOWN || '10', 10),
   AI_POKE_REPLY_FILE: process.env.AI_POKE_REPLY_FILE || 'poke_replies.json',
   AI_CUSTOM_REPLY_FILE: process.env.AI_CUSTOM_REPLY_FILE || 'custom_replies.json',
+  AI_SCHEDULE_FILE: process.env.AI_SCHEDULE_FILE || 'scheduled_tasks.json',
   AI_POKE_REPLY_TEXT: process.env.AI_POKE_REPLY_TEXT || '拍了拍',
   AI_POKE_REPLY_TEXTS: (() => {
     const fileItems = readTextListFile(process.env.AI_POKE_REPLY_FILE || 'poke_replies.json')
