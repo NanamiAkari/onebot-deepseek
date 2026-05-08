@@ -40,6 +40,7 @@ const {
   OPENAI_NETWORK_ACCESS,
   AI_SIMPLE_MODE,
   OPENAI_TIMEOUT_MS,
+  OPENAI_IMAGE_TIMEOUT_MS,
   AI_REPLY_MAX_CHARS,
   AI_REPLY_CHUNK_CHARS,
   AI_POKE_ENABLE,
@@ -1050,10 +1051,14 @@ async function callOpenAI(text, media, hist, opts) {
   if (!OPENAI_KEY) return null
   const effectiveMedia = Array.isArray(media) ? media.slice() : []
   const imageCount = Array.isArray(effectiveMedia) ? effectiveMedia.filter((m) => m && m.kind === 'image').length : 0
-  const requestTimeout = imageCount > 0 ? Math.max(OPENAI_TIMEOUT_MS, 60000) : OPENAI_TIMEOUT_MS
+  const requestTimeout = opts && Number.isFinite(opts.timeoutMs)
+    ? opts.timeoutMs
+    : imageCount > 0
+    ? Math.max(OPENAI_TIMEOUT_MS, 60000)
+    : OPENAI_TIMEOUT_MS
   try {
-    console.log('调用OpenAI')
     const useResponses = OPENAI_WIRE_API === 'responses' || /ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(OPENAI_BASE_URL)
+    console.log(`调用OpenAI timeout=${requestTimeout}ms api=${useResponses ? 'responses' : 'chat'} image=${Boolean(opts && opts.generateImage)}`)
     const url = useResponses ? `${OPENAI_BASE_URL}/responses` : `${OPENAI_BASE_URL}/chat/completions`
     const wantsImageGeneration = Boolean(opts && opts.generateImage)
     if (wantsImageGeneration && !useResponses) {
@@ -1398,8 +1403,8 @@ function isImageMime(mime) {
 function shouldGenerateImage(text) {
   const value = String(text || '').trim()
   if (!value) return false
-  return /(生成|画|做|来|给我|帮我).{0,8}(一张|张|个)?.{0,8}(图|图片|配图|插图|壁纸|头像|表情包)/i.test(value)
-    || /(文生图|生图|出图|画一张|生成一张|做一张图)/i.test(value)
+  return /(文生图|生图|出图|画图|绘图|作图|画一张|生成一张|做一张图|生成图片|生成图像)/i.test(value)
+    || /(生成|画|绘制|做|来|给我|帮我).{0,80}(图|图片|图像|配图|插图|壁纸|头像|表情包|动漫风|二次元|插画)/i.test(value)
 }
 
 function saveGeneratedImage(base64Data, mime = 'image/png') {
@@ -1937,10 +1942,18 @@ async function replyCommandMessage(ws, payload, text) {
 async function handleImageGenerationRequest(ws, payload, promptText, hist) {
   const prompt = String(promptText || '').trim()
   if (!prompt || !shouldGenerateImage(prompt)) return { handled: false }
-  const result = await callOpenAI(prompt, [], hist, { structured: true, generateImage: true })
+  console.log('命中生图请求', prompt.slice(0, 120))
+  await replyCommandMessage(ws, payload, '收到啦，正在生成图片，可能需要几十秒……')
+  const startedAt = Date.now()
+  const result = await callOpenAI(prompt, [], hist, {
+    structured: true,
+    generateImage: true,
+    timeoutMs: OPENAI_IMAGE_TIMEOUT_MS
+  })
   if (!result || typeof result !== 'object') return { handled: false }
   const images = Array.isArray(result.images) ? result.images : []
   const text = sanitizeText(result.text || '')
+  console.log(`生图返回 images=${images.length} elapsed=${Date.now() - startedAt}ms text=${text ? text.slice(0, 80) : ''}`)
   if (images.length === 0) {
     await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
     return { handled: true, deliveredText: text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试' }

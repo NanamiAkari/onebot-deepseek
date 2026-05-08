@@ -164,7 +164,8 @@ sudo systemctl restart onebot-deepseek
   - `OpenAI失败 media=1 timeout=...`
 - 文生图：
   - 生成图会保存到 `generated_images/` 后再通过 OneBot 图片消息发送
-  - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_TIMEOUT_MS`
+  - 命中后会先回复一条“正在生成图片”的提示，再等待上游返回图片
+  - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_IMAGE_TIMEOUT_MS`
 - AI 回复发送保护：
   - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
   - `AI_REPLY_CHUNK_CHARS=750`：单条消息的分段长度，超长回复会按段拆开发送
@@ -205,7 +206,7 @@ sudo systemctl restart onebot-deepseek
 - 生图一直无回复：
   - 确认 `OPENAI_WIRE_API=responses`
   - 确认上游支持 Responses API 的 `image_generation` 工具
-  - 临时提高 `OPENAI_TIMEOUT_MS`，例如 `60000`
+  - 调整 `OPENAI_IMAGE_TIMEOUT_MS`，例如 `120000` 或 `180000`
   - 查看日志是否停在 `调用OpenAI`；若是，多半是上游请求未返回
 - 拍一拍文案文件无法写入：
   - 若 `文案列表` 能用，但 `文案添加` 提示“命令处理失败，请稍后重试”，优先检查 `AI_POKE_REPLY_FILE` 的写权限
