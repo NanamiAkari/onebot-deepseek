@@ -2074,6 +2074,26 @@ function buildScheduleCommandHelp(isAdminUser) {
   return lines.join('\n')
 }
 
+function buildBannedCommandHelp(isAdminUser) {
+  const lines = [
+    '违禁词治理命令：',
+    '1. 违禁词列表',
+    '2. 违禁词帮助 / 违禁词命令'
+  ]
+  if (isAdminUser) {
+    lines.push('3. 违禁词添加 词语')
+    lines.push('4. 违禁词删除 词语')
+    lines.push('5. 违禁词清空')
+    lines.push('6. 违禁词治理开启')
+    lines.push('7. 违禁词治理关闭')
+    lines.push('8. 禁言时长 10分钟')
+    lines.push('9. 支持正则：违禁词添加 re:正则表达式')
+  } else {
+    lines.push('查看和管理违禁词需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
   const rawCommandText = stripPrefix(text || '')
   const t = normalizeCommandText(rawCommandText)
@@ -2531,6 +2551,10 @@ async function handleCommands(ws, payload, text) {
       const list = loadBanned(payload.group_id)
       if (!isGroup) {
         await replyCommandMessage(ws, payload, '违禁词管理仅支持群聊')
+        return true
+      }
+      if (/^(?:违禁词|禁词|敏感词|banned)\s*(?:帮助|命令|help|\?)?$/i.test(nt)) {
+        await replyCommandMessage(ws, payload, buildBannedCommandHelp(isAdminUser))
         return true
       }
       if (!isAdminUser) {
