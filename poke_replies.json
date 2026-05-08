@@ -62,5 +62,9 @@
   {
     "type": "image",
     "source": "/opt/onebot-deepseek/poke_media/46ed8481f75b738aa78ceff9c9aa04f694ee8642.jpg"
+  },
+  {
+    "type": "text",
+    "content": "7月已经尾声，请您为本群的7月群聊内容做评估：\nA：优质高级\nB：建议保持\nC：下月别发\nD：不配打分\nE：有TM男同\nF： 一天不看浑身难受\nG：纯傻逼，但是喜欢\nH：色情内容过多\nI：色情内容过少\nJ：感觉群友都不用上班\nK：经常骚扰群主\nL：群主画饼太多\n补充选项\nM:  群主不涩情\nN:  群主性冷淡不主动\nO:  全是炫压抑\nP:  变态太多\nQ:  变态太少\nR:  没人勾引我\nS：妈的有人搬屎"
   }
 ]

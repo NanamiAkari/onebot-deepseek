@@ -5,7 +5,7 @@ const fs = require('fs')
 const path = require('path')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
-const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
+const { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, formatOpenAITools } = require('./src/providers/openai')
 const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
 const { createToolExecutor } = require('./src/agent/tool-executor')
@@ -851,6 +851,7 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  handleImageGenerationRequest,
   handleScheduleTaskDraftInput,
   handleCustomReplyDraftInput,
   handleCustomReplyMatch,
@@ -874,6 +875,7 @@ const onMessage = createMessageHandler({
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
   AI_IMAGE_HINT_REGEX,
   AI_IMAGE_CONTEXT_MODE,
+  AI_IMAGE_CONTEXT_REQUIRE_SAME_USER,
   AI_IMAGE_CONTEXT_MAX,
   AI_IMAGE_ONLY_NO_CALL
 })
@@ -1053,6 +1055,10 @@ async function callOpenAI(text, media, hist, opts) {
     console.log('调用OpenAI')
     const useResponses = OPENAI_WIRE_API === 'responses' || /ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(OPENAI_BASE_URL)
     const url = useResponses ? `${OPENAI_BASE_URL}/responses` : `${OPENAI_BASE_URL}/chat/completions`
+    const wantsImageGeneration = Boolean(opts && opts.generateImage)
+    if (wantsImageGeneration && !useResponses) {
+      return opts && opts.structured ? { text: '当前上游接口不支持 Responses 生图工具', toolCalls: [], images: [] } : '当前上游接口不支持 Responses 生图工具'
+    }
     const content = []
     let attached = 0
     if (opts && opts.contextImage) {
@@ -1083,10 +1089,22 @@ async function callOpenAI(text, media, hist, opts) {
       msg.push({ role: 'user', content })
     }
     const tools = formatOpenAITools(opts && opts.tools, useResponses)
+    if (wantsImageGeneration && useResponses) tools.push({ type: 'image_generation' })
+    const responseInput = []
+    if (useResponses && Array.isArray(hist) && hist.length > 0) {
+      for (const h of hist) {
+        const role = h && h.role === 'assistant' ? 'assistant' : 'user'
+        const contentText = String(h && h.content || '').trim()
+        if (!contentText) continue
+        responseInput.push({ role, content: contentText })
+      }
+    }
+    if (useResponses) responseInput.push({ role: 'user', content })
     const buildPayload = (includeTools) => useResponses
       ? {
           model: OPENAI_MODEL,
-          input: [{ role: 'user', content }],
+          instructions: SYSTEM_PROMPT,
+          input: responseInput,
           ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
           ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {}),
           ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
@@ -1134,7 +1152,8 @@ async function callOpenAI(text, media, hist, opts) {
     }
     const contentText = extractOpenAIText(res.data)
     const toolCalls = extractOpenAIToolCalls(res.data)
-    if (!contentText && toolCalls.length === 0) return null
+    const images = extractOpenAIImages(res.data)
+    if (!contentText && toolCalls.length === 0 && images.length === 0) return null
     console.log('OpenAI成功')
     const txt = String(contentText || '').slice(0, 2000)
     if (txt && Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
@@ -1144,7 +1163,7 @@ async function callOpenAI(text, media, hist, opts) {
         if (again) return { text: String(again).slice(0, 2000), toolCalls }
       }
     }
-    return { text: txt, toolCalls }
+    return { text: txt, toolCalls, images }
   } catch (e) {
     const status = e && e.response && e.response.status
     const msg = e && e.response && e.response.data
@@ -1159,11 +1178,11 @@ async function callOpenAI(text, media, hist, opts) {
       }
     }
     console.log('OpenAI失败', status || '', `media=${Array.isArray(media) ? media.length : 0}`, `timeout=${requestTimeout}`, errorMessage, errText.slice(0, 500))
-    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [] } : '上游限流，请稍后再试'
-    if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [] } : '上游鉴权失败，请检查 API Key'
-    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [] } : '上游网关异常（5xx），请稍后再试'
-    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [] } : '图片分析超时，请稍后重试或发送更小的图片'
-    return opts && opts.structured ? { text: '上游调用失败', toolCalls: [] } : '上游调用失败'
+    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [], images: [] } : '上游限流，请稍后再试'
+    if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [], images: [] } : '上游鉴权失败，请检查 API Key'
+    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [], images: [] } : '上游网关异常（5xx），请稍后再试'
+    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [], images: [] } : '图片分析超时，请稍后重试或发送更小的图片'
+    return opts && opts.structured ? { text: '上游调用失败', toolCalls: [], images: [] } : '上游调用失败'
   }
 }
 
@@ -1374,6 +1393,28 @@ function detectImageExtFromMime(mime) {
 
 function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
+}
+
+function shouldGenerateImage(text) {
+  const value = String(text || '').trim()
+  if (!value) return false
+  return /(生成|画|做|来|给我|帮我).{0,8}(一张|张|个)?.{0,8}(图|图片|配图|插图|壁纸|头像|表情包)/i.test(value)
+    || /(文生图|生图|出图|画一张|生成一张|做一张图)/i.test(value)
+}
+
+function saveGeneratedImage(base64Data, mime = 'image/png') {
+  const normalized = String(base64Data || '').trim()
+  if (!normalized) return ''
+  const buffer = Buffer.from(normalized, 'base64')
+  if (!buffer.length) return ''
+  const fileMime = isImageMime(mime) ? mime : detectMimeFromBuffer(buffer, 'image/png')
+  const dir = path.join(PROJECT_ROOT, 'generated_images')
+  fs.mkdirSync(dir, { recursive: true })
+  const hash = crypto.createHash('sha1').update(buffer).digest('hex')
+  const ext = detectImageExtFromMime(fileMime)
+  const filePath = path.join(dir, `${hash}${ext}`)
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, buffer)
+  return filePath
 }
 
 function isLocalFileSource(src) {
@@ -1891,6 +1932,34 @@ async function replyCommandMessage(ws, payload, text) {
       : await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => null)
     if (result && result.status === 'ok') return
   }
+}
+
+async function handleImageGenerationRequest(ws, payload, promptText, hist) {
+  const prompt = String(promptText || '').trim()
+  if (!prompt || !shouldGenerateImage(prompt)) return { handled: false }
+  const result = await callOpenAI(prompt, [], hist, { structured: true, generateImage: true })
+  if (!result || typeof result !== 'object') return { handled: false }
+  const images = Array.isArray(result.images) ? result.images : []
+  const text = sanitizeText(result.text || '')
+  if (images.length === 0) {
+    await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
+    return { handled: true, deliveredText: text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试' }
+  }
+  if (text) await replyCommandMessage(ws, payload, text)
+  let deliveredImages = 0
+  for (const image of images.slice(0, 1)) {
+    const filePath = saveGeneratedImage(image.b64, 'image/png')
+    if (!filePath) continue
+    const variants = await buildCustomReplyMessageVariants({ segments: [{ type: 'image', source: filePath }] })
+    await replyCommandMessage(ws, payload, variants)
+    deliveredImages += 1
+  }
+  if (deliveredImages === 0) {
+    const fallbackText = text || '图片已生成，但发送失败，请稍后再试'
+    await replyCommandMessage(ws, payload, fallbackText)
+    return { handled: true, deliveredText: fallbackText }
+  }
+  return { handled: true, deliveredText: text || '[已发送生成图片]' }
 }
 
 async function getReplyMessageContent(ws, replyId) {

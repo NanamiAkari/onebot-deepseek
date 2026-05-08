@@ -4,6 +4,7 @@
 - 接收 Napcat 的消息事件（反向 WebSocket）
 - 支持群聊与私聊消息回复
 - 使用 OpenAI 兼容上游生成回复，支持 `responses` / `chat.completions`
+- 在 Responses 模式下可尝试调用上游 `image_generation` 工具生成图片
 - 内部已升级为多轮 `agent loop + tool registry + tool executor` 架构
 - 通过 OneBot v11 动作帧把回复发回 QQ
 
@@ -25,6 +26,7 @@
 
 ## 启动
 - `npm start`
+- 部署前可先运行 `npm run check` 做语法检查
 - 服务默认监听 `ws://<服务器IP>:5000/onebot/v11/ws`
 - 端口与路径可在 `.env` 配置：
   - `PORT=5000`
@@ -59,6 +61,8 @@
   - `OPENAI_WIRE_API=responses`：调用 `POST <OPENAI_BASE_URL>/responses`
   - 留空：调用 `POST <OPENAI_BASE_URL>/chat/completions`
 - 当前实现会根据 `OPENAI_WIRE_API` 和网关地址自动选择协议。
+- `responses` 模式会通过 `instructions` 传入 `PROMPT_FILE` / `SYSTEM_PROMPT`，用于保持人设提示词生效。
+- 文生图依赖上游兼容 Responses API 的 `image_generation` 工具；若上游不支持，会返回失败提示而不是继续普通对话。
 
 ## Agent Loop
 - 当前服务已升级为有限步数的多轮 agent loop
@@ -158,6 +162,9 @@ sudo systemctl restart onebot-deepseek
   - `OpenAI媒体数量: 1`
   - `OpenAI成功`
   - `OpenAI失败 media=1 timeout=...`
+- 文生图：
+  - 生成图会保存到 `generated_images/` 后再通过 OneBot 图片消息发送
+  - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_TIMEOUT_MS`
 - AI 回复发送保护：
   - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
   - `AI_REPLY_CHUNK_CHARS=750`：单条消息的分段长度，超长回复会按段拆开发送
@@ -174,10 +181,11 @@ sudo systemctl restart onebot-deepseek
 - Napcat url（同机）：`ws://127.0.0.1:5000/onebot/v11/ws`
 - 推荐先做一轮最小冒烟测试：
   - 私聊发送普通文本，确认能回复
-  - 群聊按前缀或 @ 规则触发一次，确认能回复
+  - 群聊发送 `阿卡林你好`，确认前缀触发能回复
   - 回复一条旧消息再提问，确认引用消息场景正常
   - 发送一张简单图片并提问，确认图片链路正常
   - 对同一张图片重复提问一次，确认缓存与稳定性
+  - 如上游支持生图，发送 `阿卡林画一张在教室里微笑的动漫风图片`
 
 ## 常见问题
 - 端口被占用（EADDRINUSE）：
@@ -194,6 +202,11 @@ sudo systemctl restart onebot-deepseek
   - 先提高 `OPENAI_TIMEOUT_MS`
   - 确认图片预处理已开启
   - 优先测试简单图片，再测信息密集型截图
+- 生图一直无回复：
+  - 确认 `OPENAI_WIRE_API=responses`
+  - 确认上游支持 Responses API 的 `image_generation` 工具
+  - 临时提高 `OPENAI_TIMEOUT_MS`，例如 `60000`
+  - 查看日志是否停在 `调用OpenAI`；若是，多半是上游请求未返回
 - 拍一拍文案文件无法写入：
   - 若 `文案列表` 能用，但 `文案添加` 提示“命令处理失败，请稍后重试”，优先检查 `AI_POKE_REPLY_FILE` 的写权限
   - systemd 场景下，服务运行用户由 `onebot-deepseek.service` 的 `User=` / `Group=` 决定；文案文件需对该用户可写
@@ -210,6 +223,7 @@ sudo chmod 664 /opt/onebot-deepseek/poke_replies.json
 
 ## 触发控制
 - 默认群聊按前缀触发；私聊默认可直接回复。
+- 当前示例配置使用 `阿卡林` 作为前缀，不使用 `/ai`。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_GROUP_REQUIRE_MENTION=true|false`：群聊是否必须 `@机器人`
@@ -429,6 +443,7 @@ AI_ADMIN_USER_IDS=123456789,987654321
 ## 提示词文件
 - 默认优先读取 `PROMPT_FILE` 指向的纯文本文件
 - 若读取失败，则回退到 `.env` 中的 `SYSTEM_PROMPT`
+- 在 OpenAI Responses 模式下，提示词会作为 `instructions` 发送。
 - 示例：
   - `PROMPT_FILE=prompt.txt`
   - 可使用项目中的 `prompt.py` 生成 `prompt.txt`
@@ -436,6 +451,7 @@ AI_ADMIN_USER_IDS=123456789,987654321
 ## 推荐测试 Checklist
 - 部署前
   - 确认已同步 `server.js`、`src/`、`package.json`、`.env`
+  - 执行 `npm run check`
   - 在目标服务器执行 `npm install`
   - 确认 `node_modules/sharp` 能在目标平台加载
 - 启动后

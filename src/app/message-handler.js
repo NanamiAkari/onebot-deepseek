@@ -11,6 +11,7 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    handleImageGenerationRequest,
     handleScheduleTaskDraftInput,
     handleCustomReplyDraftInput,
     handleCustomReplyMatch,
@@ -236,6 +237,17 @@ function createMessageHandler(deps) {
         ? `被引用消息：\n${quotedText}\n\n当前消息：\n${stripped || '请结合被引用消息继续回答'}`
         : stripped
       const hist = getContext(payload, modelInput)
+      if (typeof handleImageGenerationRequest === 'function') {
+        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist).catch((error) => {
+          const message = error && error.message ? String(error.message) : String(error)
+          console.log('生图处理异常', message)
+          return { handled: false }
+        })
+        if (imageGeneration && imageGeneration.handled) {
+          pushHistory(payload, stripped, imageGeneration.deliveredText || '[已处理生图请求]')
+          return
+        }
+      }
       const result = await agentRunner.run({
         message: modelInput,
         media: content.media,
