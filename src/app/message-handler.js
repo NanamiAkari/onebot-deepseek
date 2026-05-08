@@ -11,6 +11,11 @@ function createMessageHandler(deps) {
     checkMention,
     checkModeration,
     handleCommands,
+    handleImageGenerationRequest,
+    handleScheduleTaskDraftInput,
+    handleCustomReplyDraftInput,
+    handleCustomReplyMatch,
+    hasCustomReplyTrigger,
     shouldIgnoreText,
     GROUP_REQUIRE_MENTION,
     shouldRespond,
@@ -24,6 +29,8 @@ function createMessageHandler(deps) {
     AI_POKE_REPLY_TEXTS,
     getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
+    buildPokeReplyMessageSegments,
+    AI_REPLY_CHUNK_CHARS,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
     AI_IMAGE_HINT_REGEX,
@@ -32,6 +39,21 @@ function createMessageHandler(deps) {
     AI_IMAGE_CONTEXT_MAX,
     AI_IMAGE_ONLY_NO_CALL
   } = deps
+  let sendGroupPokeSupported = true
+
+  function normalizePokeReplyItem(item) {
+    if (typeof item === 'string') {
+      const content = String(item || '').replace(/\r/g, '').trim()
+      return content ? { type: 'text', content } : null
+    }
+    if (!item || typeof item !== 'object') return null
+    if (item.type === 'image') {
+      const source = String(item.source || item.file || item.url || item.localPath || '').trim()
+      return source ? { type: 'image', source } : null
+    }
+    const content = String(item.content || item.text || '').replace(/\r/g, '').trim()
+    return content ? { type: 'text', content } : null
+  }
 
   function pickPokeReply() {
     const dynamicList = typeof getPokeReplyTexts === 'function' ? getPokeReplyTexts() : null
@@ -40,7 +62,48 @@ function createMessageHandler(deps) {
       : Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0
       ? AI_POKE_REPLY_TEXTS
       : [AI_POKE_REPLY_TEXT]
-    return list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT
+    return normalizePokeReplyItem(list[Math.floor(Math.random() * list.length)] || AI_POKE_REPLY_TEXT) || { type: 'text', content: AI_POKE_REPLY_TEXT }
+  }
+
+  function extractTextFromSegments(segments) {
+    if (!Array.isArray(segments)) return ''
+    return segments
+      .filter((seg) => seg && seg.type === 'text' && seg.data && typeof seg.data.text === 'string')
+      .map((seg) => seg.data.text)
+      .join('')
+  }
+
+  function extractRemainingText(batches, startIndex) {
+    if (!Array.isArray(batches)) return ''
+    return batches
+      .slice(startIndex)
+      .map((segments) => extractTextFromSegments(segments))
+      .filter(Boolean)
+      .join('\n')
+      .trim()
+  }
+
+  function normalizeMessageVariants(message) {
+    if (!Array.isArray(message)) return [[{ type: 'text', data: { text: String(message || '') } }]]
+    if (message.length > 0 && Array.isArray(message[0])) return message
+    return [message]
+  }
+
+  async function sendReplyBatches(ws, action, payload, batches) {
+    const sentTexts = []
+    for (let index = 0; index < batches.length; index += 1) {
+      const messageSegments = batches[index]
+      const params = action === 'send_group_msg'
+        ? { group_id: payload.group_id, message: messageSegments }
+        : { user_id: payload.user_id, message: messageSegments }
+      const sendResult = await sendAction(ws, action, params).catch(() => null)
+      if (!(sendResult && sendResult.status === 'ok')) {
+        return { ok: false, failedIndex: index, sentTexts }
+      }
+      const textPart = extractTextFromSegments(messageSegments)
+      if (textPart) sentTexts.push(textPart)
+    }
+    return { ok: true, failedIndex: -1, sentTexts }
   }
 
   return async function onMessage(ws, data) {
@@ -70,18 +133,32 @@ function createMessageHandler(deps) {
         const last = pokeCooldown.get(key) || 0
         if (now - last < AI_POKE_COOLDOWN * 1000) return
         pokeCooldown.set(key, now)
+        const pokeReply = pickPokeReply()
         if (gid) {
           try {
-            const r = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
-            if (!(r && r.status === 'ok')) {
-              const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
-              await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg })
+            if (sendGroupPokeSupported) {
+              const pokeResult = await sendAction(ws, 'send_group_poke', { group_id: gid, user_id: uid }).catch(() => null)
+              if (!(pokeResult && pokeResult.status === 'ok')) sendGroupPokeSupported = false
+            }
+            const built = typeof buildPokeReplyMessageSegments === 'function'
+              ? await buildPokeReplyMessageSegments(pokeReply)
+              : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
+            const variants = normalizeMessageVariants(built)
+            for (const msg of variants) {
+              const result = await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => null)
+              if (result && result.status === 'ok') break
             }
           } catch {}
         } else {
           try {
-            const msg = [{ type: 'text', data: { text: pickPokeReply() } }]
-            await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg })
+            const built = typeof buildPokeReplyMessageSegments === 'function'
+              ? await buildPokeReplyMessageSegments(pokeReply)
+              : [{ type: 'text', data: { text: pokeReply && pokeReply.content ? pokeReply.content : AI_POKE_REPLY_TEXT } }]
+            const variants = normalizeMessageVariants(built)
+            for (const msg of variants) {
+              const result = await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg }).catch(() => null)
+              if (result && result.status === 'ok') break
+            }
           } catch {}
         }
         return
@@ -107,15 +184,12 @@ function createMessageHandler(deps) {
           }
         }
       }
-      const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-      const prefixTriggered = shouldRespond(raw.text)
-      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned) return
-      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered) return
       const content = raw
-      if ((!content.media || content.media.length === 0) && content.replyId) {
+      if (content.replyId) {
         const resp = await sendAction(ws, 'get_msg', { message_id: content.replyId }).catch(() => null)
         if (resp && resp.status === 'ok' && resp.data && resp.data.message) {
           const q = extractContent(resp.data.message)
+          const quotedText = String(q.text || '').trim()
           q.media = await resolveMediaSources(ws, q.media)
           const merged = content.media ? content.media.slice() : []
           if (q.media && q.media.length) {
@@ -125,15 +199,29 @@ function createMessageHandler(deps) {
             }
             content.media = merged
           }
-          if (!content.text && q.text) content.text = q.text
+          if (quotedText) content.quotedText = quotedText
+          if (!content.text && quotedText) content.text = quotedText
         }
       }
+      const scheduleDraftHandled = await handleScheduleTaskDraftInput(ws, payload).catch(() => false)
+      if (scheduleDraftHandled) return
+      const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
+      if (customDraftHandled) return
+      const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
+      const prefixTriggered = shouldRespond(raw.text)
+      const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
+        ? hasCustomReplyTrigger(payload.group_id, raw.text)
+        : false
+      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned && !customReplyTriggered) return
+      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       if (isGroup) {
         const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
         if (ban) return
       }
       const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
+      const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
+      if (customMatched) return
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
       if (hasText && shouldIgnoreText(content.text)) return
@@ -144,9 +232,24 @@ function createMessageHandler(deps) {
       const wantsReply = isGroup ? shouldRespond(content.text) : hasText
       if (!wantsReply) return
       const stripped = stripPrefix(content.text || '') || (hasMedia ? '请描述这张图片' : '')
-      const hist = getContext(payload, stripped)
+      const quotedText = String(content.quotedText || '').trim()
+      const modelInput = quotedText && quotedText !== stripped
+        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${stripped || '请结合被引用消息继续回答'}`
+        : stripped
+      const hist = getContext(payload, modelInput)
+      if (typeof handleImageGenerationRequest === 'function') {
+        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist).catch((error) => {
+          const message = error && error.message ? String(error.message) : String(error)
+          console.log('生图处理异常', message)
+          return { handled: false }
+        })
+        if (imageGeneration && imageGeneration.handled) {
+          pushHistory(payload, stripped, imageGeneration.deliveredText || '[已处理生图请求]')
+          return
+        }
+      }
       const result = await agentRunner.run({
-        message: stripped,
+        message: modelInput,
         media: content.media,
         history: hist,
         contextImage: ctxImgUsed,
@@ -160,16 +263,45 @@ function createMessageHandler(deps) {
       })
       const aiText = result && result.text
       if (!aiText) return
-      const messageSegments = buildReplySegments(payload.message_id, aiText)
       const action = isGroup ? 'send_group_msg' : 'send_private_msg'
-      const params = isGroup
-        ? { group_id: payload.group_id, message: messageSegments }
-        : { user_id: payload.user_id, message: messageSegments }
-      const frame = { action, params, echo: String(Date.now()) }
-      try {
-        ws.send(JSON.stringify(frame))
-      } catch {}
-      pushHistory(payload, stripped, aiText)
+      const sentTexts = []
+      const messageBatches = buildReplySegments(payload.message_id, aiText)
+      const firstAttempt = await sendReplyBatches(ws, action, payload, messageBatches)
+      sentTexts.push(...firstAttempt.sentTexts)
+      if (!firstAttempt.ok) {
+        console.log(`AI回复发送失败，尝试去掉引用重发 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
+        const remainingText = extractRemainingText(messageBatches, firstAttempt.failedIndex)
+        if (remainingText) {
+          const retryBatches = buildReplySegments(payload.message_id, remainingText, {
+            includeReply: false,
+            maxChars: Math.max(remainingText.length + 32, 64),
+            chunkSize: AI_REPLY_CHUNK_CHARS
+          })
+          const secondAttempt = await sendReplyBatches(ws, action, payload, retryBatches)
+          sentTexts.push(...secondAttempt.sentTexts)
+          if (!secondAttempt.ok) {
+            const fallbackText = extractRemainingText(retryBatches, secondAttempt.failedIndex)
+            const smallerChunkChars = Math.max(250, Math.min(AI_REPLY_CHUNK_CHARS - 1, Math.floor(AI_REPLY_CHUNK_CHARS * 0.6)))
+            console.log(`AI回复发送失败，尝试更小分段重发 chunk=${smallerChunkChars}`)
+            if (fallbackText) {
+              const thirdBatches = buildReplySegments(payload.message_id, fallbackText, {
+                includeReply: false,
+                maxChars: Math.max(fallbackText.length + 32, 64),
+                chunkSize: smallerChunkChars
+              })
+              const thirdAttempt = await sendReplyBatches(ws, action, payload, thirdBatches)
+              sentTexts.push(...thirdAttempt.sentTexts)
+              if (!thirdAttempt.ok) {
+                console.log(`AI回复发送最终失败 index=${thirdAttempt.failedIndex + 1}/${thirdBatches.length}`)
+              }
+            }
+          }
+        } else {
+          console.log('AI回复发送失败，未提取到可重发的剩余文本')
+        }
+      }
+      const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
+      pushHistory(payload, stripped, deliveredText)
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)

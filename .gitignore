@@ -1,4 +1,22 @@
 .env
 node_modules/
 npm-debug.log*
-**test**
+
+# Runtime data
+poke_media/
+generated_images/
+poke_replies.json
+custom_replies.json
+scheduled_tasks.json
+banned.json
+*.log
+
+# Local prompt/persona files
+prompt.txt
+
+# Tests and coverage
+test/
+tests/
+*.test.js
+*.spec.js
+coverage/

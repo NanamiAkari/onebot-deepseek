@@ -4,6 +4,7 @@
 - 接收 Napcat 的消息事件（反向 WebSocket）
 - 支持群聊与私聊消息回复
 - 使用 OpenAI 兼容上游生成回复，支持 `responses` / `chat.completions`
+- 在 Responses 模式下可尝试调用上游 `image_generation` 工具生成图片
 - 内部已升级为多轮 `agent loop + tool registry + tool executor` 架构
 - 通过 OneBot v11 动作帧把回复发回 QQ
 
@@ -25,6 +26,7 @@
 
 ## 启动
 - `npm start`
+- 部署前可先运行 `npm run check` 做语法检查
 - 服务默认监听 `ws://<服务器IP>:5000/onebot/v11/ws`
 - 端口与路径可在 `.env` 配置：
   - `PORT=5000`
@@ -59,6 +61,8 @@
   - `OPENAI_WIRE_API=responses`：调用 `POST <OPENAI_BASE_URL>/responses`
   - 留空：调用 `POST <OPENAI_BASE_URL>/chat/completions`
 - 当前实现会根据 `OPENAI_WIRE_API` 和网关地址自动选择协议。
+- `responses` 模式会通过 `instructions` 传入 `PROMPT_FILE` / `SYSTEM_PROMPT`，用于保持人设提示词生效。
+- 文生图依赖上游兼容 Responses API 的 `image_generation` 工具；若上游不支持，会返回失败提示而不是继续普通对话。
 
 ## Agent Loop
 - 当前服务已升级为有限步数的多轮 agent loop
@@ -158,6 +162,12 @@ sudo systemctl restart onebot-deepseek
   - `OpenAI媒体数量: 1`
   - `OpenAI成功`
   - `OpenAI失败 media=1 timeout=...`
+- 文生图：
+  - 生成图会保存到 `generated_images/` 后再通过 OneBot 图片消息发送
+  - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_TIMEOUT_MS`
+- AI 回复发送保护：
+  - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
+  - `AI_REPLY_CHUNK_CHARS=750`：单条消息的分段长度，超长回复会按段拆开发送
 - Agent loop：
   - `Agent step 1/5: 调用模型`
   - `Agent step 1/5: 调用工具 get_msg args=...`
@@ -171,10 +181,11 @@ sudo systemctl restart onebot-deepseek
 - Napcat url（同机）：`ws://127.0.0.1:5000/onebot/v11/ws`
 - 推荐先做一轮最小冒烟测试：
   - 私聊发送普通文本，确认能回复
-  - 群聊按前缀或 @ 规则触发一次，确认能回复
+  - 群聊发送 `阿卡林你好`，确认前缀触发能回复
   - 回复一条旧消息再提问，确认引用消息场景正常
   - 发送一张简单图片并提问，确认图片链路正常
   - 对同一张图片重复提问一次，确认缓存与稳定性
+  - 如上游支持生图，发送 `阿卡林画一张在教室里微笑的动漫风图片`
 
 ## 常见问题
 - 端口被占用（EADDRINUSE）：
@@ -191,9 +202,28 @@ sudo systemctl restart onebot-deepseek
   - 先提高 `OPENAI_TIMEOUT_MS`
   - 确认图片预处理已开启
   - 优先测试简单图片，再测信息密集型截图
+- 生图一直无回复：
+  - 确认 `OPENAI_WIRE_API=responses`
+  - 确认上游支持 Responses API 的 `image_generation` 工具
+  - 临时提高 `OPENAI_TIMEOUT_MS`，例如 `60000`
+  - 查看日志是否停在 `调用OpenAI`；若是，多半是上游请求未返回
+- 拍一拍文案文件无法写入：
+  - 若 `文案列表` 能用，但 `文案添加` 提示“命令处理失败，请稍后重试”，优先检查 `AI_POKE_REPLY_FILE` 的写权限
+  - systemd 场景下，服务运行用户由 `onebot-deepseek.service` 的 `User=` / `Group=` 决定；文案文件需对该用户可写
+  - 可先查看服务配置，确认实际运行用户：
+```bash
+systemctl cat onebot-deepseek
+```
+  - 重点查看输出中的 `User=` 和 `Group=`
+  - 例如服务以 `www-data:www-data` 运行时，可执行：
+```bash
+sudo chown www-data:www-data /opt/onebot-deepseek/poke_replies.json
+sudo chmod 664 /opt/onebot-deepseek/poke_replies.json
+```
 
 ## 触发控制
 - 默认群聊按前缀触发；私聊默认可直接回复。
+- 当前示例配置使用 `阿卡林` 作为前缀，不使用 `/ai`。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_GROUP_REQUIRE_MENTION=true|false`：群聊是否必须 `@机器人`
@@ -267,10 +297,12 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 ## 拍一拍与戳一戳
 - 监听 OneBot `notice.notify.poke`
 - 仅当拍一拍目标是机器人自身时才响应（`AI_POKE_ONLY_SELF=true`）
-- 平台支持时尝试 `send_group_poke` 反拍；不支持则发送文本回复
-- 支持配置独立文案文件，按行维护多条备选文案并随机回复其中一条
-- 默认优先读取 `AI_POKE_REPLY_FILE` 指向的文本文件；如果文件不存在或为空，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
+- 群聊里会优先尝试 `send_group_poke` 反拍，并继续按回复池随机发送一条文本或图片回复
+- 支持配置独立回复文件，推荐使用 JSON 数组格式维护“文本回复 + 图片回复”混合池，并随机命中其中一条；图片条目越多，被随机到图片回复的概率越高
+- 默认优先读取 `AI_POKE_REPLY_FILE` 指向的 JSON 文件；如果文件不存在、为空，或仍是旧的按行文本格式，则回退兼容旧格式，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
+- JSON 数组中的每一项代表一条完整回复；文本项可包含换行，图片项使用 `type=image`
 - 支持通过管理员命令动态查看和新增文案，写回文件后立即生效
+- 若 `文案列表` 正常但 `文案添加/删除/清空/去重` 返回“命令处理失败，请稍后重试”，通常是 `AI_POKE_REPLY_FILE` 对服务运行用户只有读权限没有写权限；systemd 部署时请确认该文件归属与 `User=` 一致
 - 配置项：
   - `AI_POKE_ENABLE`
   - `AI_POKE_COOLDOWN`
@@ -278,17 +310,34 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_POKE_REPLY_TEXT`
   - `AI_POKE_REPLY_TEXTS`
   - `AI_POKE_ONLY_SELF`
+- JSON 文件示例：
+```json
+[
+  { "type": "text", "content": "何意味" },
+  { "type": "text", "content": "第一行\n第二行" },
+  { "type": "image", "source": "https://example.com/poke.png" }
+]
+```
 - 管理命令：
   - `阿卡林 拍一拍 文案列表`
+  - `阿卡林 拍一拍 文案查看 3`
   - `阿卡林 拍一拍 文案添加 你好呀`
-  - `阿卡林 拍一拍 文案删除 你好呀`
+  - `阿卡林 拍一拍 文案添加 第一行` 后面可继续换行追加多行内容
+  - `阿卡林 拍一拍 图片添加` 并在同一条消息里附带图片，或引用一条带图片的消息
+  - `阿卡林 拍一拍 添加图片`
+  - `阿卡林 拍一拍 加图`
+  - `阿卡林 拍一拍 加图片`
+  - `阿卡林 拍一拍 图片添加 https://example.com/poke.png`
+  - `阿卡林 拍一拍 文案删除 3`
   - `阿卡林 拍一拍 文案清空`
   - `阿卡林 拍一拍 文案去重`
   - `阿卡林 拍一拍 开启`
   - `阿卡林 拍一拍 关闭`
 - 权限规则：
   - `文案列表` 任何人可查看
-  - `文案添加/删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
+  - `文案查看 序号` 任何人可查看单条完整回复；若该条是图片回复，会先提示类型，再单独发送图片
+  - 列表只预览文本项；图片项仅显示为 `[图片回复]`
+  - `文案添加/图片添加/删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
 
 ## 管理员权限
 - 除了 QQ 群内原生 `owner` / `admin`，还支持通过 `.env` 配置额外管理员账号：
@@ -298,9 +347,85 @@ AI_ADMIN_USER_IDS=123456789,987654321
 - 配置后的账号在私聊和群聊里都可使用管理命令
 - 当前已接入的管理员能力：
   - 拍一拍文案新增
+  - 自定义回复管理
+  - 定时任务管理
   - 拍一拍开关管理
   - 上下文配置修改
   - 违禁词治理管理
+
+## 定时任务
+- 按群独立存储在 `AI_SCHEDULE_FILE` 指向的 JSON 文件中，默认是 `scheduled_tasks.json`
+- 当前支持四种时间格式：
+  - `每天 HH:mm`
+  - `每周一 HH:mm`
+  - `每月 1号 HH:mm`
+  - `YYYY-MM-DD HH:mm`
+- `每天 HH:mm` 为每日循环任务
+- `每周一 HH:mm` 为每周循环任务
+- `每月 1号 HH:mm` / `每月 1日 HH:mm` 为每月循环任务
+- `YYYY-MM-DD HH:mm` 为一次性任务，执行后自动移除
+- 定时发送内容复用现有回复段落结构，可发送文本、图片、表情；图片和 GIF 会走现有图片发送兜底
+- 支持交互式创建；流程中发送 `取消` 可退出；任一步骤 10 分钟未继续会自动取消
+- 配置项：
+  - `AI_SCHEDULE_FILE`
+- 常用命令：
+  - `阿卡林 定时任务 列表`
+  - `阿卡林 定时任务 查看 1`
+  - `阿卡林 定时任务 添加 每天 08:30 => 早安`
+  - `阿卡林 定时任务 添加 每周一 08:30 => 周会提醒`
+  - `阿卡林 定时任务 添加 每月 1号 08:30 => 月初提醒`
+  - `阿卡林 定时任务 添加 2026-05-07 20:00 => 会议开始`
+  - `引用一条消息后发送：阿卡林 定时任务 添加 每天 08:30`
+  - `引用一条消息后发送：阿卡林 定时任务 添加 每周一 08:30`
+  - `引用一条消息后发送：阿卡林 定时任务 添加 每月 1号 08:30`
+  - `引用一条消息后发送：阿卡林 定时任务 添加 2026-05-07 20:00`
+  - `阿卡林 创建定时任务`
+  - `阿卡林 定时任务 删除 1`
+  - `阿卡林 定时任务 清空`
+- 引用消息创建：
+  - 若引用了一条带文本、图片、表情的消息，可直接发送 `阿卡林 定时任务 添加 时间`
+  - 机器人会把被引用消息作为定时发送内容保存下来
+- 交互式创建流程：
+  - 发送 `阿卡林 创建定时任务`
+  - 机器人提示 `请输入定时规则`
+  - 管理员发送例如 `每天 08:30`、`每周一 08:30`、`每月 1号 08:30`、`2026-05-07 20:00`
+  - 机器人再提示 `请发送定时内容`
+  - 管理员发送文本、图片、表情，或直接引用一条消息作为定时内容
+- 权限规则：
+  - `列表`、`查看` 任何人可看
+  - `添加`、`删除`、`清空` 仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
+
+## 自定义回复
+- 按群独立存储在 `AI_CUSTOM_REPLY_FILE` 指向的 JSON 文件中，默认是 `custom_replies.json`
+- 仅群聊生效，当前按“消息文本去首尾空格后包含触发词”匹配；若同时命中多个触发词，优先选择更长的触发词
+- 同一触发词可配置多条回复，命中后随机返回其中一条
+- 单条回复可由文本、图片、表情组合而成；图片会复用现有图片持久化与多种发送方式兜底
+- 交互式创建只绑定发起管理员本人；流程中发送 `取消` 可退出；任一步骤 10 分钟未继续会自动取消
+- 配置项：
+  - `AI_CUSTOM_REPLY_FILE`
+- 常用命令：
+  - `阿卡林 创建自定义回复`
+  - `阿卡林 自定义回复 添加 测试 => 功能正常`
+  - `引用一条消息后发送：阿卡林 自定义回复 添加 测试`
+  - `引用一条消息后发送：阿卡林 创建自定义回复 测试`
+  - `阿卡林 自定义回复 列表`
+  - `阿卡林 自定义回复 查看 测试`
+  - `阿卡林 自定义回复 删除 测试`
+  - `阿卡林 自定义回复 删除 测试 第2条`
+  - `阿卡林 自定义回复 清空`
+- 交互式创建流程：
+  - 发送 `阿卡林 创建自定义回复`
+  - 机器人提示 `请输入被回复内容`
+  - 管理员发送触发词，例如 `测试`
+  - 机器人提示 `请发送回复内容`
+  - 管理员再发送文本、图片、表情或它们的组合
+  - 若第二步或第三步 10 分钟内未继续，草稿会自动过期，需要重新创建
+- 一步创建：
+  - 若引用了一条消息，可直接发送 `阿卡林 自定义回复 添加 触发词`
+  - 也可直接发送 `阿卡林 创建自定义回复 触发词`
+  - 以上两种写法会把被引用消息作为该触发词的一条回复内容
+- 权限规则：
+  - 当前所有自定义回复管理命令仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
 
 ## 违禁词治理
 - 违禁词按群持久化保存在 `banned.json`
@@ -318,6 +443,7 @@ AI_ADMIN_USER_IDS=123456789,987654321
 ## 提示词文件
 - 默认优先读取 `PROMPT_FILE` 指向的纯文本文件
 - 若读取失败，则回退到 `.env` 中的 `SYSTEM_PROMPT`
+- 在 OpenAI Responses 模式下，提示词会作为 `instructions` 发送。
 - 示例：
   - `PROMPT_FILE=prompt.txt`
   - 可使用项目中的 `prompt.py` 生成 `prompt.txt`
@@ -325,6 +451,7 @@ AI_ADMIN_USER_IDS=123456789,987654321
 ## 推荐测试 Checklist
 - 部署前
   - 确认已同步 `server.js`、`src/`、`package.json`、`.env`
+  - 执行 `npm run check`
   - 在目标服务器执行 `npm install`
   - 确认 `node_modules/sharp` 能在目标平台加载
 - 启动后

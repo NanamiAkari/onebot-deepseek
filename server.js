@@ -1,10 +1,11 @@
 const { WebSocketServer } = require('ws')
 const axios = require('axios')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
-const { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools } = require('./src/providers/openai')
+const { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, formatOpenAITools } = require('./src/providers/openai')
 const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
 const { createToolExecutor } = require('./src/agent/tool-executor')
@@ -39,9 +40,13 @@ const {
   OPENAI_NETWORK_ACCESS,
   AI_SIMPLE_MODE,
   OPENAI_TIMEOUT_MS,
+  AI_REPLY_MAX_CHARS,
+  AI_REPLY_CHUNK_CHARS,
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
   AI_POKE_REPLY_FILE,
+  AI_CUSTOM_REPLY_FILE,
+  AI_SCHEDULE_FILE,
   AI_POKE_REPLY_TEXT,
   AI_POKE_REPLY_TEXTS,
   AI_CONTEXT_ENABLE,
@@ -60,7 +65,7 @@ const {
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
+const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
 const toolRegistry = createDefaultToolRegistry()
 const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
 const agentRunner = createAgentRunner({
@@ -71,26 +76,111 @@ const agentRunner = createAgentRunner({
   maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
-let currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+let currentPokeReplyTexts = []
 
 function resolveProjectFile(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
 }
 
 function getPokeReplyFilePath() {
-  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.txt')
+  return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
 }
 
-function normalizeTextList(lines) {
-  return lines.map((s) => String(s || '').trim()).filter((s) => s)
+function getCustomReplyFilePath() {
+  return resolveProjectFile(AI_CUSTOM_REPLY_FILE || 'custom_replies.json')
+}
+
+function getScheduleFilePath() {
+  return resolveProjectFile(AI_SCHEDULE_FILE || 'scheduled_tasks.json')
+}
+
+function toOutboundImageFile(source) {
+  const value = String(source || '').trim()
+  if (!value) return ''
+  if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^base64:\/\//i.test(value) || /^file:\/\//i.test(value)) return value
+  if (/^[\\/]/.test(value)) return `file://${encodeURI(value.replace(/\\/g, '/'))}`
+  if (/^[a-zA-Z]:[\\/]/.test(value)) {
+    const normalized = value.replace(/\\/g, '/')
+    return `file:///${encodeURI(normalized)}`
+  }
+  return value
+}
+
+function isTransientQqCachePath(source) {
+  const value = String(source || '').trim().replace(/\\/g, '/')
+  if (!value) return false
+  return /\/\.config\/QQ\//i.test(value)
+    || /\/nt_data\/Pic\//i.test(value)
+    || /\/NapCat\/temp\//i.test(value)
+}
+
+function pickPokeImageSource(item) {
+  if (!item || typeof item !== 'object') return ''
+  const localPath = String(item.localPath || '').trim()
+  const source = String(item.source || '').trim()
+  const url = String(item.url || '').trim()
+  if (localPath && !isTransientQqCachePath(localPath)) return localPath
+  if (source && !isTransientQqCachePath(source)) return source
+  if (url && !isQqImageUrl(url)) return url
+  if (url) return url
+  if (localPath) return localPath
+  if (source) return source
+
+  const file = String(item.file || '').trim()
+  if (isDirectMediaSource(file)) return file
+  return file
+}
+
+function normalizePokeReplyItem(item) {
+  if (typeof item === 'string') {
+    const content = String(item || '').replace(/\r/g, '').trim()
+    return content ? { type: 'text', content } : null
+  }
+  if (!item || typeof item !== 'object') return null
+  if (item.type === 'image') {
+    const source = pickPokeImageSource(item)
+    if (!source) return null
+    const name = String(item.name || '').trim()
+    return name ? { type: 'image', source, name } : { type: 'image', source }
+  }
+  const content = String(item.content || item.text || '').replace(/\r/g, '').trim()
+  return content ? { type: 'text', content } : null
+}
+
+function normalizePokeReplyList(items) {
+  return (Array.isArray(items) ? items : []).map(normalizePokeReplyItem).filter(Boolean)
+}
+
+function serializePokeReplyItem(item) {
+  if (!item || typeof item !== 'object') return null
+  if (item.type === 'image') {
+    const source = String(item.source || '').trim()
+    if (!source) return null
+    const name = String(item.name || '').trim()
+    return name ? { type: 'image', source, name } : { type: 'image', source }
+  }
+  const content = String(item.content || '').replace(/\r/g, '').trim()
+  return content ? { type: 'text', content } : null
+}
+
+function pokeReplySignature(item) {
+  if (!item || typeof item !== 'object') return ''
+  if (item.type === 'image') return `image:${String(item.source || '').trim()}`
+  return `text:${String(item.content || '').replace(/\r/g, '').trim()}`
 }
 
 function loadPokeReplyTextsFromFile() {
   try {
     const filePath = getPokeReplyFilePath()
     if (!fs.existsSync(filePath)) return []
-    return normalizeTextList(
-      fs.readFileSync(filePath, 'utf8')
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) return normalizePokeReplyList(parsed)
+    } catch {}
+    return normalizePokeReplyList(
+      raw
         .split(/\r?\n/)
         .map((s) => s.trim())
         .filter((s) => s && !s.startsWith('#'))
@@ -103,24 +193,638 @@ function loadPokeReplyTextsFromFile() {
 function refreshPokeReplyTexts() {
   const fileItems = loadPokeReplyTextsFromFile()
   if (fileItems.length > 0) currentPokeReplyTexts = fileItems
-  else currentPokeReplyTexts = Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS.slice() : [AI_POKE_REPLY_TEXT]
+  else currentPokeReplyTexts = normalizePokeReplyList(Array.isArray(AI_POKE_REPLY_TEXTS) && AI_POKE_REPLY_TEXTS.length > 0 ? AI_POKE_REPLY_TEXTS : [AI_POKE_REPLY_TEXT])
   return currentPokeReplyTexts.slice()
 }
 
 function getPokeReplyTexts() {
+  if (!Array.isArray(currentPokeReplyTexts) || currentPokeReplyTexts.length === 0) return refreshPokeReplyTexts()
   return currentPokeReplyTexts.slice()
 }
 
 function savePokeReplyTexts(list) {
-  const items = normalizeTextList(list)
+  const items = normalizePokeReplyList(list)
   const filePath = getPokeReplyFilePath()
-  fs.writeFileSync(filePath, `${items.join('\n')}\n`, 'utf8')
+  const serialized = items.map(serializePokeReplyItem).filter(Boolean)
+  fs.writeFileSync(filePath, `${JSON.stringify(serialized, null, 2)}\n`, 'utf8')
   currentPokeReplyTexts = items
   return items.slice()
 }
 
 function dedupeTextList(list) {
-  return Array.from(new Set(normalizeTextList(list)))
+  const seen = new Set()
+  const out = []
+  for (const item of normalizePokeReplyList(list)) {
+    const key = pokeReplySignature(item)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(item)
+  }
+  return out
+}
+
+function previewPokeReplyText(item) {
+  const normalizedItem = normalizePokeReplyItem(item)
+  if (!normalizedItem) return '（空）'
+  if (normalizedItem.type === 'image') return '[图片回复]'
+  const normalized = String(normalizedItem.content || '').replace(/\r/g, '').trim()
+  if (!normalized) return '（空）'
+  const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean)
+  const firstLines = lines.slice(0, 2).join(' ↵ ')
+  const compact = firstLines.replace(/\s+/g, ' ').trim()
+  return compact.length > 60 ? `${compact.slice(0, 60)}...` : compact
+}
+
+function normalizeCustomReplyTrigger(text) {
+  return String(text || '').replace(/\r/g, '').trim()
+}
+
+function normalizeCustomReplySegment(segment) {
+  if (!segment || typeof segment !== 'object') return null
+  if (segment.type === 'text') {
+    const text = String(segment.data && segment.data.text || segment.text || '').replace(/\r/g, '')
+    return text ? { type: 'text', data: { text } } : null
+  }
+  if (segment.type === 'image') {
+    const source = String(segment.source || (segment.data && (segment.data.source || segment.data.file || segment.data.url)) || '').trim()
+    return source ? { type: 'image', source } : null
+  }
+  if (segment.type === 'face' || segment.type === 'emoji' || segment.type === 'mface') {
+    return { type: segment.type, data: { ...(segment.data || {}) } }
+  }
+  return null
+}
+
+function normalizeCustomReplyEntry(entry) {
+  const rawSegments = Array.isArray(entry) ? entry : (entry && Array.isArray(entry.segments) ? entry.segments : [])
+  const segments = rawSegments.map(normalizeCustomReplySegment).filter(Boolean)
+  return segments.length > 0 ? { segments } : null
+}
+
+function customReplyEntrySignature(entry) {
+  const normalized = normalizeCustomReplyEntry(entry)
+  return normalized ? JSON.stringify(normalized.segments) : ''
+}
+
+function previewCustomReplyEntry(entry) {
+  const normalized = normalizeCustomReplyEntry(entry)
+  if (!normalized) return '（空）'
+  const parts = []
+  for (const segment of normalized.segments) {
+    if (segment.type === 'text') {
+      const text = String(segment.data && segment.data.text || '').replace(/\s+/g, ' ').trim()
+      if (text) parts.push(text)
+    } else if (segment.type === 'image') {
+      parts.push('[图片]')
+    } else if (segment.type === 'face' || segment.type === 'emoji' || segment.type === 'mface') {
+      parts.push('[表情]')
+    }
+  }
+  const compact = parts.join(' ').trim() || '（空）'
+  return compact.length > 60 ? `${compact.slice(0, 60)}...` : compact
+}
+
+function loadCustomReplyStore() {
+  const filePath = getCustomReplyFilePath()
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const store = {}
+    for (const [groupId, groupValue] of Object.entries(parsed)) {
+      if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue
+      const groupStore = {}
+      for (const [trigger, replies] of Object.entries(groupValue)) {
+        const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+        if (!normalizedTrigger) continue
+        const normalizedReplies = (Array.isArray(replies) ? replies : [])
+          .map(normalizeCustomReplyEntry)
+          .filter(Boolean)
+        if (normalizedReplies.length > 0) groupStore[normalizedTrigger] = normalizedReplies
+      }
+      if (Object.keys(groupStore).length > 0) store[String(groupId)] = groupStore
+    }
+    return store
+  } catch {
+    return {}
+  }
+}
+
+function saveCustomReplyStore(store) {
+  const filePath = getCustomReplyFilePath()
+  const normalizedStore = {}
+  for (const [groupId, groupValue] of Object.entries(store || {})) {
+    if (!groupValue || typeof groupValue !== 'object' || Array.isArray(groupValue)) continue
+    const groupStore = {}
+    for (const [trigger, replies] of Object.entries(groupValue)) {
+      const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+      if (!normalizedTrigger) continue
+      const normalizedReplies = (Array.isArray(replies) ? replies : [])
+        .map(normalizeCustomReplyEntry)
+        .filter(Boolean)
+      if (normalizedReplies.length > 0) groupStore[normalizedTrigger] = normalizedReplies
+    }
+    if (Object.keys(groupStore).length > 0) normalizedStore[String(groupId)] = groupStore
+  }
+  fs.writeFileSync(filePath, `${JSON.stringify(normalizedStore, null, 2)}\n`, 'utf8')
+  return normalizedStore
+}
+
+function listCustomReplyTriggers(groupId) {
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  return Object.entries(groupStore).map(([trigger, replies]) => ({
+    trigger,
+    replies: Array.isArray(replies) ? replies : []
+  }))
+}
+
+function getCustomReplyEntries(groupId, trigger) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger) return []
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  const replies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger] : []
+  return replies.map(normalizeCustomReplyEntry).filter(Boolean)
+}
+
+function addCustomReply(groupId, trigger, entry) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  const normalizedEntry = normalizeCustomReplyEntry(entry)
+  if (!normalizedTrigger || !normalizedEntry) return { ok: false, reason: 'invalid' }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey] && typeof store[groupKey] === 'object' ? store[groupKey] : {}
+  const currentReplies = Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger].slice() : []
+  const signature = customReplyEntrySignature(normalizedEntry)
+  if (signature && currentReplies.some((item) => customReplyEntrySignature(item) === signature)) {
+    return { ok: false, reason: 'duplicate', count: currentReplies.length }
+  }
+  currentReplies.push(normalizedEntry)
+  groupStore[normalizedTrigger] = currentReplies
+  store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, count: currentReplies.length, totalTriggers: Object.keys(groupStore).length, entry: normalizedEntry }
+}
+
+function removeCustomReply(groupId, trigger) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger) return { ok: false }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  if (!groupStore || !groupStore[normalizedTrigger]) return { ok: false }
+  const removed = groupStore[normalizedTrigger]
+  delete groupStore[normalizedTrigger]
+  if (Object.keys(groupStore).length === 0) delete store[groupKey]
+  else store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, removedCount: Array.isArray(removed) ? removed.length : 0 }
+}
+
+function removeCustomReplyEntry(groupId, trigger, index) {
+  const normalizedTrigger = normalizeCustomReplyTrigger(trigger)
+  if (!normalizedTrigger || !Number.isInteger(index) || index < 1) return { ok: false, reason: 'invalid' }
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  const replies = groupStore && Array.isArray(groupStore[normalizedTrigger]) ? groupStore[normalizedTrigger].slice() : null
+  if (!replies || index > replies.length) return { ok: false, reason: 'missing' }
+  const removed = normalizeCustomReplyEntry(replies[index - 1])
+  replies.splice(index - 1, 1)
+  if (replies.length === 0) delete groupStore[normalizedTrigger]
+  else groupStore[normalizedTrigger] = replies
+  if (Object.keys(groupStore).length === 0) delete store[groupKey]
+  else store[groupKey] = groupStore
+  saveCustomReplyStore(store)
+  return { ok: true, removed, remainingCount: replies.length }
+}
+
+function clearCustomReplies(groupId) {
+  const store = loadCustomReplyStore()
+  const groupKey = String(groupId || '')
+  const groupStore = store[groupKey]
+  if (!groupStore || typeof groupStore !== 'object') return { ok: false, removedTriggers: 0, removedReplies: 0 }
+  const removedTriggers = Object.keys(groupStore).length
+  const removedReplies = Object.values(groupStore).reduce((sum, replies) => sum + (Array.isArray(replies) ? replies.length : 0), 0)
+  delete store[groupKey]
+  saveCustomReplyStore(store)
+  return { ok: true, removedTriggers, removedReplies }
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+function normalizeWeeklyDay(value) {
+  const key = String(value || '').trim()
+  if (key === '1' || key === '一') return 1
+  if (key === '2' || key === '二') return 2
+  if (key === '3' || key === '三') return 3
+  if (key === '4' || key === '四') return 4
+  if (key === '5' || key === '五') return 5
+  if (key === '6' || key === '六') return 6
+  if (key === '7' || key === '日' || key === '天') return 0
+  return null
+}
+
+function formatWeeklyDay(weekday) {
+  return weekday === 0 ? '日' : weekday === 1 ? '一' : weekday === 2 ? '二' : weekday === 3 ? '三' : weekday === 4 ? '四' : weekday === 5 ? '五' : weekday === 6 ? '六' : '?'
+}
+
+function parseScheduleSpec(input) {
+  const text = String(input || '').trim()
+  if (!text) return null
+  const dailyMatch = text.match(/^(?:每天|每日)\s*(\d{1,2}):(\d{2})$/)
+  if (dailyMatch) {
+    const hour = parseInt(dailyMatch[1], 10)
+    const minute = parseInt(dailyMatch[2], 10)
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'daily',
+      hour,
+      minute,
+      specText: `每天 ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const weeklyMatch = text.match(/^(?:每周|每星期)\s*([一二三四五六日天1-7])\s*(\d{1,2}):(\d{2})$/)
+  if (weeklyMatch) {
+    const weekday = normalizeWeeklyDay(weeklyMatch[1])
+    const hour = parseInt(weeklyMatch[2], 10)
+    const minute = parseInt(weeklyMatch[3], 10)
+    if (weekday === null || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'weekly',
+      weekday,
+      hour,
+      minute,
+      specText: `每周${formatWeeklyDay(weekday)} ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const monthlyMatch = text.match(/^每月\s*(\d{1,2})(?:号|日)\s*(\d{1,2}):(\d{2})$/)
+  if (monthlyMatch) {
+    const day = parseInt(monthlyMatch[1], 10)
+    const hour = parseInt(monthlyMatch[2], 10)
+    const minute = parseInt(monthlyMatch[3], 10)
+    if (day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+    return {
+      mode: 'monthly',
+      day,
+      hour,
+      minute,
+      specText: `每月 ${day}号 ${pad2(hour)}:${pad2(minute)}`
+    }
+  }
+  const onceMatch = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})$/)
+  if (!onceMatch) return null
+  const year = parseInt(onceMatch[1], 10)
+  const month = parseInt(onceMatch[2], 10)
+  const day = parseInt(onceMatch[3], 10)
+  const hour = parseInt(onceMatch[4], 10)
+  const minute = parseInt(onceMatch[5], 10)
+  const runAt = new Date(year, month - 1, day, hour, minute, 0, 0)
+  if (runAt.getFullYear() !== year || runAt.getMonth() !== month - 1 || runAt.getDate() !== day || hour > 23 || minute > 59) return null
+  return {
+    mode: 'once',
+    runAt: runAt.getTime(),
+    specText: `${year}-${pad2(month)}-${pad2(day)} ${pad2(hour)}:${pad2(minute)}`
+  }
+}
+
+function computeDailyNextRunAt(hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0)
+  if (target.getTime() <= nowTs + 1000) target.setDate(target.getDate() + 1)
+  return target.getTime()
+}
+
+function computeWeeklyNextRunAt(weekday, hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0)
+  let offset = weekday - now.getDay()
+  if (offset < 0 || (offset === 0 && target.getTime() <= nowTs + 1000)) offset += 7
+  target.setDate(target.getDate() + offset)
+  return target.getTime()
+}
+
+function buildMonthlyCandidate(year, monthIndex, day, hour, minute) {
+  const target = new Date(year, monthIndex, day, hour, minute, 0, 0)
+  if (target.getFullYear() !== year || target.getMonth() !== monthIndex || target.getDate() !== day) return null
+  return target
+}
+
+function computeMonthlyNextRunAt(day, hour, minute, nowTs = Date.now()) {
+  const now = new Date(nowTs)
+  for (let offset = 0; offset < 24; offset += 1) {
+    const year = now.getFullYear() + Math.floor((now.getMonth() + offset) / 12)
+    const monthIndex = (now.getMonth() + offset) % 12
+    const candidate = buildMonthlyCandidate(year, monthIndex, day, hour, minute)
+    if (!candidate) continue
+    if (candidate.getTime() > nowTs + 1000) return candidate.getTime()
+  }
+  return 0
+}
+
+function formatScheduleTime(ts) {
+  const date = new Date(Number(ts || 0))
+  if (!Number.isFinite(date.getTime())) return '未知时间'
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+}
+
+function normalizeScheduledTask(task) {
+  if (!task || typeof task !== 'object') return null
+  const id = String(task.id || '').trim() || crypto.randomBytes(8).toString('hex')
+  const groupId = String(task.groupId || '').trim()
+  const mode = task.mode === 'once' ? 'once'
+    : task.mode === 'daily' ? 'daily'
+    : task.mode === 'weekly' ? 'weekly'
+    : task.mode === 'monthly' ? 'monthly'
+    : ''
+  const content = normalizeCustomReplyEntry(task.content || task.entry)
+  if (!groupId || !mode || !content) return null
+  if (mode === 'daily') {
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeDailyNextRunAt(hour, minute)
+    return {
+      id,
+      groupId,
+      mode,
+      hour,
+      minute,
+      specText: `每天 ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  if (mode === 'weekly') {
+    const weekday = parseInt(task.weekday, 10)
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (![0, 1, 2, 3, 4, 5, 6].includes(weekday) || !Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeWeeklyNextRunAt(weekday, hour, minute)
+    return {
+      id,
+      groupId,
+      mode,
+      weekday,
+      hour,
+      minute,
+      specText: `每周${formatWeeklyDay(weekday)} ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  if (mode === 'monthly') {
+    const day = parseInt(task.day, 10)
+    const hour = parseInt(task.hour, 10)
+    const minute = parseInt(task.minute, 10)
+    if (!Number.isInteger(day) || day < 1 || day > 31 || !Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null
+    const nextRunAt = Number.isFinite(Number(task.nextRunAt)) && Number(task.nextRunAt) > Date.now() - 60000
+      ? Number(task.nextRunAt)
+      : computeMonthlyNextRunAt(day, hour, minute)
+    if (!nextRunAt) return null
+    return {
+      id,
+      groupId,
+      mode,
+      day,
+      hour,
+      minute,
+      specText: `每月 ${day}号 ${pad2(hour)}:${pad2(minute)}`,
+      nextRunAt,
+      createdAt: Number(task.createdAt || Date.now()),
+      createdBy: String(task.createdBy || ''),
+      lastRunAt: Number(task.lastRunAt || 0),
+      content
+    }
+  }
+  const runAt = Number(task.runAt)
+  if (!Number.isFinite(runAt) || runAt <= 0) return null
+  return {
+    id,
+    groupId,
+    mode,
+    runAt,
+    specText: String(task.specText || formatScheduleTime(runAt)),
+    nextRunAt: Number.isFinite(Number(task.nextRunAt)) ? Number(task.nextRunAt) : runAt,
+    createdAt: Number(task.createdAt || Date.now()),
+    createdBy: String(task.createdBy || ''),
+    lastRunAt: Number(task.lastRunAt || 0),
+    content
+  }
+}
+
+function loadScheduledTaskStore() {
+  const filePath = getScheduleFilePath()
+  try {
+    if (!fs.existsSync(filePath)) return {}
+    const raw = fs.readFileSync(filePath, 'utf8').trim()
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out = {}
+    for (const [groupId, tasks] of Object.entries(parsed)) {
+      const normalizedTasks = (Array.isArray(tasks) ? tasks : [])
+        .map(normalizeScheduledTask)
+        .filter(Boolean)
+        .filter((task) => task.mode === 'daily' || task.mode === 'weekly' || task.mode === 'monthly' || task.nextRunAt > Date.now() - 60000)
+      if (normalizedTasks.length > 0) out[String(groupId)] = normalizedTasks
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveScheduledTaskStore(store) {
+  const filePath = getScheduleFilePath()
+  const normalizedStore = {}
+  for (const [groupId, tasks] of Object.entries(store || {})) {
+    const normalizedTasks = (Array.isArray(tasks) ? tasks : [])
+      .map(normalizeScheduledTask)
+      .filter(Boolean)
+    if (normalizedTasks.length > 0) normalizedStore[String(groupId)] = normalizedTasks
+  }
+  fs.writeFileSync(filePath, `${JSON.stringify(normalizedStore, null, 2)}\n`, 'utf8')
+  return normalizedStore
+}
+
+function listScheduledTasks(groupId) {
+  const store = loadScheduledTaskStore()
+  return ((store[String(groupId)] || []).slice()).sort((a, b) => a.nextRunAt - b.nextRunAt)
+}
+
+function addScheduledTask(groupId, scheduleSpec, entry, createdBy) {
+  const parsed = typeof scheduleSpec === 'string' ? parseScheduleSpec(scheduleSpec) : scheduleSpec
+  const content = normalizeCustomReplyEntry(entry)
+  if (!parsed || !content) return { ok: false, reason: 'invalid' }
+  if (parsed.mode === 'once' && parsed.runAt <= Date.now()) return { ok: false, reason: 'past' }
+  const task = normalizeScheduledTask({
+    id: crypto.randomBytes(8).toString('hex'),
+    groupId: String(groupId || ''),
+    mode: parsed.mode,
+    weekday: parsed.weekday,
+    day: parsed.day,
+    hour: parsed.hour,
+    minute: parsed.minute,
+    runAt: parsed.runAt,
+    specText: parsed.specText,
+    nextRunAt: parsed.mode === 'daily' ? computeDailyNextRunAt(parsed.hour, parsed.minute)
+      : parsed.mode === 'weekly' ? computeWeeklyNextRunAt(parsed.weekday, parsed.hour, parsed.minute)
+      : parsed.mode === 'monthly' ? computeMonthlyNextRunAt(parsed.day, parsed.hour, parsed.minute)
+      : parsed.runAt,
+    createdAt: Date.now(),
+    createdBy: String(createdBy || ''),
+    content
+  })
+  if (!task) return { ok: false, reason: 'invalid' }
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const current = Array.isArray(store[groupKey]) ? store[groupKey].slice() : []
+  current.push(task)
+  store[groupKey] = current
+  saveScheduledTaskStore(store)
+  return { ok: true, task, count: current.length }
+}
+
+function removeScheduledTask(groupId, index) {
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const tasks = ((store[groupKey] || []).slice()).sort((a, b) => a.nextRunAt - b.nextRunAt)
+  if (!Number.isInteger(index) || index < 1 || index > tasks.length) return { ok: false }
+  const removed = tasks[index - 1]
+  const remaining = tasks.filter((task) => task.id !== removed.id)
+  if (remaining.length > 0) store[groupKey] = remaining
+  else delete store[groupKey]
+  saveScheduledTaskStore(store)
+  return { ok: true, removed, count: remaining.length }
+}
+
+function clearScheduledTasks(groupId) {
+  const store = loadScheduledTaskStore()
+  const groupKey = String(groupId || '')
+  const tasks = Array.isArray(store[groupKey]) ? store[groupKey] : []
+  if (tasks.length === 0) return { ok: false, removedCount: 0 }
+  delete store[groupKey]
+  saveScheduledTaskStore(store)
+  return { ok: true, removedCount: tasks.length }
+}
+
+function previewScheduledTask(task) {
+  if (!task) return '（空）'
+  return `${task.specText || formatScheduleTime(task.nextRunAt)} | ${previewCustomReplyEntry(task.content)}`
+}
+
+async function sendScheduledTaskMessage(ws, task) {
+  const variants = await buildCustomReplyMessageVariants(task.content)
+  for (const msg of variants) {
+    const result = await sendAction(ws, 'send_group_msg', { group_id: Number(task.groupId), message: msg }).catch(() => null)
+    if (result && result.status === 'ok') return true
+  }
+  return false
+}
+
+let activeWsClient = null
+let scheduledTaskRunnerBusy = false
+
+function isWsClientReady(ws) {
+  return Boolean(ws && ws.readyState === 1)
+}
+
+async function runScheduledTasksTick() {
+  if (scheduledTaskRunnerBusy || !isWsClientReady(activeWsClient)) return
+  scheduledTaskRunnerBusy = true
+  try {
+    const now = Date.now()
+    const store = loadScheduledTaskStore()
+    let changed = false
+    for (const [groupId, tasks] of Object.entries(store)) {
+      const nextTasks = []
+      for (const task of Array.isArray(tasks) ? tasks : []) {
+        const normalized = normalizeScheduledTask(task)
+        if (!normalized) {
+          changed = true
+          continue
+        }
+        if (normalized.nextRunAt > now + 1000) {
+          nextTasks.push(normalized)
+          continue
+        }
+        const sent = await sendScheduledTaskMessage(activeWsClient, normalized).catch(() => false)
+        if (normalized.mode === 'daily') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeDailyNextRunAt(normalized.hour, normalized.minute, now + 1000)
+          nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        if (normalized.mode === 'weekly') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeWeeklyNextRunAt(normalized.weekday, normalized.hour, normalized.minute, now + 1000)
+          nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        if (normalized.mode === 'monthly') {
+          normalized.lastRunAt = now
+          normalized.nextRunAt = computeMonthlyNextRunAt(normalized.day, normalized.hour, normalized.minute, now + 1000)
+          if (normalized.nextRunAt) nextTasks.push(normalized)
+          changed = true
+          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          continue
+        }
+        changed = true
+        if (!sent) console.log(`一次性定时任务发送失败，仍按已执行移除 group=${groupId} id=${normalized.id}`)
+      }
+      if (nextTasks.length > 0) store[groupId] = nextTasks
+      else delete store[groupId]
+    }
+    if (changed) saveScheduledTaskStore(store)
+  } finally {
+    scheduledTaskRunnerBusy = false
+  }
+}
+
+setInterval(() => {
+  runScheduledTasksTick().catch((err) => console.log('runScheduledTasksTick', err && err.stack ? err.stack : err))
+}, 15000)
+
+function findCustomReplyMatches(groupId, text) {
+  const normalizedText = normalizeCustomReplyTrigger(text)
+  if (!normalizedText) return []
+  const store = loadCustomReplyStore()
+  const groupStore = store[String(groupId)] || {}
+  return Object.entries(groupStore)
+    .filter(([trigger, replies]) => trigger && normalizedText.includes(trigger) && Array.isArray(replies) && replies.length > 0)
+    .sort((a, b) => b[0].length - a[0].length)
+}
+
+function pickCustomReply(groupId, text) {
+  const matches = findCustomReplyMatches(groupId, text)
+  if (matches.length === 0) return null
+  const [, replies] = matches[0]
+  if (replies.length === 0) return null
+  return normalizeCustomReplyEntry(replies[Math.floor(Math.random() * replies.length)])
+}
+
+function hasCustomReplyTrigger(groupId, text) {
+  return findCustomReplyMatches(groupId, text).length > 0
 }
 
 function isConfiguredAdmin(userId) {
@@ -147,6 +851,11 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  handleImageGenerationRequest,
+  handleScheduleTaskDraftInput,
+  handleCustomReplyDraftInput,
+  handleCustomReplyMatch,
+  hasCustomReplyTrigger,
   shouldIgnoreText,
   GROUP_REQUIRE_MENTION,
   shouldRespond,
@@ -160,6 +869,8 @@ const onMessage = createMessageHandler({
   AI_POKE_REPLY_TEXTS,
   getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
+  buildPokeReplyMessageSegments: buildPokeReplyMessageSegmentsAsync,
+  AI_REPLY_CHUNK_CHARS,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
   AI_IMAGE_HINT_REGEX,
@@ -170,7 +881,14 @@ const onMessage = createMessageHandler({
 })
 
 wss.on('connection', (ws) => {
+  activeWsClient = ws
   ws.on('message', (data) => onMessage(ws, data))
+  ws.on('close', () => {
+    if (activeWsClient === ws) {
+      const nextClient = Array.from(wss.clients || []).find((client) => client && client.readyState === 1 && client !== ws) || null
+      activeWsClient = nextClient
+    }
+  })
 })
 
 process.on('unhandledRejection', (reason) => {
@@ -270,21 +988,21 @@ async function callLLM(text, media, hist, opts) {
 
 function sanitizeText(s) {
   let t = String(s || '')
-  t = t.replace(/```[\s\S]*?```/g, ' ')
-  t = t.replace(/`+/g, '')
+  t = t.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, _lang, body) => `${body}\n`)
+  t = t.replace(/`([^`]*)`/g, '$1')
   t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '')
   t = t.replace(/^\s*([-*+]|(\d+[\.\)]))\s+/gm, '')
-  t = t.replace(/(\*\*|__)(.*?)\1/g, '$2')
-  t = t.replace(/(\*|_)(.*?)\1/g, '$2')
-  t = t.replace(/\$\$[\s\S]*?\$\$/g, ' ')
-  t = t.replace(/\\\[[\s\S]*?\\\]/g, ' ')
-  t = t.replace(/\\\([\s\S]*?\\\)/g, ' ')
-  t = t.replace(/\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}/g, ' ')
+  t = t.replace(/\*\*([\s\S]*?)\*\*/g, '$1')
+  t = t.replace(/\*([\s\S]*?)\*/g, '$1')
+  t = t.replace(/\$\$([\s\S]*?)\$\$/g, '\n$1\n')
+  t = t.replace(/\\\[([\s\S]*?)\\\]/g, '\n$1\n')
+  t = t.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+  t = t.replace(/\\begin\{([^}]+)\}([\s\S]*?)\\end\{\1\}/g, '\n$2\n')
   t = t.replace(/<[^>]+>/g, ' ')
+  t = t.replace(/[ \t]{2,}/g, ' ')
   t = t.replace(/[ \t]+\n/g, '\n')
   t = t.replace(/\n{3,}/g, '\n\n')
-  t = t.trim()
-  return t.slice(0, 2000)
+  return t.trim()
 }
 
 async function callGemini(text, media, opts) {
@@ -337,6 +1055,10 @@ async function callOpenAI(text, media, hist, opts) {
     console.log('调用OpenAI')
     const useResponses = OPENAI_WIRE_API === 'responses' || /ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(OPENAI_BASE_URL)
     const url = useResponses ? `${OPENAI_BASE_URL}/responses` : `${OPENAI_BASE_URL}/chat/completions`
+    const wantsImageGeneration = Boolean(opts && opts.generateImage)
+    if (wantsImageGeneration && !useResponses) {
+      return opts && opts.structured ? { text: '当前上游接口不支持 Responses 生图工具', toolCalls: [], images: [] } : '当前上游接口不支持 Responses 生图工具'
+    }
     const content = []
     let attached = 0
     if (opts && opts.contextImage) {
@@ -367,10 +1089,22 @@ async function callOpenAI(text, media, hist, opts) {
       msg.push({ role: 'user', content })
     }
     const tools = formatOpenAITools(opts && opts.tools, useResponses)
+    if (wantsImageGeneration && useResponses) tools.push({ type: 'image_generation' })
+    const responseInput = []
+    if (useResponses && Array.isArray(hist) && hist.length > 0) {
+      for (const h of hist) {
+        const role = h && h.role === 'assistant' ? 'assistant' : 'user'
+        const contentText = String(h && h.content || '').trim()
+        if (!contentText) continue
+        responseInput.push({ role, content: contentText })
+      }
+    }
+    if (useResponses) responseInput.push({ role: 'user', content })
     const buildPayload = (includeTools) => useResponses
       ? {
           model: OPENAI_MODEL,
-          input: [{ role: 'user', content }],
+          instructions: SYSTEM_PROMPT,
+          input: responseInput,
           ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
           ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {}),
           ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
@@ -418,7 +1152,8 @@ async function callOpenAI(text, media, hist, opts) {
     }
     const contentText = extractOpenAIText(res.data)
     const toolCalls = extractOpenAIToolCalls(res.data)
-    if (!contentText && toolCalls.length === 0) return null
+    const images = extractOpenAIImages(res.data)
+    if (!contentText && toolCalls.length === 0 && images.length === 0) return null
     console.log('OpenAI成功')
     const txt = String(contentText || '').slice(0, 2000)
     if (txt && Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
@@ -428,7 +1163,7 @@ async function callOpenAI(text, media, hist, opts) {
         if (again) return { text: String(again).slice(0, 2000), toolCalls }
       }
     }
-    return { text: txt, toolCalls }
+    return { text: txt, toolCalls, images }
   } catch (e) {
     const status = e && e.response && e.response.status
     const msg = e && e.response && e.response.data
@@ -443,11 +1178,11 @@ async function callOpenAI(text, media, hist, opts) {
       }
     }
     console.log('OpenAI失败', status || '', `media=${Array.isArray(media) ? media.length : 0}`, `timeout=${requestTimeout}`, errorMessage, errText.slice(0, 500))
-    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [] } : '上游限流，请稍后再试'
-    if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [] } : '上游鉴权失败，请检查 API Key'
-    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [] } : '上游网关异常（5xx），请稍后再试'
-    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [] } : '图片分析超时，请稍后重试或发送更小的图片'
-    return opts && opts.structured ? { text: '上游调用失败', toolCalls: [] } : '上游调用失败'
+    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [], images: [] } : '上游限流，请稍后再试'
+    if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [], images: [] } : '上游鉴权失败，请检查 API Key'
+    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [], images: [] } : '上游网关异常（5xx），请稍后再试'
+    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [], images: [] } : '图片分析超时，请稍后重试或发送更小的图片'
+    return opts && opts.structured ? { text: '上游调用失败', toolCalls: [], images: [] } : '上游调用失败'
   }
 }
 
@@ -484,11 +1219,63 @@ async function callDeepseek(text) {
   }
 }
 
-function buildReplySegments(messageId, content) {
-  return [
-    { type: 'reply', data: { id: messageId } },
-    { type: 'text', data: { text: content } }
-  ]
+function splitLongText(text, chunkSize = AI_REPLY_CHUNK_CHARS) {
+  const normalized = String(text || '').replace(/\r/g, '').trim()
+  if (!normalized) return []
+  const chunks = []
+  const paragraphs = normalized.split('\n')
+  let current = ''
+  for (const rawPart of paragraphs) {
+    const part = String(rawPart || '')
+    const candidate = current ? `${current}\n${part}` : part
+    if (candidate.length <= chunkSize) {
+      current = candidate
+      continue
+    }
+    if (current) chunks.push(current)
+    if (part.length <= chunkSize) {
+      current = part
+      continue
+    }
+    for (let i = 0; i < part.length; i += chunkSize) {
+      chunks.push(part.slice(i, i + chunkSize))
+    }
+    current = ''
+  }
+  if (current) chunks.push(current)
+  return chunks.filter(Boolean)
+}
+
+function truncateReplyText(text, maxChars = AI_REPLY_MAX_CHARS) {
+  const normalized = String(text || '').replace(/\r/g, '').trim()
+  if (!normalized) return ''
+  if (normalized.length <= maxChars) return normalized
+  const suffix = '\n\n[后续内容已截断]'
+  const keep = Math.max(0, maxChars - suffix.length)
+  return `${normalized.slice(0, keep)}${suffix}`
+}
+
+function buildReplySegments(messageId, content, options = {}) {
+  const includeReply = options.includeReply !== false
+  const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : AI_REPLY_MAX_CHARS
+  const chunkSize = Number.isFinite(options.chunkSize) ? options.chunkSize : AI_REPLY_CHUNK_CHARS
+  const safeText = truncateReplyText(content, maxChars)
+  const chunks = splitLongText(safeText, chunkSize)
+  if (chunks.length === 0) {
+    return [[
+      ...(includeReply ? [{ type: 'reply', data: { id: messageId } }] : []),
+      { type: 'text', data: { text: '（空）' } }
+    ]]
+  }
+  return chunks.map((chunk, index) => {
+    if (includeReply && index === 0) {
+      return [
+        { type: 'reply', data: { id: messageId } },
+        { type: 'text', data: { text: chunk } }
+      ]
+    }
+    return [{ type: 'text', data: { text: chunk } }]
+  })
 }
 
 function sendAction(ws, action, params) {
@@ -595,8 +1382,71 @@ function detectMimeFromExt(filePath) {
     : 'application/octet-stream'
 }
 
+function detectImageExtFromMime(mime) {
+  const normalized = String(mime || '').toLowerCase()
+  return normalized === 'image/jpeg' ? '.jpg'
+    : normalized === 'image/png' ? '.png'
+    : normalized === 'image/gif' ? '.gif'
+    : normalized === 'image/webp' ? '.webp'
+    : '.img'
+}
+
 function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
+}
+
+function shouldGenerateImage(text) {
+  const value = String(text || '').trim()
+  if (!value) return false
+  return /(生成|画|做|来|给我|帮我).{0,8}(一张|张|个)?.{0,8}(图|图片|配图|插图|壁纸|头像|表情包)/i.test(value)
+    || /(文生图|生图|出图|画一张|生成一张|做一张图)/i.test(value)
+}
+
+function saveGeneratedImage(base64Data, mime = 'image/png') {
+  const normalized = String(base64Data || '').trim()
+  if (!normalized) return ''
+  const buffer = Buffer.from(normalized, 'base64')
+  if (!buffer.length) return ''
+  const fileMime = isImageMime(mime) ? mime : detectMimeFromBuffer(buffer, 'image/png')
+  const dir = path.join(PROJECT_ROOT, 'generated_images')
+  fs.mkdirSync(dir, { recursive: true })
+  const hash = crypto.createHash('sha1').update(buffer).digest('hex')
+  const ext = detectImageExtFromMime(fileMime)
+  const filePath = path.join(dir, `${hash}${ext}`)
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, buffer)
+  return filePath
+}
+
+function isLocalFileSource(src) {
+  const value = String(src || '').trim()
+  return /^file:\/\//i.test(value) || /^[\\/]/.test(value) || /^[a-zA-Z]:[\\/]/.test(value)
+}
+
+async function persistPokeImageSource(source) {
+  const value = String(source || '').trim()
+  if (!value) return ''
+
+  const ownedDir = path.join(PROJECT_ROOT, 'poke_media')
+  const normalizedOwnedDir = path.resolve(ownedDir)
+  if (isLocalFileSource(value)) {
+    try {
+      const localPath = /^file:\/\//i.test(value)
+        ? decodeURIComponent(value.replace(/^file:\/\//i, ''))
+        : value
+      const normalizedLocalPath = path.resolve(localPath)
+      if (normalizedLocalPath.startsWith(normalizedOwnedDir) && fs.existsSync(normalizedLocalPath)) return normalizedLocalPath
+    } catch {}
+  }
+
+  const downloaded = await sourceToBuffer(value).catch(() => null)
+  if (!downloaded || !downloaded.buf || !isImageMime(downloaded.mime)) return value
+
+  fs.mkdirSync(ownedDir, { recursive: true })
+  const hash = crypto.createHash('sha1').update(downloaded.buf).digest('hex')
+  const ext = detectImageExtFromMime(downloaded.mime)
+  const filePath = path.join(ownedDir, `${hash}${ext}`)
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, downloaded.buf)
+  return filePath
 }
 
 async function sourceToBuffer(src) {
@@ -672,6 +1522,269 @@ async function sourceToBase64(src) {
     return null
   }
 }
+
+async function captureCustomReplySegments(ws, message) {
+  const segments = []
+  if (typeof message === 'string') {
+    const text = String(message || '').replace(/\r/g, '')
+    if (text.trim()) segments.push({ type: 'text', data: { text } })
+    return segments
+  }
+  if (!Array.isArray(message)) return segments
+  for (const seg of message) {
+    if (!seg || typeof seg !== 'object') continue
+    if (seg.type === 'text') {
+      const text = String(seg.data && seg.data.text || '').replace(/\r/g, '')
+      if (text) segments.push({ type: 'text', data: { text } })
+      continue
+    }
+    if (seg.type === 'image' && seg.data) {
+      let source = pickPokeImageSource(seg.data)
+      const fileRef = seg.data.file || ''
+      if ((!source || !isDirectMediaSource(source)) && fileRef && !isDirectMediaSource(fileRef)) {
+        const resp = await sendAction(ws, 'get_image', { file: fileRef }).catch(() => null)
+        if (resp && resp.status === 'ok' && resp.data) {
+          source = pickPokeImageSource({ ...resp.data, file: fileRef })
+        }
+      }
+      const persistedSource = await persistPokeImageSource(source).catch(() => source)
+      const normalized = normalizeCustomReplySegment({ type: 'image', source: persistedSource || source })
+      if (normalized) segments.push(normalized)
+      continue
+    }
+    if (seg.type === 'face' || seg.type === 'emoji' || seg.type === 'mface') {
+      const normalized = normalizeCustomReplySegment({ type: seg.type, data: { ...(seg.data || {}) } })
+      if (normalized) segments.push(normalized)
+    }
+  }
+  return segments
+}
+
+async function buildImageMessageVariants(source) {
+  const actualSource = await persistPokeImageSource(source).catch(() => source)
+  const variants = []
+  const seen = new Set()
+  const pushVariant = (segment) => {
+    const key = JSON.stringify(segment)
+    if (seen.has(key)) return
+    seen.add(key)
+    variants.push(segment)
+  }
+  if (isLocalFileSource(actualSource)) {
+    const file = toOutboundImageFile(actualSource)
+    if (file) pushVariant({ type: 'image', data: { file } })
+  }
+  const base64 = await sourceToBase64(actualSource).catch(() => null)
+  if (base64 && base64.data) pushVariant({ type: 'image', data: { file: `base64://${base64.data}` } })
+  const file = toOutboundImageFile(actualSource)
+  if (file) pushVariant({ type: 'image', data: { file } })
+  return variants
+}
+
+function combineCustomReplyVariants(variantSets, limit = 8) {
+  let combined = [[]]
+  for (const variants of variantSets) {
+    const next = []
+    for (const current of combined) {
+      for (const variant of variants) {
+        next.push(current.concat([variant]))
+        if (next.length >= limit) break
+      }
+      if (next.length >= limit) break
+    }
+    combined = next
+    if (combined.length >= limit) break
+  }
+  return combined
+}
+
+async function buildCustomReplyMessageVariants(entry, headerText = '') {
+  const normalized = normalizeCustomReplyEntry(entry)
+  const prefix = headerText ? [{ type: 'text', data: { text: headerText } }] : []
+  if (!normalized) return [prefix.concat([{ type: 'text', data: { text: '（空）' } }])]
+  const variantSets = []
+  for (const segment of normalized.segments) {
+    if (segment.type === 'image') {
+      const variants = await buildImageMessageVariants(segment.source)
+      if (variants.length > 0) variantSets.push(variants)
+      continue
+    }
+    variantSets.push([segment])
+  }
+  if (variantSets.length === 0) return [prefix.concat([{ type: 'text', data: { text: '（空）' } }])]
+  return combineCustomReplyVariants(variantSets).map((segments) => prefix.concat(segments))
+}
+
+function getCustomReplyDraftKey(payload) {
+  return `g:${payload.group_id || ''}:u:${payload.user_id || ''}`
+}
+
+const CUSTOM_REPLY_DRAFT_TTL_MS = 10 * 60 * 1000
+
+function createCustomReplyDraft(stage, extra = {}) {
+  return {
+    stage,
+    ...extra,
+    updatedAt: Date.now(),
+    expiresAt: Date.now() + CUSTOM_REPLY_DRAFT_TTL_MS
+  }
+}
+
+function isCustomReplyDraftExpired(draft) {
+  if (!draft || typeof draft !== 'object') return true
+  return Number(draft.expiresAt || 0) > 0 && Date.now() > Number(draft.expiresAt || 0)
+}
+
+function purgeExpiredCustomReplyDrafts() {
+  for (const [key, draft] of customReplyDrafts.entries()) {
+    if (isCustomReplyDraftExpired(draft)) customReplyDrafts.delete(key)
+  }
+}
+
+async function handleCustomReplyDraftInput(ws, payload) {
+  if (!payload || payload.message_type !== 'group') return false
+  purgeExpiredCustomReplyDrafts()
+  const draftKey = getCustomReplyDraftKey(payload)
+  const draft = customReplyDrafts.get(draftKey)
+  if (!draft) return false
+  if (isCustomReplyDraftExpired(draft)) {
+    customReplyDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '创建自定义回复已超时，请重新发送“阿卡林 创建自定义回复”开始')
+    return true
+  }
+  const content = extractContent(payload.message)
+  const triggerText = normalizeCustomReplyTrigger(content.text)
+  if (triggerText === '取消') {
+    customReplyDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '已取消创建自定义回复')
+    return true
+  }
+  if (draft.stage === 'await_trigger') {
+    if (!triggerText) {
+      customReplyDrafts.set(draftKey, createCustomReplyDraft('await_trigger'))
+      await replyCommandMessage(ws, payload, '请输入要被触发的文本内容，例如：测试')
+      return true
+    }
+    customReplyDrafts.set(draftKey, createCustomReplyDraft('await_reply', { trigger: triggerText }))
+    await replyCommandMessage(ws, payload, `已记录被回复内容：${triggerText}\n请发送回复内容，可包含文本、图片、表情等；发送“取消”可退出`)
+    return true
+  }
+  if (draft.stage === 'await_reply') {
+    const replySegments = await captureCustomReplySegments(ws, payload.message)
+    if (replySegments.length === 0) {
+      customReplyDrafts.set(draftKey, createCustomReplyDraft('await_reply', { trigger: draft.trigger }))
+      await replyCommandMessage(ws, payload, '未识别到可保存的回复内容，请发送文本、图片或表情，或发送“取消”退出')
+      return true
+    }
+    const added = addCustomReply(payload.group_id, draft.trigger, { segments: replySegments })
+    customReplyDrafts.delete(draftKey)
+    if (!added.ok && added.reason === 'duplicate') {
+      await replyCommandMessage(ws, payload, `该自定义回复已存在：${draft.trigger} => ${previewCustomReplyEntry({ segments: replySegments })}`)
+      return true
+    }
+    await replyCommandMessage(ws, payload, `已创建自定义回复：${draft.trigger} => ${previewCustomReplyEntry(added.entry)}\n当前该关键词共有 ${added.count} 条回复`)
+    return true
+  }
+  customReplyDrafts.delete(draftKey)
+  return false
+}
+
+function getScheduleTaskDraftKey(payload) {
+  return `g:${payload.group_id || ''}:u:${payload.user_id || ''}`
+}
+
+const SCHEDULE_TASK_DRAFT_TTL_MS = 10 * 60 * 1000
+
+function createScheduleTaskDraft(stage, extra = {}) {
+  return {
+    stage,
+    ...extra,
+    updatedAt: Date.now(),
+    expiresAt: Date.now() + SCHEDULE_TASK_DRAFT_TTL_MS
+  }
+}
+
+function isScheduleTaskDraftExpired(draft) {
+  if (!draft || typeof draft !== 'object') return true
+  return Number(draft.expiresAt || 0) > 0 && Date.now() > Number(draft.expiresAt || 0)
+}
+
+function purgeExpiredScheduleTaskDrafts() {
+  for (const [key, draft] of scheduleTaskDrafts.entries()) {
+    if (isScheduleTaskDraftExpired(draft)) scheduleTaskDrafts.delete(key)
+  }
+}
+
+async function handleScheduleTaskDraftInput(ws, payload) {
+  if (!payload || payload.message_type !== 'group') return false
+  purgeExpiredScheduleTaskDrafts()
+  const draftKey = getScheduleTaskDraftKey(payload)
+  const draft = scheduleTaskDrafts.get(draftKey)
+  if (!draft) return false
+  if (isScheduleTaskDraftExpired(draft)) {
+    scheduleTaskDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '创建定时任务已超时，请重新发送“阿卡林 创建定时任务”开始')
+    return true
+  }
+  const content = extractContent(payload.message)
+  const inputText = normalizeCommandText(content.text)
+  if (inputText === '取消') {
+    scheduleTaskDrafts.delete(draftKey)
+    await replyCommandMessage(ws, payload, '已取消创建定时任务')
+    return true
+  }
+  if (draft.stage === 'await_spec') {
+    const parsed = parseScheduleSpec(inputText)
+    if (!parsed) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+      await replyCommandMessage(ws, payload, '请输入定时规则，例如：每天 08:30、每周一 08:30、每月 1号 08:30、2026-05-07 08:30')
+      return true
+    }
+    if (parsed.mode === 'once' && parsed.runAt <= Date.now()) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+      await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间，请重新输入')
+      return true
+    }
+    scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_content', { scheduleSpec: parsed }))
+    await replyCommandMessage(ws, payload, `已记录定时规则：${parsed.specText}\n请发送定时内容\n可包含文本、图片、表情，或引用一条消息\n发送“取消”可退出`)
+    return true
+  }
+  if (draft.stage === 'await_content') {
+    let replySegments = await captureCustomReplySegments(ws, payload.message)
+    if (replySegments.length === 0 && content.replyId) {
+      const repliedContent = await getReplyMessageContent(ws, content.replyId)
+      replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+    }
+    if (replySegments.length === 0) {
+      scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_content', { scheduleSpec: draft.scheduleSpec }))
+      await replyCommandMessage(ws, payload, '未识别到可保存的定时内容，请发送文本、图片、表情，或引用一条消息')
+      return true
+    }
+    const added = addScheduledTask(payload.group_id, draft.scheduleSpec, { segments: replySegments }, payload.user_id)
+    scheduleTaskDrafts.delete(draftKey)
+    if (!added.ok && added.reason === 'past') {
+      await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间，请重新创建')
+      return true
+    }
+    if (!added.ok) {
+      await replyCommandMessage(ws, payload, '定时任务创建失败，请重新创建')
+      return true
+    }
+    await replyCommandMessage(ws, payload, `已创建定时任务 #${added.count}：${previewScheduledTask(added.task)}\n下次执行：${formatScheduleTime(added.task.nextRunAt)}`)
+    return true
+  }
+  scheduleTaskDrafts.delete(draftKey)
+  return false
+}
+
+async function handleCustomReplyMatch(ws, payload, text) {
+  if (!payload || payload.message_type !== 'group') return false
+  const entry = pickCustomReply(payload.group_id, text)
+  if (!entry) return false
+  await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(entry))
+  return true
+}
+
 process.on('SIGINT', () => {
   try { wss.close() } catch {}
   process.exit(0)
@@ -752,13 +1865,112 @@ async function getUserRole(ws, groupId, userId) {
   return role
 }
 
-async function replyCommandMessage(ws, payload, text) {
-  const msg = [{ type: 'text', data: { text } }]
-  if (payload.message_type === 'group') {
-    await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
-  } else {
-    await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => {})
+function buildPokeReplyMessageSegments(item, headerText = '') {
+  const normalizedItem = normalizePokeReplyItem(item)
+  const segments = []
+  if (headerText) segments.push({ type: 'text', data: { text: headerText } })
+  if (!normalizedItem) {
+    segments.push({ type: 'text', data: { text: '（空）' } })
+    return segments
   }
+  if (normalizedItem.type === 'image') {
+    const file = toOutboundImageFile(normalizedItem.source)
+    segments.push({ type: 'image', data: { file } })
+    return segments
+  }
+  segments.push({ type: 'text', data: { text: normalizedItem.content } })
+  return segments
+}
+
+async function buildPokeReplyMessageSegmentsAsync(item, headerText = '') {
+  const normalizedItem = normalizePokeReplyItem(item)
+  const textPrefix = headerText ? [{ type: 'text', data: { text: headerText } }] : []
+  const withHeader = (messageSegments) => textPrefix.concat(Array.isArray(messageSegments) ? messageSegments : [])
+  if (!normalizedItem) {
+    return [withHeader([{ type: 'text', data: { text: '（空）' } }])]
+  }
+  if (normalizedItem.type === 'image') {
+    const actualSource = await persistPokeImageSource(normalizedItem.source).catch(() => normalizedItem.source)
+    const variants = []
+    const seen = new Set()
+    const pushVariant = (messageSegments) => {
+      const variant = withHeader(messageSegments)
+      const key = JSON.stringify(variant)
+      if (seen.has(key)) return
+      seen.add(key)
+      variants.push(variant)
+    }
+    if (isLocalFileSource(actualSource)) {
+      const file = toOutboundImageFile(actualSource)
+      pushVariant([{ type: 'image', data: { file } }])
+    }
+    const base64 = await sourceToBase64(actualSource).catch(() => null)
+    if (base64 && base64.data) {
+      pushVariant([{ type: 'image', data: { file: `base64://${base64.data}` } }])
+    }
+    const file = toOutboundImageFile(actualSource)
+    if (file) pushVariant([{ type: 'image', data: { file } }])
+    return variants.length > 0
+      ? variants
+      : [withHeader([{ type: 'text', data: { text: '[图片发送失败]' } }])]
+  }
+  return [withHeader([{ type: 'text', data: { text: normalizedItem.content } }])]
+}
+
+function normalizeMessageVariants(message) {
+  if (!Array.isArray(message)) return [[{ type: 'text', data: { text: String(message || '') } }]]
+  if (message.length > 0 && Array.isArray(message[0])) return message
+  return [message]
+}
+
+async function replyCommandMessage(ws, payload, text) {
+  const baseMessage = Array.isArray(text) ? text : [{ type: 'text', data: { text } }]
+  const variants = normalizeMessageVariants(baseMessage)
+  for (const msg of variants) {
+    const result = payload.message_type === 'group'
+      ? await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => null)
+      : await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => null)
+    if (result && result.status === 'ok') return
+  }
+}
+
+async function handleImageGenerationRequest(ws, payload, promptText, hist) {
+  const prompt = String(promptText || '').trim()
+  if (!prompt || !shouldGenerateImage(prompt)) return { handled: false }
+  const result = await callOpenAI(prompt, [], hist, { structured: true, generateImage: true })
+  if (!result || typeof result !== 'object') return { handled: false }
+  const images = Array.isArray(result.images) ? result.images : []
+  const text = sanitizeText(result.text || '')
+  if (images.length === 0) {
+    await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
+    return { handled: true, deliveredText: text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试' }
+  }
+  if (text) await replyCommandMessage(ws, payload, text)
+  let deliveredImages = 0
+  for (const image of images.slice(0, 1)) {
+    const filePath = saveGeneratedImage(image.b64, 'image/png')
+    if (!filePath) continue
+    const variants = await buildCustomReplyMessageVariants({ segments: [{ type: 'image', source: filePath }] })
+    await replyCommandMessage(ws, payload, variants)
+    deliveredImages += 1
+  }
+  if (deliveredImages === 0) {
+    const fallbackText = text || '图片已生成，但发送失败，请稍后再试'
+    await replyCommandMessage(ws, payload, fallbackText)
+    return { handled: true, deliveredText: fallbackText }
+  }
+  return { handled: true, deliveredText: text || '[已发送生成图片]' }
+}
+
+async function getReplyMessageContent(ws, replyId) {
+  const normalizedReplyId = String(replyId || '').trim()
+  if (!normalizedReplyId) return null
+  const replied = await sendAction(ws, 'get_msg', { message_id: normalizedReplyId }).catch(() => null)
+  if (!(replied && replied.status === 'ok' && replied.data && replied.data.message)) return null
+  const repliedContent = extractContent(replied.data.message)
+  repliedContent.media = await resolveMediaSources(ws, repliedContent.media)
+  repliedContent.message = replied.data.message
+  return repliedContent
 }
 
 function normalizeCommandText(text) {
@@ -777,29 +1989,74 @@ function compactCommandText(text) {
 function buildPokeCommandHelp(isAdminUser) {
   const lines = [
     '拍一拍命令：',
-    '1. 拍一拍 文案列表'
+    '1. 拍一拍 文案列表',
+    '2. 拍一拍 文案查看 序号'
   ]
   if (isAdminUser) {
-    lines.push('2. 拍一拍 文案添加 内容')
-    lines.push('3. 拍一拍 文案删除 内容')
-    lines.push('4. 拍一拍 文案清空')
-    lines.push('5. 拍一拍 文案去重')
-    lines.push('6. 拍一拍 开启')
-    lines.push('7. 拍一拍 关闭')
+    lines.push('3. 拍一拍 文案添加 内容')
+    lines.push('4. 拍一拍 图片添加 / 加图 / 添加图片')
+    lines.push('5. 拍一拍 文案删除 序号')
+    lines.push('6. 拍一拍 文案清空')
+    lines.push('7. 拍一拍 文案去重')
+    lines.push('8. 拍一拍 开启')
+    lines.push('9. 拍一拍 关闭')
   } else {
     lines.push('其余文案管理和开关命令需要管理员权限')
   }
   return lines.join('\n')
 }
 
+function buildCustomReplyHelp(isAdminUser) {
+  const lines = [
+    '自定义回复命令：',
+    '1. 创建自定义回复',
+    '2. 自定义回复 添加 触发词 => 回复文本',
+    '3. 可引用一条消息后发送：自定义回复 添加 触发词',
+    '4. 可引用一条消息后发送：创建自定义回复 触发词',
+    '5. 自定义回复 列表',
+    '6. 自定义回复 查看 触发词',
+    '7. 自定义回复 删除 触发词',
+    '8. 自定义回复 删除 触发词 第N条',
+    '9. 自定义回复 清空',
+    '10. 交互创建过程中发送“取消”可退出'
+  ]
+  if (!isAdminUser) lines.push('以上命令需要管理员权限')
+  return lines.join('\n')
+}
+
+function buildScheduleCommandHelp(isAdminUser) {
+  const lines = [
+    '定时任务命令：',
+    '1. 定时任务 列表',
+    '2. 定时任务 查看 序号'
+  ]
+  if (isAdminUser) {
+    lines.push('3. 定时任务 添加 每天 08:30 => 文本内容')
+    lines.push('4. 定时任务 添加 每周一 08:30 => 文本内容')
+    lines.push('5. 定时任务 添加 每月 1号 08:30 => 文本内容')
+    lines.push('6. 定时任务 添加 2026-05-07 08:30 => 文本内容')
+    lines.push('7. 可引用一条消息后发送：定时任务 添加 每天 08:30')
+    lines.push('8. 创建定时任务')
+    lines.push('9. 定时任务 删除 序号')
+    lines.push('10. 定时任务 清空')
+  } else {
+    lines.push('其余定时任务管理命令需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
 async function handleCommands(ws, payload, text) {
-  const t = normalizeCommandText(stripPrefix(text || ''))
+  const rawCommandText = stripPrefix(text || '')
+  const t = normalizeCommandText(rawCommandText)
   const nt = t.replace(/\s+/g, ' ')
   const compact = compactCommandText(t)
   const isBanned = /^(banned|违禁词|禁词|敏感词)|^(添加|删除|移除|增加|新增)\s*(违禁词|禁词|敏感词)/i.test(nt)
   const isContext = /^(context|上下文)/i.test(nt)
   const isPoke = /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(nt) || /^(poke|拍一拍|一拍一拍|戳一戳)/i.test(compact)
-  const matchedCommand = isBanned || isContext || isPoke
+  const isSchedule = /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(nt) || /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(compact)
+  const isCustomReply = /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(nt)
+    || /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(compact)
+  const matchedCommand = isBanned || isContext || isPoke || isSchedule || isCustomReply
   if (!matchedCommand) return false
   try {
     const isGroup = payload.message_type === 'group'
@@ -830,10 +2087,34 @@ async function handleCommands(ws, payload, text) {
       return true
     }
     if (isPoke) {
+      const commandContent = extractContent(payload.message)
+      const commandMedia = await resolveMediaSources(ws, commandContent.media)
+      let repliedContent = null
       if (/(回复\s*列表|文案\s*列表|list)/i.test(nt) || /(回复列表|文案列表)/i.test(compact)) {
         const items = refreshPokeReplyTexts()
-        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${s}`).join('\n') : '（空）'
+        const body = items.length > 0 ? items.map((s, i) => `${i + 1}. ${previewPokeReplyText(s)}`).join('\n') : '（空）'
         await replyCommandMessage(ws, payload, `拍一拍回复列表：\n${body}`)
+        return true
+      }
+      const viewMatch = nt.match(/(?:回复|文案)\s*(?:查看|详情|明细)\s*(\d+)/i) || nt.match(/(?:view|show)\s+(\d+)/i)
+      if (viewMatch) {
+        const items = refreshPokeReplyTexts()
+        const index = parseInt(viewMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请提供正确的文案编号，例如：拍一拍 文案查看 3')
+          return true
+        }
+        if (index > items.length) {
+          await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
+          return true
+        }
+        const targetItem = normalizePokeReplyItem(items[index - 1])
+        if (targetItem && targetItem.type === 'image') {
+          await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：[图片回复]`)
+          await replyCommandMessage(ws, payload, await buildPokeReplyMessageSegmentsAsync(targetItem))
+          return true
+        }
+        await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem, `拍一拍文案 #${index}：\n`))
         return true
       }
       const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
@@ -842,9 +2123,15 @@ async function handleCommands(ws, payload, text) {
           await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
           return true
         }
-        const content = String(addMatch[1] || '').trim()
+        const rawAddMatch = String(rawCommandText || '').match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:add|replyadd)\s+([\s\S]+)/i)
+        let content = String((rawAddMatch && rawAddMatch[1]) || addMatch[1] || '').trim()
+        if (!content && commandContent.replyId) {
+          repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
+          content = String((repliedContent && repliedContent.text) || '').trim()
+        }
         if (!content) {
-          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案')
+          await replyCommandMessage(ws, payload, '请在命令后附带要添加的拍一拍文案，或引用一条带文本的消息')
           return true
         }
         const items = refreshPokeReplyTexts()
@@ -853,28 +2140,66 @@ async function handleCommands(ws, payload, text) {
           return true
         }
         const saved = savePokeReplyTexts(items.concat(content))
-        await replyCommandMessage(ws, payload, `已添加拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        await replyCommandMessage(ws, payload, `已添加拍一拍文案 #${saved.length}：${previewPokeReplyText(saved[saved.length - 1])}\n当前共 ${saved.length} 条`)
         return true
       }
-      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s+(.+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(.+)/i)
+      const imageAddMatch = nt.match(/(?:图片|图)\s*(?:添加|增加|新增)(?:\s+(.+))?/i)
+        || nt.match(/(?:添加图片|加图|加图片)(?:\s+(.+))?/i)
+        || nt.match(/(?:imageadd|imgadd|addimage)(?:\s+(.+))?/i)
+      if (imageAddMatch) {
+        if (!isAdminUser) {
+          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍图片回复')
+          return true
+        }
+        let imageMedia = (commandMedia || []).find((item) => item && item.kind === 'image')
+        if (!imageMedia && commandContent.replyId) {
+          repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
+          imageMedia = ((repliedContent && repliedContent.media) || []).find((item) => item && item.kind === 'image') || null
+        }
+        const rawImageAddMatch = String(rawCommandText || '').match(/(?:图片|图)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:添加图片|加图|加图片)\s+([\s\S]+)/i)
+          || String(rawCommandText || '').match(/(?:imageadd|imgadd|addimage)\s+([\s\S]+)/i)
+        const source = String(
+          (imageMedia && pickPokeImageSource(imageMedia))
+          || (rawImageAddMatch && rawImageAddMatch[1])
+          || imageAddMatch[1]
+          || ''
+        ).trim()
+        if (!source) {
+          await replyCommandMessage(ws, payload, '请在命令消息中附带图片、引用一条带图片的消息，或在命令后提供图片地址/路径')
+          return true
+        }
+        const persistedSource = await persistPokeImageSource(source).catch(() => source)
+        const item = normalizePokeReplyItem({ type: 'image', source: persistedSource || source })
+        const items = refreshPokeReplyTexts()
+        if (item && items.some((existing) => pokeReplySignature(existing) === pokeReplySignature(item))) {
+          await replyCommandMessage(ws, payload, '该拍一拍图片回复已存在')
+          return true
+        }
+        const saved = savePokeReplyTexts(items.concat(item))
+        await replyCommandMessage(ws, payload, `已添加拍一拍图片回复 #${saved.length}：[图片回复]\n当前共 ${saved.length} 条`)
+        return true
+      }
+      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s*(\d+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(\d+)/i)
       if (removeMatch) {
         if (!isAdminUser) {
           await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
           return true
         }
-        const content = String(removeMatch[1] || '').trim()
-        if (!content) {
-          await replyCommandMessage(ws, payload, '请在命令后附带要删除的拍一拍文案')
+        const index = parseInt(removeMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请提供正确的文案编号，例如：拍一拍 文案删除 3')
           return true
         }
         const items = refreshPokeReplyTexts()
-        const nextItems = items.filter((item) => item !== content)
-        if (nextItems.length === items.length) {
-          await replyCommandMessage(ws, payload, `未找到拍一拍文案：${content}`)
+        if (index > items.length) {
+          await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
           return true
         }
+        const removed = items[index - 1]
+        const nextItems = items.slice(0, index - 1).concat(items.slice(index))
         const saved = savePokeReplyTexts(nextItems)
-        await replyCommandMessage(ws, payload, `已删除拍一拍文案：${content}\n当前共 ${saved.length} 条`)
+        await replyCommandMessage(ws, payload, `已删除拍一拍文案 #${index}：${previewPokeReplyText(removed)}\n当前共 ${saved.length} 条`)
         return true
       }
       if (/(回复|文案).*(清空|重置)|(?:clear|empty|purge|reset)/i.test(nt) || /(回复清空|文案清空|回复重置|文案重置)/i.test(compact)) {
@@ -908,6 +2233,269 @@ async function handleCommands(ws, payload, text) {
         return true
       }
       await replyCommandMessage(ws, payload, buildPokeCommandHelp(isAdminUser))
+      return true
+    }
+    if (isSchedule) {
+      if (!isGroup) {
+        await replyCommandMessage(ws, payload, '定时任务目前仅支持群聊')
+        return true
+      }
+      const commandContent = extractContent(payload.message)
+      const draftKey = getScheduleTaskDraftKey(payload)
+      purgeExpiredScheduleTaskDrafts()
+      const currentDraft = scheduleTaskDrafts.get(draftKey)
+      const startInteractive = /^(创建定时任务|定时任务创建|定时任务新建)$/i.test(nt) || /^(创建定时任务|定时任务创建|定时任务新建)$/i.test(compact)
+      const cancelInteractive = /^(取消定时任务|取消创建定时任务|定时任务取消)$/i.test(nt) || /^(取消定时任务|取消创建定时任务|定时任务取消)$/i.test(compact)
+      const listMatch = /^(?:定时任务|定时|计划任务|定时提醒).*(列表|list)$/i.test(nt) || /(定时任务列表|计划任务列表)/i.test(compact)
+      const viewMatch = nt.match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:查看|详情|明细|show|view)\s+(\d+)$/i)
+      const deleteMatch = nt.match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:删除|移除|取消)\s+(\d+)$/i)
+      const clearMatch = /^(?:定时任务|定时|计划任务|定时提醒).*(清空|clear|reset)$/i.test(nt)
+      const textAddMatch = String(rawCommandText || '').match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:添加|新增|创建)\s+(.+?)\s*(?:=>|->|＝>|→)\s*([\s\S]+)$/i)
+      const quotedAddMatch = String(rawCommandText || '').match(/^(?:定时任务|定时|计划任务|定时提醒)\s*(?:添加|新增|创建)\s+([\s\S]+)$/i)
+
+      if (listMatch) {
+        const tasks = listScheduledTasks(payload.group_id)
+        if (tasks.length === 0) {
+          await replyCommandMessage(ws, payload, '当前群还没有定时任务')
+          return true
+        }
+        const body = tasks.map((task, index) => `${index + 1}. ${previewScheduledTask(task)} | 下次执行：${formatScheduleTime(task.nextRunAt)}`).join('\n')
+        await replyCommandMessage(ws, payload, `当前群定时任务列表：\n${body}`)
+        return true
+      }
+      if (viewMatch) {
+        const tasks = listScheduledTasks(payload.group_id)
+        const index = parseInt(viewMatch[1], 10)
+        if (!Number.isInteger(index) || index < 1 || index > tasks.length) {
+          await replyCommandMessage(ws, payload, '请提供正确的任务编号，例如：定时任务 查看 1')
+          return true
+        }
+        const task = tasks[index - 1]
+        await replyCommandMessage(ws, payload, `定时任务 #${index}\n时间：${task.specText}\n下次执行：${formatScheduleTime(task.nextRunAt)}`)
+        await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(task.content))
+        return true
+      }
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理定时任务')
+        return true
+      }
+      if (cancelInteractive) {
+        if (currentDraft) {
+          scheduleTaskDrafts.delete(draftKey)
+          await replyCommandMessage(ws, payload, '已取消创建定时任务')
+        } else {
+          await replyCommandMessage(ws, payload, '当前没有正在进行的定时任务创建流程')
+        }
+        return true
+      }
+      if (startInteractive) {
+        scheduleTaskDrafts.set(draftKey, createScheduleTaskDraft('await_spec'))
+        await replyCommandMessage(ws, payload, '请输入定时规则\n例如：每天 08:30、每周一 08:30、每月 1号 08:30、2026-05-07 08:30\n10分钟内未继续将自动取消')
+        return true
+      }
+      if (deleteMatch) {
+        const index = parseInt(deleteMatch[1], 10)
+        const removed = removeScheduledTask(payload.group_id, index)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, '未找到对应的定时任务编号')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除定时任务 #${index}：${previewScheduledTask(removed.removed)}\n当前共 ${removed.count} 条`)
+        return true
+      }
+      if (clearMatch) {
+        const cleared = clearScheduledTasks(payload.group_id)
+        if (!cleared.ok) {
+          await replyCommandMessage(ws, payload, '当前群没有可清空的定时任务')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已清空当前群定时任务，共移除 ${cleared.removedCount} 条`)
+        return true
+      }
+      if (textAddMatch || quotedAddMatch) {
+        const scheduleRaw = String((textAddMatch && textAddMatch[1]) || (quotedAddMatch && quotedAddMatch[1]) || '').trim()
+        const schedule = parseScheduleSpec(scheduleRaw)
+        if (!schedule) {
+          await replyCommandMessage(ws, payload, '请使用正确的时间格式，例如：定时任务 添加 每天 08:30 => 早安、定时任务 添加 每周一 08:30 => 周会、定时任务 添加 每月 1号 08:30 => 月初提醒、定时任务 添加 2026-05-07 08:30 => 开会提醒')
+          return true
+        }
+        let entry = null
+        if (textAddMatch) {
+          const contentText = String(textAddMatch[2] || '').replace(/\r/g, '').trim()
+          if (!contentText) {
+            await replyCommandMessage(ws, payload, '请在 => 后提供文本内容，或改用引用消息的方式创建定时任务')
+            return true
+          }
+          entry = { segments: [{ type: 'text', data: { text: contentText } }] }
+        } else if (commandContent.replyId) {
+          const repliedContent = await getReplyMessageContent(ws, commandContent.replyId)
+          const replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+          if (replySegments.length > 0) entry = { segments: replySegments }
+        }
+        if (!entry) {
+          await replyCommandMessage(ws, payload, '请在命令中使用 => 提供文本内容，或引用一条带文本/图片/表情的消息作为定时发送内容')
+          return true
+        }
+        const added = addScheduledTask(payload.group_id, schedule, entry, payload.user_id)
+        if (!added.ok && added.reason === 'past') {
+          await replyCommandMessage(ws, payload, '一次性定时任务的时间必须晚于当前时间')
+          return true
+        }
+        if (!added.ok) {
+          await replyCommandMessage(ws, payload, '定时任务创建失败，请检查时间格式和发送内容')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建定时任务 #${added.count}：${previewScheduledTask(added.task)}\n下次执行：${formatScheduleTime(added.task.nextRunAt)}`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildScheduleCommandHelp(isAdminUser))
+      return true
+    }
+    if (isCustomReply) {
+      if (!isGroup) {
+        await replyCommandMessage(ws, payload, '自定义回复目前仅支持群聊')
+        return true
+      }
+      const commandContent = extractContent(payload.message)
+      const draftKey = getCustomReplyDraftKey(payload)
+      purgeExpiredCustomReplyDrafts()
+      const currentDraft = customReplyDrafts.get(draftKey)
+      const startInteractive = /^(创建自定义回复|自定义回复创建|自定义回复新建)$/i.test(nt) || /^(创建自定义回复|自定义回复创建|自定义回复新建)$/i.test(compact)
+      const cancelInteractive = /^(取消自定义回复|取消创建自定义回复|自定义回复取消)$/i.test(nt) || /^(取消自定义回复|取消创建自定义回复|自定义回复取消)$/i.test(compact)
+      const listRules = /^(自定义回复|关键词回复|关键字回复).*(列表|list)$/i.test(nt) || /(自定义回复列表|关键词回复列表|关键字回复列表)/i.test(compact)
+      const viewMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:查看|详情|明细|show|view)\s+([\s\S]+)$/i)
+      const removeEntryMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:删除|移除|去除)\s+([\s\S]+?)\s*(?:第\s*)?(\d+)\s*条?$/i)
+      const removeMatch = nt.match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:删除|移除|去除)\s+(.+)$/i)
+      const clearRules = /^(?:自定义回复|关键词回复|关键字回复).*(清空|重置|clear|reset|empty|purge)$/i.test(nt)
+        || /(自定义回复清空|关键词回复清空|关键字回复清空|自定义回复重置)/i.test(compact)
+      const rawAddMatch = String(rawCommandText || '').match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:添加|新增|创建)\s+([\s\S]+?)\s*(?:=>|->|＝>|→)\s*([\s\S]+)$/i)
+      const quotedAddTriggerMatch = String(rawCommandText || '').match(/^(?:自定义回复|关键词回复|关键字回复)\s*(?:添加|新增|创建)\s+([\s\S]+)$/i)
+      const quotedCreateTriggerMatch = String(rawCommandText || '').match(/^(?:创建自定义回复|自定义回复创建|自定义回复新建)\s+([\s\S]+)$/i)
+
+      if (!isAdminUser) {
+        await replyCommandMessage(ws, payload, '需要管理员权限才能管理自定义回复')
+        return true
+      }
+      if (cancelInteractive) {
+        if (currentDraft) {
+          customReplyDrafts.delete(draftKey)
+          await replyCommandMessage(ws, payload, '已取消创建自定义回复')
+        } else {
+          await replyCommandMessage(ws, payload, '当前没有正在进行的自定义回复创建流程')
+        }
+        return true
+      }
+      if (startInteractive) {
+        customReplyDrafts.set(draftKey, createCustomReplyDraft('await_trigger'))
+        await replyCommandMessage(ws, payload, '请输入被回复内容\n10分钟内未继续将自动取消')
+        return true
+      }
+      if (rawAddMatch) {
+        const trigger = normalizeCustomReplyTrigger(rawAddMatch[1])
+        const replyText = String(rawAddMatch[2] || '').replace(/\r/g, '').trim()
+        if (!trigger || !replyText) {
+          await replyCommandMessage(ws, payload, '请使用：自定义回复 添加 触发词 => 回复文本')
+          return true
+        }
+        const added = addCustomReply(payload.group_id, trigger, {
+          segments: [{ type: 'text', data: { text: replyText } }]
+        })
+        if (!added.ok && added.reason === 'duplicate') {
+          await replyCommandMessage(ws, payload, `该自定义回复已存在：${trigger} => ${replyText}`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建自定义回复：${trigger} => ${replyText}\n当前该关键词共有 ${added.count} 条回复`)
+        return true
+      }
+      const quotedTriggerRaw = (quotedAddTriggerMatch && quotedAddTriggerMatch[1]) || (quotedCreateTriggerMatch && quotedCreateTriggerMatch[1]) || ''
+      const quotedTrigger = normalizeCustomReplyTrigger(quotedTriggerRaw)
+      if (quotedTrigger && commandContent.replyId) {
+        const repliedContent = await getReplyMessageContent(ws, commandContent.replyId)
+        const replySegments = await captureCustomReplySegments(ws, repliedContent && repliedContent.message)
+        if (replySegments.length === 0) {
+          await replyCommandMessage(ws, payload, '引用消息里没有可保存的回复内容，请引用一条带文本、图片或表情的消息')
+          return true
+        }
+        const added = addCustomReply(payload.group_id, quotedTrigger, { segments: replySegments })
+        if (!added.ok && added.reason === 'duplicate') {
+          await replyCommandMessage(ws, payload, `该自定义回复已存在：${quotedTrigger} => ${previewCustomReplyEntry({ segments: replySegments })}`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已创建自定义回复：${quotedTrigger} => ${previewCustomReplyEntry(added.entry)}\n当前该关键词共有 ${added.count} 条回复`)
+        return true
+      }
+      if (quotedTriggerRaw) {
+        await replyCommandMessage(ws, payload, '请引用一条消息作为回复内容，或使用：自定义回复 添加 触发词 => 回复内容')
+        return true
+      }
+      if (listRules) {
+        const rules = listCustomReplyTriggers(payload.group_id)
+        if (rules.length === 0) {
+          await replyCommandMessage(ws, payload, '当前群还没有自定义回复')
+          return true
+        }
+        const body = rules
+          .map((rule, index) => `${index + 1}. ${rule.trigger}（${rule.replies.length} 条） 示例：${previewCustomReplyEntry(rule.replies[0])}`)
+          .join('\n')
+        await replyCommandMessage(ws, payload, `当前群自定义回复列表：\n${body}`)
+        return true
+      }
+      if (viewMatch) {
+        const trigger = normalizeCustomReplyTrigger(viewMatch[1])
+        if (!trigger) {
+          await replyCommandMessage(ws, payload, '请提供要查看的触发词，例如：自定义回复 查看 测试')
+          return true
+        }
+        const entries = getCustomReplyEntries(payload.group_id, trigger)
+        if (entries.length === 0) {
+          await replyCommandMessage(ws, payload, `未找到触发词为“${trigger}”的自定义回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `自定义回复：${trigger}\n共 ${entries.length} 条`)
+        for (let index = 0; index < entries.length; index += 1) {
+          await replyCommandMessage(ws, payload, await buildCustomReplyMessageVariants(entries[index], `#${index + 1}：\n`))
+        }
+        return true
+      }
+      if (removeEntryMatch) {
+        const trigger = normalizeCustomReplyTrigger(removeEntryMatch[1])
+        const index = parseInt(removeEntryMatch[2], 10)
+        if (!trigger || !Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请使用：自定义回复 删除 触发词 第2条')
+          return true
+        }
+        const removed = removeCustomReplyEntry(payload.group_id, trigger, index)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, `未找到“${trigger}”的第 ${index} 条回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除自定义回复：${trigger} 第 ${index} 条\n内容：${previewCustomReplyEntry(removed.removed)}\n剩余 ${removed.remainingCount} 条`)
+        return true
+      }
+      if (removeMatch) {
+        const trigger = normalizeCustomReplyTrigger(removeMatch[1])
+        if (!trigger) {
+          await replyCommandMessage(ws, payload, '请提供要删除的触发词，例如：自定义回复 删除 测试')
+          return true
+        }
+        const removed = removeCustomReply(payload.group_id, trigger)
+        if (!removed.ok) {
+          await replyCommandMessage(ws, payload, `未找到触发词为“${trigger}”的自定义回复`)
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已删除自定义回复：${trigger}（共 ${removed.removedCount} 条回复）`)
+        return true
+      }
+      if (clearRules) {
+        const cleared = clearCustomReplies(payload.group_id)
+        if (!cleared.ok) {
+          await replyCommandMessage(ws, payload, '当前群没有可清空的自定义回复')
+          return true
+        }
+        await replyCommandMessage(ws, payload, `已清空当前群自定义回复：移除 ${cleared.removedTriggers} 个触发词，共 ${cleared.removedReplies} 条回复`)
+        return true
+      }
+      await replyCommandMessage(ws, payload, buildCustomReplyHelp(isAdminUser))
       return true
     }
     if (isBanned) {

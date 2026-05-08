@@ -62,6 +62,21 @@ function extractOpenAIToolCalls(data) {
   return out
 }
 
+function extractOpenAIImages(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.output)) return []
+  const out = []
+  for (const item of data.output) {
+    if (!item || item.type !== 'image_generation_call') continue
+    const result = typeof item.result === 'string' ? item.result.trim() : ''
+    if (!result) continue
+    out.push({
+      id: item.id || item.call_id || `image_${out.length + 1}`,
+      b64: result
+    })
+  }
+  return out
+}
+
 function formatOpenAITools(tools, useResponses) {
   if (!Array.isArray(tools) || tools.length === 0) return []
   return tools.map((tool) => {
@@ -85,4 +100,4 @@ function formatOpenAITools(tools, useResponses) {
   })
 }
 
-module.exports = { extractOpenAIText, extractOpenAIToolCalls, formatOpenAITools }
+module.exports = { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, formatOpenAITools }
