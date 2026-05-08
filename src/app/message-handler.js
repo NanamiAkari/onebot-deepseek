@@ -212,12 +212,12 @@ function createMessageHandler(deps) {
       const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
         ? hasCustomReplyTrigger(payload.group_id, raw.text)
         : false
-      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned && !customReplyTriggered) return
-      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       if (isGroup) {
         const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
         if (ban) return
       }
+      if (isGroup && GROUP_REQUIRE_MENTION && !mentioned && !customReplyTriggered) return
+      if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
       const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
