@@ -1806,25 +1806,41 @@ function buildTextWithContext(text, hist) {
 }
 
 async function checkModeration(ws, groupId, userId, selfId, text) {
-  if (!AI_MOD_ENABLE) return false
+  const modEnabled = String(process.env.AI_MOD_ENABLE || AI_MOD_ENABLE).toLowerCase() === 'true'
+  if (!modEnabled) return false
   const banned = loadBanned(groupId)
   if (!banned || !banned.length) return false
   const t = String(text || '')
-  let hit = false
+  let hitWord = ''
   for (const w of banned) {
+    const word = String(w || '')
+    if (!word) continue
     if (w.startsWith('re:')) {
       try {
-        const re = new RegExp(w.slice(3), 'i')
-        if (re.test(t)) { hit = true; break }
+        const re = new RegExp(word.slice(3), 'i')
+        if (re.test(t)) { hitWord = word; break }
       } catch {}
     } else {
-      if (t.includes(w)) { hit = true; break }
+      if (t.includes(word)) { hitWord = word; break }
     }
   }
-  if (!hit) return false
-  const role = await getMyRole(ws, groupId, selfId).catch(() => 'member')
+  if (!hitWord) return false
+  const userRole = await getUserRole(ws, groupId, userId).catch(() => 'member')
+  if (userRole === 'owner' || userRole === 'admin') {
+    console.log(`违禁词命中但跳过管理员 group=${groupId} user=${userId} word=${hitWord}`)
+    return false
+  }
+  const role = await getMyRole(ws, groupId, selfId, { refresh: true }).catch(() => 'member')
+  const duration = Math.max(30, parseInt(process.env.AI_BAN_DURATION || AI_BAN_DURATION, 10) || AI_BAN_DURATION)
   if (role === 'owner' || role === 'admin') {
-    await sendAction(ws, 'set_group_ban', { group_id: groupId, user_id: userId, duration: AI_BAN_DURATION }).catch(() => {})
+    const banResult = await sendAction(ws, 'set_group_ban', { group_id: groupId, user_id: userId, duration }).catch((error) => {
+      const message = error && error.message ? String(error.message) : String(error)
+      console.log('禁言动作异常', message)
+      return null
+    })
+    console.log(`违禁词命中 group=${groupId} user=${userId} word=${hitWord} duration=${duration} botRole=${role} banStatus=${banResult && banResult.status}`)
+  } else {
+    console.log(`违禁词命中但机器人无管理员权限 group=${groupId} user=${userId} word=${hitWord} botRole=${role}`)
   }
   const msg = [{ type: 'text', data: { text: '已检测到不允许的内容' } }]
   await sendAction(ws, 'send_group_msg', { group_id: groupId, message: msg }).catch(() => {})
@@ -1852,9 +1868,9 @@ function saveBanned(groupId, list) {
   } catch {}
 }
 
-async function getMyRole(ws, groupId, selfId) {
+async function getMyRole(ws, groupId, selfId, options = {}) {
   const k = `role:${groupId}`
-  if (roleCache.has(k)) return roleCache.get(k)
+  if (!options.refresh && roleCache.has(k)) return roleCache.get(k)
   const uid = typeof selfId === 'number' ? selfId : 0
   const info = await sendAction(ws, 'get_group_member_info', { group_id: groupId, user_id: uid }).catch(() => null)
   let role = 'member'
@@ -2054,6 +2070,26 @@ function buildScheduleCommandHelp(isAdminUser) {
     lines.push('10. 定时任务 清空')
   } else {
     lines.push('其余定时任务管理命令需要管理员权限')
+  }
+  return lines.join('\n')
+}
+
+function buildBannedCommandHelp(isAdminUser) {
+  const lines = [
+    '违禁词治理命令：',
+    '1. 违禁词列表',
+    '2. 违禁词帮助 / 违禁词命令'
+  ]
+  if (isAdminUser) {
+    lines.push('3. 违禁词添加 词语')
+    lines.push('4. 违禁词删除 词语')
+    lines.push('5. 违禁词清空')
+    lines.push('6. 违禁词治理开启')
+    lines.push('7. 违禁词治理关闭')
+    lines.push('8. 禁言时长 10分钟')
+    lines.push('9. 支持正则：违禁词添加 re:正则表达式')
+  } else {
+    lines.push('查看和管理违禁词需要管理员权限')
   }
   return lines.join('\n')
 }
@@ -2513,17 +2549,25 @@ async function handleCommands(ws, payload, text) {
     }
     if (isBanned) {
       const list = loadBanned(payload.group_id)
+      if (!isGroup) {
+        await replyCommandMessage(ws, payload, '违禁词管理仅支持群聊')
+        return true
+      }
+      if (/^(?:违禁词|禁词|敏感词|banned)\s*(?:帮助|命令|help|\?)?$/i.test(nt)) {
+        await replyCommandMessage(ws, payload, buildBannedCommandHelp(isAdminUser))
+        return true
+      }
+      if (!isAdminUser) {
+        const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
+        await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
+        return true
+      }
       if (/列表|查看|list/i.test(nt)) {
         const msg = [{ type: 'text', data: { text: `违禁词列表：${list.join(',') || '（空）'}｜治理开关=${process.env.AI_MOD_ENABLE || AI_MOD_ENABLE}｜禁言时长=${process.env.AI_BAN_DURATION || AI_BAN_DURATION}s` } }]
         await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => {})
         return true
       }
-      if (!isAdminUser) {
-        const denied = [{ type: 'text', data: { text: '需要管理员权限才能管理违禁词' } }]
-        if (isGroup) await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: denied }).catch(() => {})
-        else await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: denied }).catch(() => {})
-        return true
-      } else if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
+      if (/add\s+(.+)/i.test(nt) || /(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i.test(nt) || /(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i.test(nt)) {
         const m = nt.match(/add\s+(.+)/i) || nt.match(/(添加|增加|新增)\s*(违禁词|禁词|敏感词)?\s+(.+)/i) || nt.match(/(违禁词|禁词|敏感词)\s*(添加|增加|新增)\s+(.+)/i)
         const w = m ? (m[4] || m[3] || m[1]).trim() : ''
         if (w) {
