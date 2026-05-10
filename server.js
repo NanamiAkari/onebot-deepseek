@@ -78,6 +78,7 @@ const agentRunner = createAgentRunner({
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 let currentPokeReplyTexts = []
+let imageGenerationInFlight = null
 
 function resolveProjectFile(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
@@ -1958,37 +1959,52 @@ async function replyCommandMessage(ws, payload, text) {
 async function handleImageGenerationRequest(ws, payload, promptText, hist) {
   const prompt = String(promptText || '').trim()
   if (!prompt || !shouldGenerateImage(prompt)) return { handled: false }
+  if (imageGenerationInFlight) {
+    const elapsed = Math.max(1, Math.round((Date.now() - imageGenerationInFlight.startedAt) / 1000))
+    await replyCommandMessage(ws, payload, `现在已经有一张图片在生成中，已等待 ${elapsed} 秒，请稍后再试`)
+    return { handled: true, deliveredText: '[生图请求被拒绝：已有任务进行中]' }
+  }
+  imageGenerationInFlight = {
+    startedAt: Date.now(),
+    groupId: payload.group_id || null,
+    userId: payload.user_id || null,
+    prompt: prompt.slice(0, 120)
+  }
   console.log('命中生图请求', prompt.slice(0, 120))
-  await replyCommandMessage(ws, payload, '收到啦，正在生成图片，可能需要几十秒……')
-  const startedAt = Date.now()
-  const result = await callOpenAI(prompt, [], hist, {
-    structured: true,
-    generateImage: true,
-    timeoutMs: OPENAI_IMAGE_TIMEOUT_MS
-  })
-  if (!result || typeof result !== 'object') return { handled: false }
-  const images = Array.isArray(result.images) ? result.images : []
-  const text = sanitizeText(result.text || '')
-  console.log(`生图返回 images=${images.length} elapsed=${Date.now() - startedAt}ms text=${text ? text.slice(0, 80) : ''}`)
-  if (images.length === 0) {
-    await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
-    return { handled: true, deliveredText: text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试' }
+  try {
+    await replyCommandMessage(ws, payload, '收到啦，正在生成图片，可能需要几十秒……')
+    const startedAt = Date.now()
+    const result = await callOpenAI(prompt, [], hist, {
+      structured: true,
+      generateImage: true,
+      timeoutMs: OPENAI_IMAGE_TIMEOUT_MS
+    })
+    if (!result || typeof result !== 'object') return { handled: false }
+    const images = Array.isArray(result.images) ? result.images : []
+    const text = sanitizeText(result.text || '')
+    console.log(`生图返回 images=${images.length} elapsed=${Date.now() - startedAt}ms text=${text ? text.slice(0, 80) : ''}`)
+    if (images.length === 0) {
+      await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
+      return { handled: true, deliveredText: text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试' }
+    }
+    if (text) await replyCommandMessage(ws, payload, text)
+    let deliveredImages = 0
+    for (const image of images.slice(0, 1)) {
+      const filePath = saveGeneratedImage(image.b64, 'image/png')
+      if (!filePath) continue
+      const variants = await buildCustomReplyMessageVariants({ segments: [{ type: 'image', source: filePath }] })
+      await replyCommandMessage(ws, payload, variants)
+      deliveredImages += 1
+    }
+    if (deliveredImages === 0) {
+      const fallbackText = text || '图片已生成，但发送失败，请稍后再试'
+      await replyCommandMessage(ws, payload, fallbackText)
+      return { handled: true, deliveredText: fallbackText }
+    }
+    return { handled: true, deliveredText: text || '[已发送生成图片]' }
+  } finally {
+    imageGenerationInFlight = null
   }
-  if (text) await replyCommandMessage(ws, payload, text)
-  let deliveredImages = 0
-  for (const image of images.slice(0, 1)) {
-    const filePath = saveGeneratedImage(image.b64, 'image/png')
-    if (!filePath) continue
-    const variants = await buildCustomReplyMessageVariants({ segments: [{ type: 'image', source: filePath }] })
-    await replyCommandMessage(ws, payload, variants)
-    deliveredImages += 1
-  }
-  if (deliveredImages === 0) {
-    const fallbackText = text || '图片已生成，但发送失败，请稍后再试'
-    await replyCommandMessage(ws, payload, fallbackText)
-    return { handled: true, deliveredText: fallbackText }
-  }
-  return { handled: true, deliveredText: text || '[已发送生成图片]' }
 }
 
 async function getReplyMessageContent(ws, replyId) {

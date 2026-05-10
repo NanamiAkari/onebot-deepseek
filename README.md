@@ -165,6 +165,7 @@ sudo systemctl restart onebot-deepseek
 - 文生图：
   - 生成图会保存到 `generated_images/` 后再通过 OneBot 图片消息发送
   - 命中后会先回复一条“正在生成图片”的提示，再等待上游返回图片
+  - 同一服务进程内同一时间只允许一个生图请求；已有任务时，新生图请求会被立即拒绝
   - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_IMAGE_TIMEOUT_MS`
 - AI 回复发送保护：
   - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
