@@ -731,6 +731,23 @@ function previewScheduledTask(task) {
   return `${task.specText || formatScheduleTime(task.nextRunAt)} | ${previewCustomReplyEntry(task.content)}`
 }
 
+function advanceRecurringScheduledTask(task, nowTs = Date.now()) {
+  if (!task || typeof task !== 'object') return null
+  if (task.mode === 'daily') {
+    task.nextRunAt = computeDailyNextRunAt(task.hour, task.minute, nowTs + 1000)
+    return task.nextRunAt ? task : null
+  }
+  if (task.mode === 'weekly') {
+    task.nextRunAt = computeWeeklyNextRunAt(task.weekday, task.hour, task.minute, nowTs + 1000)
+    return task.nextRunAt ? task : null
+  }
+  if (task.mode === 'monthly') {
+    task.nextRunAt = computeMonthlyNextRunAt(task.day, task.hour, task.minute, nowTs + 1000)
+    return task.nextRunAt ? task : null
+  }
+  return null
+}
+
 async function sendScheduledTaskMessage(ws, task) {
   const variants = await buildCustomReplyMessageVariants(task.content)
   for (const msg of variants) {
@@ -754,6 +771,7 @@ async function runScheduledTasksTick() {
     const now = Date.now()
     const store = loadScheduledTaskStore()
     let changed = false
+    const dueTasks = []
     for (const [groupId, tasks] of Object.entries(store)) {
       const nextTasks = []
       for (const task of Array.isArray(tasks) ? tasks : []) {
@@ -766,38 +784,33 @@ async function runScheduledTasksTick() {
           nextTasks.push(normalized)
           continue
         }
-        const sent = await sendScheduledTaskMessage(activeWsClient, normalized).catch(() => false)
-        if (normalized.mode === 'daily') {
+        if (normalized.mode === 'daily' || normalized.mode === 'weekly' || normalized.mode === 'monthly') {
           normalized.lastRunAt = now
-          normalized.nextRunAt = computeDailyNextRunAt(normalized.hour, normalized.minute, now + 1000)
-          nextTasks.push(normalized)
+          const advanced = advanceRecurringScheduledTask(normalized, now)
+          if (advanced) nextTasks.push(advanced)
           changed = true
-          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
-          continue
-        }
-        if (normalized.mode === 'weekly') {
-          normalized.lastRunAt = now
-          normalized.nextRunAt = computeWeeklyNextRunAt(normalized.weekday, normalized.hour, normalized.minute, now + 1000)
-          nextTasks.push(normalized)
-          changed = true
-          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
-          continue
-        }
-        if (normalized.mode === 'monthly') {
-          normalized.lastRunAt = now
-          normalized.nextRunAt = computeMonthlyNextRunAt(normalized.day, normalized.hour, normalized.minute, now + 1000)
-          if (normalized.nextRunAt) nextTasks.push(normalized)
-          changed = true
-          if (!sent) console.log(`定时任务发送失败，将保留任务 group=${groupId} id=${normalized.id}`)
+          dueTasks.push({ groupId, task: normalized, recurring: true })
           continue
         }
         changed = true
-        if (!sent) console.log(`一次性定时任务发送失败，仍按已执行移除 group=${groupId} id=${normalized.id}`)
+        dueTasks.push({ groupId, task: normalized, recurring: false })
       }
       if (nextTasks.length > 0) store[groupId] = nextTasks
       else delete store[groupId]
     }
     if (changed) saveScheduledTaskStore(store)
+    for (const item of dueTasks) {
+      const sent = await sendScheduledTaskMessage(activeWsClient, item.task).catch((error) => {
+        const message = error && error.message ? String(error.message) : String(error)
+        console.log(`定时任务发送异常 group=${item.groupId} id=${item.task.id} ${message}`)
+        return false
+      })
+      if (!sent && item.recurring) {
+        console.log(`定时任务发送失败，已推进下次执行 group=${item.groupId} id=${item.task.id} nextRunAt=${formatScheduleTime(item.task.nextRunAt)}`)
+      } else if (!sent) {
+        console.log(`一次性定时任务发送失败，仍按已执行移除 group=${item.groupId} id=${item.task.id}`)
+      }
+    }
   } finally {
     scheduledTaskRunnerBusy = false
   }
