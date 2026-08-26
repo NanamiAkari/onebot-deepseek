@@ -47,7 +47,7 @@ function messageArraySchema(description) {
   }
 }
 
-function createDefaultToolRegistry() {
+function createDefaultToolRegistry(options = {}) {
   const registry = createToolRegistry()
   registry.register({
     name: 'get_msg',
@@ -86,6 +86,25 @@ function createDefaultToolRegistry() {
       session_key: stringField('会话唯一键；当前实现会忽略该值并从运行时 payload 读取')
     }, ['session_key'])
   })
+  if (options.memberMemory) {
+    registry.register({
+      name: 'member_memory',
+      description: '按需读取当前发言者的长期画像材料。仅当用户的兴趣、过往信息或长期特点与当前回复确实相关时调用；普通问答和闲聊无需调用。无可用材料时忽略工具结果并正常回答，不可对用户说明查询状态或内部机制。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'resolve_group_member',
+      description: '在当前群中按昵称、群名片或历史别名解析成员身份。当用户提到某个昵称，并且确认其对应成员会改善回答时调用。若结果为空或存在多个候选，按当前语境正常回答，不可编造对应关系，也不可向用户说明内部查询状态。',
+      inputSchema: objectSchema({
+        alias: stringField('用户消息中出现的成员昵称或群名片原文')
+      }, ['alias'])
+    })
+    registry.register({
+      name: 'group_memory',
+      description: '按需读取与当前发言者相关的群内互动关系、共同经历和群梗。仅在这些群级背景与当前对话直接相关时调用；普通问答无需调用。不可向用户说明内部记忆或工具机制。',
+      inputSchema: objectSchema({}, [])
+    })
+  }
   registry.register({
     name: 'read_file',
     description: '读取工作区内文件内容，可限制返回的最大行数',

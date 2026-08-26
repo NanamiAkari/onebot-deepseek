@@ -8,6 +8,7 @@ generated_images/
 poke_replies.json
 custom_replies.json
 scheduled_tasks.json
+memory_data/
 banned.json
 *.log
 
@@ -20,3 +21,9 @@ tests/
 *.test.js
 *.spec.js
 coverage/
+
+# Keep message routing regressions under version control.
+!test/
+!test/message-handler.test.js
+!test/member-memory.test.js
+!test/image-generation-intent.test.js

@@ -10,6 +10,8 @@ const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
 const { createToolExecutor } = require('./src/agent/tool-executor')
 const { createMessageHandler } = require('./src/app/message-handler')
+const { createMemberMemory, previousLocalDate } = require('./src/memory/member-memory')
+const { shouldGenerateImage } = require('./src/image-generation/intent')
 
 const {
   PROJECT_ROOT,
@@ -41,6 +43,7 @@ const {
   AI_SIMPLE_MODE,
   OPENAI_TIMEOUT_MS,
   OPENAI_IMAGE_TIMEOUT_MS,
+  AI_IMAGE_GENERATION_INTENT_THRESHOLD,
   AI_REPLY_MAX_CHARS,
   AI_REPLY_CHUNK_CHARS,
   AI_POKE_ENABLE,
@@ -53,6 +56,20 @@ const {
   AI_CONTEXT_ENABLE,
   AI_CONTEXT_WINDOW,
   AI_CONTEXT_TTL,
+  AI_MEMORY_ENABLE,
+  AI_MEMORY_DIR,
+  AI_MEMORY_RETENTION_DAYS,
+  AI_MEMORY_PROFILE_CACHE_TTL,
+  AI_MEMORY_PROFILE_CACHE_MAX,
+  AI_MEMORY_MESSAGE_MAX_CHARS,
+  AI_MEMORY_DAILY_MAX_MESSAGES,
+  AI_MEMORY_DAILY_MAX_CHARS,
+  AI_MEMORY_GROUP_DAILY_MAX_MESSAGES,
+  AI_MEMORY_GROUP_DAILY_MAX_CHARS,
+  AI_MEMORY_CONTEXT_MAX_CHARS,
+  AI_MEMORY_DEDUPE_TTL,
+  AI_MEMORY_DEDUPE_MAX,
+  AI_MEMORY_SUMMARY_HOUR,
   AI_BAN_DURATION,
   AI_MOD_ENABLE,
   AI_IMAGE_CONTEXT_TTL,
@@ -66,19 +83,35 @@ const {
 } = config
 
 const sessionStore = createSessionStore(config)
-const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory } = sessionStore
-const toolRegistry = createDefaultToolRegistry()
-const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT })
+const memberMemory = createMemberMemory({
+  enabled: AI_MEMORY_ENABLE,
+  rootDir: resolveProjectFile(AI_MEMORY_DIR),
+  retentionDays: AI_MEMORY_RETENTION_DAYS,
+  cacheTtlSeconds: AI_MEMORY_PROFILE_CACHE_TTL,
+  cacheMax: AI_MEMORY_PROFILE_CACHE_MAX,
+  maxMessageChars: AI_MEMORY_MESSAGE_MAX_CHARS,
+  dailyMaxMessages: AI_MEMORY_DAILY_MAX_MESSAGES,
+  dailyMaxChars: AI_MEMORY_DAILY_MAX_CHARS,
+  groupDailyMaxMessages: AI_MEMORY_GROUP_DAILY_MAX_MESSAGES,
+  groupDailyMaxChars: AI_MEMORY_GROUP_DAILY_MAX_CHARS,
+  contextMaxChars: AI_MEMORY_CONTEXT_MAX_CHARS,
+  dedupeTtlSeconds: AI_MEMORY_DEDUPE_TTL,
+  dedupeMax: AI_MEMORY_DEDUPE_MAX
+})
+const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory, cleanup: cleanupSessionStore } = sessionStore
+const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE })
+const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT, memberMemory })
 const agentRunner = createAgentRunner({
   toolRegistry,
   toolExecutor,
-  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
-  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, tools: input.tools, structured: true }),
+  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, structured: true }),
+  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, structured: true }),
   maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 let currentPokeReplyTexts = []
 let imageGenerationInFlight = null
+const pokeReplyViewMessageCache = new Map()
 
 function resolveProjectFile(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
@@ -169,6 +202,87 @@ function pokeReplySignature(item) {
   if (!item || typeof item !== 'object') return ''
   if (item.type === 'image') return `image:${String(item.source || '').trim()}`
   return `text:${String(item.content || '').replace(/\r/g, '').trim()}`
+}
+
+function rememberPokeReplyViewMessage(messageId, index, item) {
+  const key = String(messageId || '').trim()
+  if (!key || !Number.isInteger(index) || index < 1) return
+  const now = Date.now()
+  for (const [cachedKey, cached] of pokeReplyViewMessageCache.entries()) {
+    if (!cached || now - cached.ts > 3600 * 1000) pokeReplyViewMessageCache.delete(cachedKey)
+  }
+  pokeReplyViewMessageCache.set(key, {
+    index,
+    signature: pokeReplySignature(normalizePokeReplyItem(item)),
+    ts: now
+  })
+}
+
+function findPokeReplyIndexByCachedMessageId(items, messageId) {
+  const cached = pokeReplyViewMessageCache.get(String(messageId || '').trim())
+  if (!cached) return -1
+  const list = normalizePokeReplyList(items)
+  const directIndex = cached.index - 1
+  if (directIndex >= 0 && directIndex < list.length && pokeReplySignature(list[directIndex]) === cached.signature) {
+    return directIndex
+  }
+  return list.findIndex((item) => pokeReplySignature(item) === cached.signature)
+}
+
+function rememberPokeReplyMessage(sendResult, item) {
+  const messageId = sendResult && sendResult.data && (sendResult.data.message_id || sendResult.data.messageId)
+  const signature = pokeReplySignature(normalizePokeReplyItem(item))
+  if (!messageId || !signature) return
+  const items = refreshPokeReplyTexts()
+  const index = items.findIndex((existing) => pokeReplySignature(existing) === signature)
+  if (index >= 0) rememberPokeReplyViewMessage(messageId, index + 1, items[index])
+}
+
+function normalizeComparableText(text) {
+  return String(text || '').replace(/\r/g, '').trim()
+}
+
+function normalizeComparableImageSource(source) {
+  let value = String(source || '').trim()
+  if (!value) return ''
+  value = value.replace(/^file:\/+?/i, '')
+  value = decodeURIComponent(value).replace(/\\/g, '/')
+  return value
+}
+
+function imageSourceComparableKeys(source) {
+  const normalized = normalizeComparableImageSource(source)
+  if (!normalized) return []
+  const keys = new Set([normalized])
+  const base = path.basename(normalized)
+  if (base) keys.add(base)
+  return Array.from(keys)
+}
+
+function findPokeReplyIndexByQuotedContent(items, quotedContent) {
+  const list = normalizePokeReplyList(items)
+  const quotedText = normalizeComparableText(quotedContent && quotedContent.text)
+  if (quotedText) {
+    const viewMatch = quotedText.match(/拍一拍文案\s*#(\d+)/)
+    if (viewMatch) {
+      const index = parseInt(viewMatch[1], 10)
+      if (Number.isInteger(index) && index >= 1 && index <= list.length) return index - 1
+    }
+    const textIndex = list.findIndex((item) => item.type === 'text' && normalizeComparableText(item.content) === quotedText)
+    if (textIndex >= 0) return textIndex
+  }
+  const quotedMedia = Array.isArray(quotedContent && quotedContent.media) ? quotedContent.media : []
+  const quotedImageKeys = new Set()
+  for (const media of quotedMedia) {
+    if (!media || media.kind !== 'image') continue
+    const source = pickPokeImageSource(media)
+    for (const key of imageSourceComparableKeys(source)) quotedImageKeys.add(key)
+  }
+  if (quotedImageKeys.size === 0) return -1
+  return list.findIndex((item) => {
+    if (!item || item.type !== 'image') return false
+    return imageSourceComparableKeys(item.source).some((key) => quotedImageKeys.has(key))
+  })
 }
 
 function loadPokeReplyTextsFromFile() {
@@ -630,6 +744,27 @@ function normalizeScheduledTask(task) {
   }
 }
 
+function scheduledTaskSignature(task) {
+  if (!task || typeof task !== 'object') return ''
+  try {
+    return JSON.stringify({
+      id: task.id,
+      groupId: task.groupId,
+      mode: task.mode,
+      weekday: task.weekday,
+      day: task.day,
+      hour: task.hour,
+      minute: task.minute,
+      runAt: task.runAt,
+      nextRunAt: task.nextRunAt,
+      lastRunAt: task.lastRunAt,
+      content: task.content || task.entry
+    })
+  } catch {
+    return ''
+  }
+}
+
 function loadScheduledTaskStore() {
   const filePath = getScheduleFilePath()
   try {
@@ -639,12 +774,30 @@ function loadScheduledTaskStore() {
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
     const out = {}
+    let repaired = false
     for (const [groupId, tasks] of Object.entries(parsed)) {
-      const normalizedTasks = (Array.isArray(tasks) ? tasks : [])
-        .map(normalizeScheduledTask)
-        .filter(Boolean)
-        .filter((task) => task.mode === 'daily' || task.mode === 'weekly' || task.mode === 'monthly' || task.nextRunAt > Date.now() - 60000)
+      const normalizedTasks = []
+      for (const task of Array.isArray(tasks) ? tasks : []) {
+        const before = scheduledTaskSignature(task)
+        const normalized = normalizeScheduledTask(task)
+        if (!normalized) {
+          repaired = true
+          continue
+        }
+        if (!(normalized.mode === 'daily' || normalized.mode === 'weekly' || normalized.mode === 'monthly' || normalized.nextRunAt > Date.now() - 60000)) {
+          repaired = true
+          continue
+        }
+        if (before !== scheduledTaskSignature(normalized)) repaired = true
+        normalizedTasks.push(normalized)
+      }
       if (normalizedTasks.length > 0) out[String(groupId)] = normalizedTasks
+    }
+    if (repaired) {
+      try {
+        fs.writeFileSync(filePath, `${JSON.stringify(out, null, 2)}\n`, 'utf8')
+        console.log('已修复过期或异常定时任务配置')
+      } catch {}
     }
     return out
   } catch {
@@ -820,6 +973,49 @@ setInterval(() => {
   runScheduledTasksTick().catch((err) => console.log('runScheduledTasksTick', err && err.stack ? err.stack : err))
 }, 15000)
 
+let lastMemorySummaryDate = ''
+
+async function runMemberMemoryTick() {
+  if (!AI_MEMORY_ENABLE) return
+  const now = new Date()
+  if (now.getHours() < Math.max(0, Math.min(23, AI_MEMORY_SUMMARY_HOUR))) return
+  const summaryDate = previousLocalDate()
+  if (lastMemorySummaryDate === summaryDate) return
+  const summarizeMemory = async (prompt) => {
+    const summaryOptions = {
+      structured: true,
+      timeoutMs: Math.max(OPENAI_TIMEOUT_MS, 30000),
+      systemPrompt: '你是 QQ 群长期记忆归纳器。严格按照任务中的字段，结合旧记忆和当天消息更新结构化记忆，只输出有效 JSON。'
+    }
+    const response = await callOpenAI(prompt, [], [], summaryOptions)
+    if (response && response.text) return response.text
+    const deepseek = await callDeepseek(prompt, summaryOptions)
+    if (deepseek) return deepseek
+    return await callGemini(prompt, [], summaryOptions) || ''
+  }
+  const memberResult = await memberMemory.summarizeDay(summaryDate, summarizeMemory)
+  const groupResult = await memberMemory.summarizeGroupsDay(summaryDate, summarizeMemory)
+  if (!memberResult.failed && !groupResult.failed) {
+    lastMemorySummaryDate = summaryDate
+    console.log(`记忆总结完成 date=${summaryDate} members=${memberResult.processed} groups=${groupResult.processed}`)
+  } else {
+    console.log(`记忆总结部分失败 date=${summaryDate} memberFailed=${memberResult.failed || 0} groupFailed=${groupResult.failed || 0}`)
+  }
+  memberMemory.cleanupJournals()
+}
+
+const memoryMaintenanceTimer = setInterval(() => {
+  cleanupSessionStore()
+  memberMemory.cleanupCache()
+  runMemberMemoryTick().catch((error) => console.log('成员记忆任务异常', error && error.stack ? error.stack : error))
+}, 300000)
+if (typeof memoryMaintenanceTimer.unref === 'function') memoryMaintenanceTimer.unref()
+setImmediate(() => {
+  cleanupSessionStore()
+  memberMemory.cleanupCache()
+  runMemberMemoryTick().catch((error) => console.log('成员记忆启动检查异常', error && error.stack ? error.stack : error))
+})
+
 function findCustomReplyMatches(groupId, text) {
   const normalizedText = normalizeCustomReplyTrigger(text)
   if (!normalizedText) return []
@@ -876,6 +1072,7 @@ const onMessage = createMessageHandler({
   shouldRespond,
   stripPrefix,
   getContext,
+  memberMemory,
   agentRunner,
   buildReplySegments,
   AI_POKE_ENABLE,
@@ -885,6 +1082,7 @@ const onMessage = createMessageHandler({
   getPokeReplyTexts,
   AI_POKE_ONLY_SELF,
   buildPokeReplyMessageSegments: buildPokeReplyMessageSegmentsAsync,
+  rememberPokeReplyMessage,
   AI_REPLY_CHUNK_CHARS,
   AI_IMAGE_CONTEXT_TTL,
   AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -930,28 +1128,37 @@ function extractContent(message) {
         if (url || file) media.push({ kind: 'image', url, file })
       } else if ((seg.type === 'record' || seg.type === 'audio') && seg.data) {
         const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'audio', url, file: seg.data.file || '' })
+        if (url) media.push({ kind: 'audio', url, file: seg.data.file || '', duration: Number(seg.data.duration || 0) })
       } else if (seg.type === 'video' && seg.data) {
         const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'video', url, file: seg.data.file || '' })
+        if (url) media.push({ kind: 'video', url, file: seg.data.file || '', duration: Number(seg.data.duration || 0) })
       } else if (seg.type === 'face') {
         text += '[表情]'
       } else if (seg.type === 'emoji' && seg.data && seg.data.id) {
         text += `[emoji:${seg.data.id}]`
       } else if (seg.type === 'reply' && seg.data) {
         replyId = String(seg.data.id || seg.data.message_id || '')
+      } else if (seg.type === 'at') {
+        text += ' '
       }
     }
     text = text.trim()
     text = text.replace(/\s*\[CQ:at,qq=\d+\]\s*/g, '')
-    return { text, media, replyId }
+    const forwardIds = message.filter((seg) => seg && seg.type === 'forward' && seg.data && (seg.data.id || seg.data.resid))
+      .map((seg) => String(seg.data.id || seg.data.resid)).slice(0, 3)
+    return { text, media, replyId, forwardIds }
   }
   if (typeof message === 'string') {
-    const t = message.replace(/\[CQ:at,qq=\d+\]/g, '').trim()
+    const t = message
+      .replace(/\[CQ:at,qq=\d+\]/g, '')
+      .replace(/\[CQ:face,[^\]]*\]/g, '[表情]')
+      .replace(/\[CQ:(?:image|record|audio|video|reply|forward),[^\]]*\]/g, '')
+      .trim()
     const cqMedia = parseCQMedia(message)
-    return { text: t, media: cqMedia.length ? cqMedia : media, replyId }
+    const forwardIds = Array.from(message.matchAll(/\[CQ:forward,(?:id|resid)=([^,\]]+)/g)).map((match) => match[1]).slice(0, 3)
+    return { text: t, media: cqMedia.length ? cqMedia : media, replyId, forwardIds }
   }
-  return { text: '', media, replyId }
+  return { text: '', media, replyId, forwardIds: [] }
 }
 
 function checkMention(message, selfId) {
@@ -980,7 +1187,11 @@ function shouldIgnoreText(text) {
 }
 
 function stripPrefix(text) {
-  const t = String(text || '').trim()
+  let t = String(text || '').trim()
+  t = t.replace(/^@?[^\s]+\s+/, (head) => {
+    const label = head.trim().replace(/^@/, '')
+    return PREFIXES.includes(label) ? '' : head
+  }).trim()
   for (const p of PREFIXES) {
     if (t.startsWith(p)) return t.slice(p.length).trim()
   }
@@ -1020,13 +1231,19 @@ function sanitizeText(s) {
   return t.trim()
 }
 
+function requestSystemPrompt(opts) {
+  const base = String(opts && opts.systemPrompt || SYSTEM_PROMPT).trim()
+  const memory = String(opts && opts.memoryContext || '').trim()
+  return memory ? `${base}\n\n${memory}` : base
+}
+
 async function callGemini(text, media, opts) {
   if (!GEMINI_KEY) return null
   try {
     console.log('调用Gemini')
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`
     const prefix = opts && opts.contextImage ? '若下方图片与问题无关，请忽略图片，仅回答文本问题。\n' : ''
-    const parts = [{ text: `${SYSTEM_PROMPT}\n\n${prefix}${text || '你好'}` }]
+    const parts = [{ text: `${requestSystemPrompt(opts)}\n\n${prefix}${text || '你好'}` }]
     if (Array.isArray(media) && media.length > 0) {
       const limited = media.slice(0, AI_IMAGE_CONTEXT_MAX)
       for (const m of limited) {
@@ -1099,7 +1316,7 @@ async function callOpenAI(text, media, hist, opts) {
     }
     const msg = []
     if (!useResponses) {
-      msg.push({ role: 'system', content: SYSTEM_PROMPT })
+      msg.push({ role: 'system', content: requestSystemPrompt(opts) })
       if (Array.isArray(hist) && hist.length > 0) {
         for (const h of hist) {
           msg.push({ role: h.role, content: h.content })
@@ -1122,7 +1339,7 @@ async function callOpenAI(text, media, hist, opts) {
     const buildPayload = (includeTools) => useResponses
       ? {
           model: OPENAI_MODEL,
-          instructions: SYSTEM_PROMPT,
+          instructions: requestSystemPrompt(opts),
           input: responseInput,
           ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
           ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {}),
@@ -1197,6 +1414,11 @@ async function callOpenAI(text, media, hist, opts) {
       }
     }
     console.log('OpenAI失败', status || '', `media=${Array.isArray(media) ? media.length : 0}`, `timeout=${requestTimeout}`, errorMessage, errText.slice(0, 500))
+    if (status === 403 && /Codex official clients|forbidden/i.test(errText)) {
+      const fallback = await callDeepseek(text, opts)
+      if (fallback) return opts && opts.structured ? { text: fallback, toolCalls: [], images: [] } : fallback
+      return opts && opts.structured ? { text: '上游账号被限制：当前 API Key 仅允许 Codex 官方客户端，请更换上游 Key 或模型', toolCalls: [], images: [] } : '上游账号被限制：当前 API Key 仅允许 Codex 官方客户端，请更换上游 Key 或模型'
+    }
     if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [], images: [] } : '上游限流，请稍后再试'
     if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [], images: [] } : '上游鉴权失败，请检查 API Key'
     if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [], images: [] } : '上游网关异常（5xx），请稍后再试'
@@ -1205,7 +1427,7 @@ async function callOpenAI(text, media, hist, opts) {
   }
 }
 
-async function callDeepseek(text) {
+async function callDeepseek(text, opts) {
   if (!DEEPSEEK_KEY) return null
   try {
     console.log('调用DeepSeek')
@@ -1214,7 +1436,7 @@ async function callDeepseek(text) {
       {
         model: DEEPSEEK_MODEL,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: requestSystemPrompt(opts) },
           { role: 'user', content: text || '你好' }
         ]
       },
@@ -1412,13 +1634,6 @@ function detectImageExtFromMime(mime) {
 
 function isImageMime(mime) {
   return typeof mime === 'string' && /^image\//i.test(mime)
-}
-
-function shouldGenerateImage(text) {
-  const value = String(text || '').trim()
-  if (!value) return false
-  return /(文生图|生图|出图|画图|绘图|作图|画一张|生成一张|做一张图|生成图片|生成图像)/i.test(value)
-    || /(生成|画|绘制|做|来|给我|帮我).{0,80}(图|图片|图像|配图|插图|壁纸|头像|表情包|动漫风|二次元|插画)/i.test(value)
 }
 
 function saveGeneratedImage(base64Data, mime = 'image/png') {
@@ -1965,13 +2180,28 @@ async function replyCommandMessage(ws, payload, text) {
     const result = payload.message_type === 'group'
       ? await sendAction(ws, 'send_group_msg', { group_id: payload.group_id, message: msg }).catch(() => null)
       : await sendAction(ws, 'send_private_msg', { user_id: payload.user_id, message: msg }).catch(() => null)
-    if (result && result.status === 'ok') return
+    if (result && result.status === 'ok') return result
   }
+  return null
 }
 
-async function handleImageGenerationRequest(ws, payload, promptText, hist) {
+async function handleImageGenerationRequest(ws, payload, promptText, hist, intentText) {
   const prompt = String(promptText || '').trim()
-  if (!prompt || !shouldGenerateImage(prompt)) return { handled: false }
+  const intentPrompt = String(intentText || promptText || '').trim()
+  if (!prompt) return { handled: false }
+  const generateImage = await shouldGenerateImage(intentPrompt, async (ambiguousPrompt) => {
+    const response = await callOpenAI([
+      '判断下面的用户消息是否明确要求创建一张新图片。只输出JSON：{"generateImage":boolean,"confidence":0到1}。',
+      '查看、分析、识别、描述、翻译已有图片不属于创建新图片。',
+      `用户消息：${ambiguousPrompt}`
+    ].join('\n'), [], [], {
+      structured: true,
+      timeoutMs: Math.min(OPENAI_TIMEOUT_MS, 12000),
+      systemPrompt: '你是图片生成意图分类器，只输出有效JSON。'
+    })
+    return response && response.text ? response.text : ''
+  }, AI_IMAGE_GENERATION_INTENT_THRESHOLD)
+  if (!generateImage) return { handled: false }
   if (imageGenerationInFlight) {
     const elapsed = Math.max(1, Math.round((Date.now() - imageGenerationInFlight.startedAt) / 1000))
     await replyCommandMessage(ws, payload, `现在已经有一张图片在生成中，已等待 ${elapsed} 秒，请稍后再试`)
@@ -2189,20 +2419,20 @@ async function handleCommands(ws, payload, text) {
         const targetItem = normalizePokeReplyItem(items[index - 1])
         if (targetItem && targetItem.type === 'image') {
           await replyCommandMessage(ws, payload, `拍一拍文案 #${index}：[图片回复]`)
-          await replyCommandMessage(ws, payload, await buildPokeReplyMessageSegmentsAsync(targetItem))
+          const imageResult = await replyCommandMessage(ws, payload, await buildPokeReplyMessageSegmentsAsync(targetItem))
+          const messageId = imageResult && imageResult.data && (imageResult.data.message_id || imageResult.data.messageId)
+          rememberPokeReplyViewMessage(messageId, index, targetItem)
           return true
         }
-        await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem, `拍一拍文案 #${index}：\n`))
+        const viewResult = await replyCommandMessage(ws, payload, buildPokeReplyMessageSegments(targetItem, `拍一拍文案 #${index}：\n`))
+        const messageId = viewResult && viewResult.data && (viewResult.data.message_id || viewResult.data.messageId)
+        rememberPokeReplyViewMessage(messageId, index, targetItem)
         return true
       }
-      const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+(.+)/i) || nt.match(/(?:add|replyadd)\s+(.+)/i)
+      const addMatch = nt.match(/(?:回复|文案)\s*(?:添加|增加|新增)(?:\s+(.+))?/i) || nt.match(/(?:add|replyadd)(?:\s+(.+))?/i)
       if (addMatch) {
-        if (!isAdminUser) {
-          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍文案')
-          return true
-        }
-        const rawAddMatch = String(rawCommandText || '').match(/(?:回复|文案)\s*(?:添加|增加|新增)\s+([\s\S]+)/i)
-          || String(rawCommandText || '').match(/(?:add|replyadd)\s+([\s\S]+)/i)
+        const rawAddMatch = String(rawCommandText || '').match(/(?:回复|文案)\s*(?:添加|增加|新增)(?:\s+([\s\S]+))?/i)
+          || String(rawCommandText || '').match(/(?:add|replyadd)(?:\s+([\s\S]+))?/i)
         let content = String((rawAddMatch && rawAddMatch[1]) || addMatch[1] || '').trim()
         if (!content && commandContent.replyId) {
           repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
@@ -2225,10 +2455,6 @@ async function handleCommands(ws, payload, text) {
         || nt.match(/(?:添加图片|加图|加图片)(?:\s+(.+))?/i)
         || nt.match(/(?:imageadd|imgadd|addimage)(?:\s+(.+))?/i)
       if (imageAddMatch) {
-        if (!isAdminUser) {
-          await replyCommandMessage(ws, payload, '需要管理员权限才能添加拍一拍图片回复')
-          return true
-        }
         let imageMedia = (commandMedia || []).find((item) => item && item.kind === 'image')
         if (!imageMedia && commandContent.replyId) {
           repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
@@ -2258,18 +2484,33 @@ async function handleCommands(ws, payload, text) {
         await replyCommandMessage(ws, payload, `已添加拍一拍图片回复 #${saved.length}：[图片回复]\n当前共 ${saved.length} 条`)
         return true
       }
-      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)\s*(\d+)/i) || nt.match(/(?:rm|remove|replyrm)\s+(\d+)/i)
+      const removeMatch = nt.match(/(?:回复|文案)\s*(?:删除|移除|去除)(?:\s*(\d+))?/i)
+        || nt.match(/(?:删图|删除图片|移除图片|去除图片)(?:\s*(\d+))?/i)
+        || nt.match(/(?:rm|remove|replyrm)(?:\s+(\d+))?/i)
       if (removeMatch) {
         if (!isAdminUser) {
           await replyCommandMessage(ws, payload, '需要管理员权限才能删除拍一拍文案')
           return true
         }
-        const index = parseInt(removeMatch[1], 10)
+        const items = refreshPokeReplyTexts()
+        let index = parseInt(removeMatch[1], 10)
         if (!Number.isInteger(index) || index < 1) {
-          await replyCommandMessage(ws, payload, '请提供正确的文案编号，例如：拍一拍 文案删除 3')
+          if (commandContent.replyId) {
+            const cachedIndex = findPokeReplyIndexByCachedMessageId(items, commandContent.replyId)
+            if (cachedIndex >= 0) index = cachedIndex + 1
+          }
+        }
+        if (!Number.isInteger(index) || index < 1) {
+          if (commandContent.replyId) {
+            repliedContent = repliedContent || await getReplyMessageContent(ws, commandContent.replyId)
+            const quotedIndex = findPokeReplyIndexByQuotedContent(items, repliedContent)
+            if (quotedIndex >= 0) index = quotedIndex + 1
+          }
+        }
+        if (!Number.isInteger(index) || index < 1) {
+          await replyCommandMessage(ws, payload, '请提供正确的文案编号，或引用一条机器人发出的拍一拍文案/图片回复')
           return true
         }
-        const items = refreshPokeReplyTexts()
         if (index > items.length) {
           await replyCommandMessage(ws, payload, `未找到编号为 ${index} 的拍一拍文案，当前共 ${items.length} 条`)
           return true

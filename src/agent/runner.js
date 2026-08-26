@@ -47,6 +47,7 @@ function createAgentRunner(deps) {
       media: Array.isArray(input.media) ? input.media : [],
       history: Array.isArray(input.history) ? input.history : [],
       contextImage: Boolean(input.contextImage),
+      memoryContext: String(input.memoryContext || ''),
       session: input.session || null,
       runtime: input.runtime || null,
       toolResults: [],

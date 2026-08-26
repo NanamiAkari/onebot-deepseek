@@ -21,6 +21,7 @@ function createMessageHandler(deps) {
     shouldRespond,
     stripPrefix,
     getContext,
+    memberMemory,
     agentRunner,
     buildReplySegments,
     AI_POKE_ENABLE,
@@ -30,6 +31,7 @@ function createMessageHandler(deps) {
     getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
     buildPokeReplyMessageSegments,
+    rememberPokeReplyMessage,
     AI_REPLY_CHUNK_CHARS,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -106,6 +108,44 @@ function createMessageHandler(deps) {
     return { ok: true, failedIndex: -1, sentTexts }
   }
 
+  function extractMentionedUserIds(message) {
+    if (Array.isArray(message)) {
+      return Array.from(new Set(message
+        .filter((segment) => segment && segment.type === 'at' && segment.data && segment.data.qq)
+        .map((segment) => String(segment.data.qq))))
+    }
+    const ids = []
+    const regex = /\[CQ:at,qq=(\d+)\]/g
+    let match
+    while ((match = regex.exec(String(message || '')))) ids.push(match[1])
+    return Array.from(new Set(ids))
+  }
+
+  async function resolveForwardedRecords(ws, forwardIds) {
+    const records = []
+    let chars = 0
+    for (const forwardId of Array.isArray(forwardIds) ? forwardIds.slice(0, 3) : []) {
+      const response = await sendAction(ws, 'get_forward_msg', { id: forwardId, message_id: forwardId }).catch(() => null)
+      const nodes = response && response.status === 'ok' && response.data
+        ? (response.data.messages || response.data.message || [])
+        : []
+      for (const node of Array.isArray(nodes) ? nodes.slice(0, 50) : []) {
+        if (chars >= 5000) break
+        const nodeMessage = node && (node.content || node.message)
+        const extracted = extractContent(nodeMessage)
+        const text = String(extracted.text || '').slice(0, 5000 - chars)
+        chars += text.length
+        records.push({
+          userId: String(node.user_id || (node.sender && node.sender.user_id) || ''),
+          nickname: String(node.nickname || (node.sender && (node.sender.card || node.sender.nickname)) || '').slice(0, 80),
+          text,
+          mediaTypes: Array.from(new Set((extracted.media || []).map((item) => item.kind))).slice(0, 10)
+        })
+      }
+    }
+    return records
+  }
+
   return async function onMessage(ws, data) {
     try {
       let payload
@@ -146,7 +186,10 @@ function createMessageHandler(deps) {
             const variants = normalizeMessageVariants(built)
             for (const msg of variants) {
               const result = await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => null)
-              if (result && result.status === 'ok') break
+              if (result && result.status === 'ok') {
+                if (typeof rememberPokeReplyMessage === 'function') rememberPokeReplyMessage(result, pokeReply)
+                break
+              }
             }
           } catch {}
         } else {
@@ -157,7 +200,10 @@ function createMessageHandler(deps) {
             const variants = normalizeMessageVariants(built)
             for (const msg of variants) {
               const result = await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg }).catch(() => null)
-              if (result && result.status === 'ok') break
+              if (result && result.status === 'ok') {
+                if (typeof rememberPokeReplyMessage === 'function') rememberPokeReplyMessage(result, pokeReply)
+                break
+              }
             }
           } catch {}
         }
@@ -166,7 +212,14 @@ function createMessageHandler(deps) {
       if (payload.post_type !== 'message') return
       const isGroup = payload.message_type === 'group'
       const raw = extractContent(payload.message)
+      const memoryRelations = { mentionedUserIds: extractMentionedUserIds(payload.message), replyToUserId: '', media: [], forwarded: [] }
       raw.media = await resolveMediaSources(ws, raw.media)
+      memoryRelations.media = (raw.media || []).map((item) => ({
+        kind: String(item.kind || ''),
+        file: String(item.file || '').slice(0, 200),
+        duration: Math.max(0, Number(item.duration || 0))
+      })).filter((item) => item.kind).slice(0, 20)
+      memoryRelations.forwarded = await resolveForwardedRecords(ws, raw.forwardIds)
       const key = getKey(payload)
       let ctxImgUsed = false
       if (raw.media && raw.media.length > 0) {
@@ -201,6 +254,12 @@ function createMessageHandler(deps) {
           }
           if (quotedText) content.quotedText = quotedText
           if (!content.text && quotedText) content.text = quotedText
+          memoryRelations.replyToUserId = String(resp.data.user_id || (resp.data.sender && resp.data.sender.user_id) || '')
+        }
+      }
+      if (memberMemory && typeof memberMemory.recordMessage === 'function') {
+        try { memberMemory.recordMessage(payload, raw.text, memoryRelations) } catch (error) {
+          console.log('成员消息归档失败', error && error.message ? error.message : error)
         }
       }
       const scheduleDraftHandled = await handleScheduleTaskDraftInput(ws, payload).catch(() => false)
@@ -208,7 +267,10 @@ function createMessageHandler(deps) {
       const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
       if (customDraftHandled) return
       const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-      const prefixTriggered = shouldRespond(raw.text)
+      const rawText = String(raw.text || '').trim()
+      const prefixTriggered = shouldRespond(rawText)
+      const addressedByPrefix = prefixTriggered && stripPrefix(rawText) !== rawText
+      const aiExplicitlyTriggered = isGroup && (mentioned || addressedByPrefix)
       const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
         ? hasCustomReplyTrigger(payload.group_id, raw.text)
         : false
@@ -220,8 +282,10 @@ function createMessageHandler(deps) {
       if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
-      const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
-      if (customMatched) return
+      if (!aiExplicitlyTriggered) {
+        const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
+        if (customMatched) return
+      }
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
       if (hasText && shouldIgnoreText(content.text)) return
@@ -229,22 +293,28 @@ function createMessageHandler(deps) {
         if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
         if (!hasMedia) return
       }
-      const wantsReply = isGroup ? shouldRespond(content.text) : hasText
+      const wantsReply = isGroup ? (aiExplicitlyTriggered || shouldRespond(content.text)) : hasText
       if (!wantsReply) return
       const stripped = stripPrefix(content.text || '') || (hasMedia ? '请描述这张图片' : '')
-      const quotedText = String(content.quotedText || '').trim()
-      const modelInput = quotedText && quotedText !== stripped
-        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${stripped || '请结合被引用消息继续回答'}`
+      const conversationText = addressedByPrefix
+        ? (String(content.text || '').trim() || stripped)
         : stripped
+      const quotedText = String(content.quotedText || '').trim()
+      const modelInput = quotedText && quotedText !== conversationText
+        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${conversationText || '请结合被引用消息继续回答'}`
+        : conversationText
       const hist = getContext(payload, modelInput)
+      const memoryContext = memberMemory && typeof memberMemory.buildStyleContext === 'function'
+        ? memberMemory.buildStyleContext(payload)
+        : ''
       if (typeof handleImageGenerationRequest === 'function') {
-        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist).catch((error) => {
+        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist, stripped).catch((error) => {
           const message = error && error.message ? String(error.message) : String(error)
           console.log('生图处理异常', message)
           return { handled: false }
         })
         if (imageGeneration && imageGeneration.handled) {
-          pushHistory(payload, stripped, imageGeneration.deliveredText || '[已处理生图请求]')
+          pushHistory(payload, conversationText, imageGeneration.deliveredText || '[已处理生图请求]')
           return
         }
       }
@@ -253,6 +323,7 @@ function createMessageHandler(deps) {
         media: content.media,
         history: hist,
         contextImage: ctxImgUsed,
+        memoryContext,
         runtime: { ws, payload },
         session: {
           key,
@@ -301,7 +372,7 @@ function createMessageHandler(deps) {
         }
       }
       const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
-      pushHistory(payload, stripped, deliveredText)
+      pushHistory(payload, conversationText, deliveredText)
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)

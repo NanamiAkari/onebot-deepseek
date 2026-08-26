@@ -50,6 +50,30 @@ function createSessionStore(config) {
     sessionHist.delete(k)
   }
 
+  function trimMap(map, max) {
+    while (map.size > max) map.delete(map.keys().next().value)
+  }
+
+  function cleanup(now = Date.now()) {
+    const historyTtl = Math.max(60, Number(config.AI_CONTEXT_TTL || 900)) * 1000
+    for (const [key, entries] of sessionHist.entries()) {
+      const active = (entries || []).filter((item) => item && now - item.ts <= historyTtl)
+      if (active.length) sessionHist.set(key, active)
+      else sessionHist.delete(key)
+    }
+    for (const [key, item] of mediaCache.entries()) {
+      if (!item || now - item.ts > Math.max(60, Number(config.AI_IMAGE_CONTEXT_TTL || 60)) * 1000) mediaCache.delete(key)
+    }
+    for (const [key, timestamp] of pokeCooldown.entries()) {
+      if (now - Number(timestamp || 0) > 3600000) pokeCooldown.delete(key)
+    }
+    const max = Math.max(100, Number(config.AI_RUNTIME_CACHE_MAX || 1000))
+    trimMap(sessionHist, max)
+    trimMap(mediaCache, max)
+    trimMap(roleCache, max)
+    trimMap(pokeCooldown, max)
+  }
+
   return {
     pending,
     pokeCooldown,
@@ -62,7 +86,8 @@ function createSessionStore(config) {
     getHistoryRaw,
     needContext,
     getContext,
-    clearHistory
+    clearHistory,
+    cleanup
   }
 }
 

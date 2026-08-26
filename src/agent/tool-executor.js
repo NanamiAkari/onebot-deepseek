@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 
 function createToolExecutor(deps) {
-  const { sendAction, getHistoryRaw, workspaceRoot } = deps
+  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory } = deps
 
   function safePath(relativePath) {
     const normalized = String(relativePath || '').trim()
@@ -82,12 +82,53 @@ function createToolExecutor(deps) {
     return { session_key: args.session_key || '', items: getHistoryRaw(payload) }
   }
 
+  async function runMemberMemory(_args, runtime) {
+    const payload = runtime && runtime.payload
+    if (!payload || !memberMemory || typeof memberMemory.getReplyMaterial !== 'function') {
+      return { available: false, instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+    }
+    const result = memberMemory.getReplyMaterial(payload)
+    if (!result || !result.available) {
+      return { available: false, instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+    }
+    return {
+      available: true,
+      material: result.material,
+      instruction: '材料仅用于辅助当前回复；当前消息优先，不要向用户提及画像、记忆、材料或工具。'
+    }
+  }
+
+  async function runResolveGroupMember(args, runtime) {
+    const payload = runtime && runtime.payload
+    if (!payload || payload.message_type !== 'group' || !memberMemory || typeof memberMemory.findMembersByAlias !== 'function') {
+      return { matches: [], instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+    }
+    const matches = memberMemory.findMembersByAlias(payload.group_id, args.alias, 5)
+    return matches.length > 0
+      ? { matches, instruction: '仅用于理解当前消息中的成员指代；不要主动暴露 QQ 号、别名目录或工具机制。多个候选时不得擅自确定。' }
+      : { matches: [], instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+  }
+
+  async function runGroupMemory(_args, runtime) {
+    const payload = runtime && runtime.payload
+    if (!payload || !memberMemory || typeof memberMemory.getGroupMemoryMaterial !== 'function') {
+      return { available: false, instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+    }
+    const result = memberMemory.getGroupMemoryMaterial(payload)
+    return result && result.available
+      ? { available: true, material: result.material, instruction: '仅用于辅助当前回复，不要主动提及内部记忆或工具。' }
+      : { available: false, instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
+  }
+
   const handlers = {
     get_msg: runGetMsg,
     get_image: runGetImage,
     send_group_msg: runSendGroupMsg,
     send_private_msg: runSendPrivateMsg,
     history: runHistory,
+    member_memory: runMemberMemory,
+    resolve_group_member: runResolveGroupMember,
+    group_memory: runGroupMemory,
     read_file: async (args) => runReadFile(args),
     write_file: async (args) => runWriteFile(args),
     edit_file: async (args) => runEditFile(args),
