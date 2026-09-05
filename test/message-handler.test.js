@@ -88,7 +88,8 @@ test('AI prefix takes priority when the message contains a custom reply keyword'
   await harness.run()
   assert.equal(harness.calls.custom, 0)
   assert.equal(harness.calls.ai, 1)
-  assert.equal(harness.calls.modelMessages[0], '阿卡林 测试关键词是什么意思')
+  assert.match(harness.calls.modelMessages[0], /用户原话：阿卡林 测试关键词是什么意思/)
+  assert.match(harness.calls.modelMessages[0], /实际话题：测试关键词是什么意思/)
 })
 
 test('keeps the AI trigger name as part of quoted conversation input', async () => {
@@ -99,7 +100,16 @@ test('keeps the AI trigger name as part of quoted conversation input', async () 
     quotedMessage: { user_id: 20, message: [{ type: 'text', data: { text: '前面的内容' } }] }
   })
   await harness.run()
-  assert.match(harness.calls.modelMessages[0], /当前消息：\n阿卡林 你觉得呢/)
+  assert.match(harness.calls.modelMessages[0], /当前消息：\n用户原话：阿卡林 你觉得呢/)
+  assert.match(harness.calls.modelMessages[0], /实际话题：你觉得呢/)
+})
+
+test('separates the AI trigger name from a following member nickname', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林灯灯今天怎么了' } }])
+  await harness.run()
+  assert.match(harness.calls.modelMessages[0], /用户原话：阿卡林灯灯今天怎么了/)
+  assert.match(harness.calls.modelMessages[0], /句首“阿卡林”是用户对你的称呼/)
+  assert.match(harness.calls.modelMessages[0], /实际话题：灯灯今天怎么了/)
 })
 
 test('plain custom reply keyword still uses the custom reply', async () => {

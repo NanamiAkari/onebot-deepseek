@@ -69,6 +69,8 @@ const {
   AI_MEMORY_CONTEXT_MAX_CHARS,
   AI_MEMORY_DEDUPE_TTL,
   AI_MEMORY_DEDUPE_MAX,
+  AI_MEMORY_RETRY_BASE_SECONDS,
+  AI_MEMORY_MAX_RETRIES,
   AI_MEMORY_SUMMARY_HOUR,
   AI_BAN_DURATION,
   AI_MOD_ENABLE,
@@ -96,7 +98,9 @@ const memberMemory = createMemberMemory({
   groupDailyMaxChars: AI_MEMORY_GROUP_DAILY_MAX_CHARS,
   contextMaxChars: AI_MEMORY_CONTEXT_MAX_CHARS,
   dedupeTtlSeconds: AI_MEMORY_DEDUPE_TTL,
-  dedupeMax: AI_MEMORY_DEDUPE_MAX
+  dedupeMax: AI_MEMORY_DEDUPE_MAX,
+  retryBaseSeconds: AI_MEMORY_RETRY_BASE_SECONDS,
+  maxRetries: AI_MEMORY_MAX_RETRIES
 })
 const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory, cleanup: cleanupSessionStore } = sessionStore
 const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE })

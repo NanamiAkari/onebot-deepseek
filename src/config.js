@@ -109,6 +109,8 @@ module.exports = {
   AI_MEMORY_CONTEXT_MAX_CHARS: parseInt(process.env.AI_MEMORY_CONTEXT_MAX_CHARS || '1200', 10),
   AI_MEMORY_DEDUPE_TTL: parseInt(process.env.AI_MEMORY_DEDUPE_TTL || '3600', 10),
   AI_MEMORY_DEDUPE_MAX: parseInt(process.env.AI_MEMORY_DEDUPE_MAX || '5000', 10),
+  AI_MEMORY_RETRY_BASE_SECONDS: parseInt(process.env.AI_MEMORY_RETRY_BASE_SECONDS || '3600', 10),
+  AI_MEMORY_MAX_RETRIES: parseInt(process.env.AI_MEMORY_MAX_RETRIES || '3', 10),
   AI_MEMORY_SUMMARY_HOUR: parseInt(process.env.AI_MEMORY_SUMMARY_HOUR || '4', 10),
   AI_BAN_DURATION: parseInt(process.env.AI_BAN_DURATION || '600', 10),
   AI_MOD_ENABLE: String(process.env.AI_MOD_ENABLE || 'true').toLowerCase() === 'true',

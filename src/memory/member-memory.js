@@ -157,9 +157,12 @@ function createMemberMemory(options = {}) {
   const contextMaxChars = Math.max(200, Number(options.contextMaxChars || 1200))
   const dedupeTtlMs = Math.max(60, Number(options.dedupeTtlSeconds || 3600)) * 1000
   const dedupeMax = Math.max(100, Number(options.dedupeMax || 5000))
+  const retryBaseMs = Math.max(60, Number(options.retryBaseSeconds || 3600)) * 1000
+  const maxRetries = Math.max(1, Number(options.maxRetries || 3))
   const profileCache = new Map()
   const recentMessageIds = new Map()
   const memberCache = new Map()
+  const aliasIndexCache = new Map()
   let dailyJobRunning = false
 
   if (enabled) {
@@ -182,6 +185,23 @@ function createMemberMemory(options = {}) {
     return path.join(groupDir, `${safeId(groupId)}.json`)
   }
 
+  function retryStatePath(date, key) { return path.join(rootDir, 'jobs', date, `${key}.retry.json`) }
+  function readRetryState(date, key) {
+    try { return JSON.parse(fs.readFileSync(retryStatePath(date, key), 'utf8')) } catch { return { attempts: 0, nextRetryAt: 0 } }
+  }
+  function canRetry(date, key) {
+    const state = readRetryState(date, key)
+    return state.attempts < maxRetries && Date.now() >= Number(state.nextRetryAt || 0)
+  }
+  function recordRetryFailure(date, key) {
+    const attempts = readRetryState(date, key).attempts + 1
+    const nextRetryAt = Date.now() + retryBaseMs * Math.pow(2, attempts - 1)
+    const filePath = retryStatePath(date, key)
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, `${JSON.stringify({ attempts, nextRetryAt, lastFailedAt: Date.now() }, null, 2)}\n`, 'utf8')
+  }
+  function clearRetryFailure(date, key) { try { fs.rmSync(retryStatePath(date, key), { force: true }) } catch {} }
+
   function cacheKey(groupId, userId) {
     return `${groupId}:${userId}`
   }
@@ -202,6 +222,9 @@ function createMemberMemory(options = {}) {
     }
     for (const [key, item] of memberCache.entries()) {
       if (!item || item.expiresAt <= now) memberCache.delete(key)
+    }
+    for (const [key, item] of aliasIndexCache.entries()) {
+      if (!item || item.expiresAt <= now) aliasIndexCache.delete(key)
     }
   }
 
@@ -251,6 +274,7 @@ function createMemberMemory(options = {}) {
     fs.renameSync(tempPath, filePath)
     const key = cacheKey(groupId, userId)
     memberCache.set(key, { value, expiresAt: Date.now() + cacheTtlMs })
+    aliasIndexCache.delete(groupId)
     while (memberCache.size > cacheMax) memberCache.delete(memberCache.keys().next().value)
   }
 
@@ -498,6 +522,7 @@ function createMemberMemory(options = {}) {
     const tempPath = `${filePath}.${process.pid}.tmp`
     fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
     fs.renameSync(tempPath, filePath)
+    aliasIndexCache.delete(String(value.groupId))
     return true
   }
 
@@ -542,6 +567,8 @@ function createMemberMemory(options = {}) {
     for (const group of groups) {
       const markerPath = path.join(rootDir, 'jobs', date, `group_${group.name}.done`)
       if (fs.existsSync(markerPath)) continue
+      const retryKey = `group_${group.name}`
+      if (!canRetry(date, retryKey)) { failed += 1; continue }
       try {
         const messages = await collectGroupDay(date, group.name)
         if (!messages.length) continue
@@ -560,8 +587,10 @@ function createMemberMemory(options = {}) {
         saveGroupMemory(normalizeGroupMemory(parsed, groupId, date, allowedUserIds))
         fs.mkdirSync(path.dirname(markerPath), { recursive: true })
         fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`, 'utf8')
+        clearRetryFailure(date, retryKey)
         processed += 1
       } catch {
+        recordRetryFailure(date, retryKey)
         failed += 1
       }
     }
@@ -580,6 +609,8 @@ function createMemberMemory(options = {}) {
         if (member.messages.length === 0) continue
         const memberMarker = path.join(rootDir, 'jobs', date, `${safeId(member.groupId)}_${safeId(member.userId)}.done`)
         if (fs.existsSync(memberMarker)) continue
+        const retryKey = `${safeId(member.groupId)}_${safeId(member.userId)}`
+        if (!canRetry(date, retryKey)) { failed += 1; continue }
         try {
           const previous = getProfile(member.groupId, member.userId)
           const output = await summarize(buildSummaryPrompt(member, previous), member)
@@ -598,8 +629,10 @@ function createMemberMemory(options = {}) {
           saveProfile(mergeProfile(previous, parsed, fallback, date, (member.interactions || []).length))
           fs.mkdirSync(path.dirname(memberMarker), { recursive: true })
           fs.writeFileSync(memberMarker, `${new Date().toISOString()}\n`, 'utf8')
+          clearRetryFailure(date, retryKey)
           processed += 1
         } catch (error) {
+          recordRetryFailure(date, retryKey)
           failed += 1
         }
       }
@@ -710,6 +743,79 @@ function createMemberMemory(options = {}) {
     return matches.sort((a, b) => b.confidence - a.confidence || (a.match === b.match ? 0 : a.match === 'exact' ? -1 : 1)).slice(0, Math.max(1, limit))
   }
 
+  function buildAliasIndex(groupId) {
+    const groupKey = String(groupId || '')
+    const cached = aliasIndexCache.get(groupKey)
+    if (cached && cached.expiresAt > Date.now()) return cached.items
+    const byAlias = new Map()
+    const add = (alias, member) => {
+      const name = String(alias || '').trim()
+      if (name.length < 2 || name.length > 80) return
+      const normalized = name.toLowerCase()
+      const entries = byAlias.get(normalized) || []
+      if (!entries.some((item) => item.userId === member.userId)) entries.push({ ...member, alias: name })
+      byAlias.set(normalized, entries)
+    }
+    const dir = path.join(memberDir, safeId(groupId))
+    let files = []
+    try { files = fs.readdirSync(dir).filter((name) => name.endsWith('.json')) } catch {}
+    for (const file of files) {
+      let member
+      try { member = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) } catch { continue }
+      const base = { userId: String(member.userId || ''), currentName: String(member.currentName || ''), source: 'directory', confidence: 1 }
+      for (const alias of [...(member.aliases || []), ...(member.titles || [])]) add(alias, base)
+    }
+    const groupMemory = readGroupMemory(groupId)
+    for (const item of groupMemory && Array.isArray(groupMemory.inferredAliases) ? groupMemory.inferredAliases : []) {
+      const confidence = confidenceWithDecay(item.confidence, item.lastConfirmedDate)
+      if (confidence < 0.6) continue
+      const member = readMember(groupId, item.targetUserId) || {}
+      add(item.alias, {
+        userId: String(item.targetUserId || ''),
+        currentName: String(member.currentName || ''),
+        source: 'inferred',
+        confidence
+      })
+    }
+    const items = Array.from(byAlias.entries()).map(([normalized, matches]) => ({ normalized, matches }))
+      .sort((a, b) => b.normalized.length - a.normalized.length)
+    aliasIndexCache.set(groupKey, { items, expiresAt: Date.now() + cacheTtlMs })
+    while (aliasIndexCache.size > Math.max(10, Math.min(cacheMax, 200))) aliasIndexCache.delete(aliasIndexCache.keys().next().value)
+    return items
+  }
+
+  function resolveAliasesInText(groupId, text, limit = 8) {
+    if (!enabled || !groupId) return []
+    const value = String(text || '').trim().toLowerCase()
+    if (!value) return []
+    const resolved = []
+    const seenSpans = []
+    for (const item of buildAliasIndex(groupId)) {
+      const position = value.indexOf(item.normalized)
+      if (position < 0) continue
+      const end = position + item.normalized.length
+      if (seenSpans.some((span) => position >= span.start && end <= span.end)) continue
+      seenSpans.push({ start: position, end })
+      resolved.push({ alias: item.matches[0].alias, matches: item.matches.slice(0, 5) })
+      if (resolved.length >= Math.max(1, limit)) break
+    }
+    return resolved
+  }
+
+  function buildIdentityContext(payload, text) {
+    if (!enabled || !payload || payload.message_type !== 'group') return ''
+    const resolved = resolveAliasesInText(payload.group_id, text)
+    if (!resolved.length) return ''
+    const lines = resolved.map((item) => {
+      if (item.matches.length === 1) {
+        const match = item.matches[0]
+        return `“${item.alias}”指当前群成员 ${match.currentName || item.alias}（内部QQ标识：${match.userId}）`
+      }
+      return `“${item.alias}”存在多个候选：${item.matches.map((match) => `${match.currentName || item.alias}(${match.userId})`).join('、')}，不要擅自确定`
+    })
+    return `当前消息中的群成员指代参考（仅用于理解称呼，不要主动展示QQ号或说明查询机制）：\n${lines.join('\n')}`.slice(0, contextMaxChars)
+  }
+
   function getGroupMemoryMaterial(payload) {
     if (!enabled || !payload || payload.message_type !== 'group') return { available: false, material: '' }
     const memory = readGroupMemory(payload.group_id)
@@ -724,7 +830,7 @@ function createMemberMemory(options = {}) {
     return { available: true, material: lines.join('\n').slice(0, contextMaxChars) }
   }
 
-  return { recordMessage, getProfile, saveProfile, buildStyleContext, getReplyMaterial, getGroupMemoryMaterial, findMembersByAlias, summarizeDay, summarizeGroupsDay, cleanupCache, cleanupJournals, collectDay, cacheSize: () => profileCache.size + memberCache.size }
+  return { recordMessage, getProfile, saveProfile, buildStyleContext, buildIdentityContext, getReplyMaterial, getGroupMemoryMaterial, findMembersByAlias, resolveAliasesInText, summarizeDay, summarizeGroupsDay, cleanupCache, cleanupJournals, collectDay, cacheSize: () => profileCache.size + memberCache.size + aliasIndexCache.size }
 }
 
 module.exports = { createMemberMemory, localDate, previousLocalDate, normalizeProfile }

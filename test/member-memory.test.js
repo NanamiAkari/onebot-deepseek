@@ -64,6 +64,9 @@ test('maps current and historical nicknames to the same QQ member within a group
   assert.equal(fixture.memory.findMembersByAlias(10, '新群名片')[0].userId, '20')
   assert.equal(fixture.memory.findMembersByAlias(10, 'QQ昵称')[0].userId, '20')
   assert.equal(fixture.memory.findMembersByAlias(10, '音游高手')[0].userId, '20')
+  const identityContext = fixture.memory.buildIdentityContext({ message_type: 'group', group_id: 10 }, '听说新群名片今天又迟到了')
+  assert.match(identityContext, /“新群名片”指当前群成员 新群名片/)
+  assert.match(identityContext, /内部QQ标识：20/)
   assert.deepEqual(fixture.memory.findMembersByAlias(11, '新群名片'), [])
 })
 
@@ -80,6 +83,7 @@ test('group summary infers conversational aliases from structured interaction ev
     message_type: 'group', group_id: 10, user_id: 21, self_id: 99, message_id: 101,
     time: Math.floor(timestamp / 1000), sender: { card: '小红' }
   }, '牢明你说得对，顺便问一下潜水员', { mentionedUserIds: ['20', '22'], replyToUserId: '20' })
+  assert.deepEqual(fixture.memory.resolveAliasesInText(10, '牢明今天来了'), [])
   let receivedPrompt = ''
   const result = await fixture.memory.summarizeGroupsDay(date, async (prompt) => {
     receivedPrompt = prompt
@@ -99,6 +103,7 @@ test('group summary infers conversational aliases from structured interaction ev
   assert.equal(alias.userId, '20')
   assert.equal(alias.source, 'inferred')
   assert.equal(fixture.memory.findMembersByAlias(10, '潜水员')[0].userId, '22')
+  assert.equal(fixture.memory.resolveAliasesInText(10, '牢明今天来了')[0].matches[0].userId, '20')
   const groupMaterial = fixture.memory.getGroupMemoryMaterial({ message_type: 'group', group_id: 10, user_id: 20 })
   assert.equal(groupMaterial.available, true)
   assert.match(groupMaterial.material, /友好接话/)
@@ -140,6 +145,8 @@ test('one failed member does not block others and successful members are not sum
   const first = await fixture.memory.summarizeDay(date, summarize)
   assert.equal(first.processed, 1)
   assert.equal(first.failed, 1)
+  const retryPath = path.join(fixture.rootDir, 'jobs', date, '10_20.retry.json')
+  fs.writeFileSync(retryPath, JSON.stringify({ attempts: 1, nextRetryAt: 0 }), 'utf8')
   const second = await fixture.memory.summarizeDay(date, summarize)
   assert.equal(second.processed, 1)
   assert.equal(second.failed, 0)

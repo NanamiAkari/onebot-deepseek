@@ -121,6 +121,17 @@ function createMessageHandler(deps) {
     return Array.from(new Set(ids))
   }
 
+  function formatConversationText(originalText, strippedText, addressedByPrefix) {
+    const original = String(originalText || '').trim()
+    const actual = String(strippedText || '').trim()
+    if (!addressedByPrefix || !original) return actual
+    return [
+      `用户原话：${original}`,
+      '语义说明：句首“阿卡林”是用户对你的称呼和AI触发词，不默认充当后续内容的主语，也不要与紧随其后的成员昵称连成一个名字。',
+      `实际话题：${actual || '用户只是在称呼你'}`
+    ].join('\n')
+  }
+
   async function resolveForwardedRecords(ws, forwardIds) {
     const records = []
     let chars = 0
@@ -296,9 +307,10 @@ function createMessageHandler(deps) {
       const wantsReply = isGroup ? (aiExplicitlyTriggered || shouldRespond(content.text)) : hasText
       if (!wantsReply) return
       const stripped = stripPrefix(content.text || '') || (hasMedia ? '请描述这张图片' : '')
-      const conversationText = addressedByPrefix
+      const originalConversationText = addressedByPrefix
         ? (String(content.text || '').trim() || stripped)
         : stripped
+      const conversationText = formatConversationText(originalConversationText, stripped, addressedByPrefix)
       const quotedText = String(content.quotedText || '').trim()
       const modelInput = quotedText && quotedText !== conversationText
         ? `被引用消息：\n${quotedText}\n\n当前消息：\n${conversationText || '请结合被引用消息继续回答'}`
@@ -307,6 +319,10 @@ function createMessageHandler(deps) {
       const memoryContext = memberMemory && typeof memberMemory.buildStyleContext === 'function'
         ? memberMemory.buildStyleContext(payload)
         : ''
+      const identityContext = memberMemory && typeof memberMemory.buildIdentityContext === 'function'
+        ? memberMemory.buildIdentityContext(payload, stripped)
+        : ''
+      const combinedMemoryContext = [memoryContext, identityContext].filter(Boolean).join('\n\n')
       if (typeof handleImageGenerationRequest === 'function') {
         const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist, stripped).catch((error) => {
           const message = error && error.message ? String(error.message) : String(error)
@@ -314,7 +330,7 @@ function createMessageHandler(deps) {
           return { handled: false }
         })
         if (imageGeneration && imageGeneration.handled) {
-          pushHistory(payload, conversationText, imageGeneration.deliveredText || '[已处理生图请求]')
+          pushHistory(payload, originalConversationText, imageGeneration.deliveredText || '[已处理生图请求]')
           return
         }
       }
@@ -323,7 +339,7 @@ function createMessageHandler(deps) {
         media: content.media,
         history: hist,
         contextImage: ctxImgUsed,
-        memoryContext,
+        memoryContext: combinedMemoryContext,
         runtime: { ws, payload },
         session: {
           key,
@@ -372,7 +388,7 @@ function createMessageHandler(deps) {
         }
       }
       const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
-      pushHistory(payload, conversationText, deliveredText)
+      pushHistory(payload, originalConversationText, deliveredText)
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)
