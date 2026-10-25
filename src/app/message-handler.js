@@ -5,6 +5,8 @@ function createMessageHandler(deps) {
     mediaCache,
     getKey,
     pushHistory,
+    recordGroupMessage,
+    getRecentGroupContext,
     sendAction,
     extractContent,
     resolveMediaSources,
@@ -23,6 +25,7 @@ function createMessageHandler(deps) {
     getContext,
     memberMemory,
     agentRunner,
+    aiRequestQueue,
     buildReplySegments,
     AI_POKE_ENABLE,
     AI_POKE_COOLDOWN,
@@ -42,6 +45,10 @@ function createMessageHandler(deps) {
     AI_IMAGE_ONLY_NO_CALL
   } = deps
   let sendGroupPokeSupported = true
+  const handledMessageIds = new Map()
+  const handledMessageTtlMs = 10 * 60 * 1000
+  const handledMessageMax = 2000
+  const queueNoticeTimes = new Map()
 
   function normalizePokeReplyItem(item) {
     if (typeof item === 'string') {
@@ -98,7 +105,13 @@ function createMessageHandler(deps) {
       const params = action === 'send_group_msg'
         ? { group_id: payload.group_id, message: messageSegments }
         : { user_id: payload.user_id, message: messageSegments }
-      const sendResult = await sendAction(ws, action, params).catch(() => null)
+      let sendResult
+      try {
+        sendResult = await sendAction(ws, action, params)
+      } catch (error) {
+        if (error && error.message === 'timeout') return { ok: false, uncertain: true, failedIndex: index, sentTexts }
+        return { ok: false, uncertain: false, failedIndex: index, sentTexts }
+      }
       if (!(sendResult && sendResult.status === 'ok')) {
         return { ok: false, failedIndex: index, sentTexts }
       }
@@ -221,8 +234,22 @@ function createMessageHandler(deps) {
         return
       }
       if (payload.post_type !== 'message') return
+      if (payload.self_id && String(payload.user_id) === String(payload.self_id)) return
+      const incomingMessageId = String(payload.message_id || payload.messageId || '')
+      if (incomingMessageId) {
+        const now = Date.now()
+        for (const [key, expiresAt] of handledMessageIds.entries()) {
+          if (expiresAt <= now) handledMessageIds.delete(key)
+        }
+        const eventKey = `${payload.message_type || ''}:${payload.group_id || payload.user_id || ''}:${incomingMessageId}`
+        if (handledMessageIds.has(eventKey)) return
+        handledMessageIds.set(eventKey, now + handledMessageTtlMs)
+        while (handledMessageIds.size > handledMessageMax) handledMessageIds.delete(handledMessageIds.keys().next().value)
+      }
       const isGroup = payload.message_type === 'group'
       const raw = extractContent(payload.message)
+      const originalText = raw.text
+      if (typeof recordGroupMessage === 'function') recordGroupMessage(payload, raw.text)
       const memoryRelations = { mentionedUserIds: extractMentionedUserIds(payload.message), replyToUserId: '', media: [], forwarded: [] }
       raw.media = await resolveMediaSources(ws, raw.media)
       memoryRelations.media = (raw.media || []).map((item) => ({
@@ -264,12 +291,11 @@ function createMessageHandler(deps) {
             content.media = merged
           }
           if (quotedText) content.quotedText = quotedText
-          if (!content.text && quotedText) content.text = quotedText
           memoryRelations.replyToUserId = String(resp.data.user_id || (resp.data.sender && resp.data.sender.user_id) || '')
         }
       }
       if (memberMemory && typeof memberMemory.recordMessage === 'function') {
-        try { memberMemory.recordMessage(payload, raw.text, memoryRelations) } catch (error) {
+        try { memberMemory.recordMessage(payload, originalText, memoryRelations) } catch (error) {
           console.log('成员消息归档失败', error && error.message ? error.message : error)
         }
       }
@@ -315,14 +341,30 @@ function createMessageHandler(deps) {
       const modelInput = quotedText && quotedText !== conversationText
         ? `被引用消息：\n${quotedText}\n\n当前消息：\n${conversationText || '请结合被引用消息继续回答'}`
         : conversationText
-      const hist = getContext(payload, modelInput)
+      const reply = async () => {
+      if (typeof ws.readyState === 'number' && ws.readyState !== 1) return
+      // Context is read when the queued turn starts, after the previous reply is saved.
+      const hist = getContext(payload, stripped)
+      const adjacentContext = typeof getRecentGroupContext === 'function'
+        ? getRecentGroupContext(payload, stripped)
+        : []
+      const combinedHistory = hist
       const memoryContext = memberMemory && typeof memberMemory.buildStyleContext === 'function'
         ? memberMemory.buildStyleContext(payload)
         : ''
       const identityContext = memberMemory && typeof memberMemory.buildIdentityContext === 'function'
         ? memberMemory.buildIdentityContext(payload, stripped)
         : ''
-      const combinedMemoryContext = [memoryContext, identityContext].filter(Boolean).join('\n\n')
+      const adjacentText = adjacentContext.length
+        ? adjacentContext.map((item) => String(item.content || '')).join('\n')
+        : ''
+      const promptParts = []
+      if (identityContext) promptParts.push(`【记忆中的确定身份】\n${identityContext}`)
+      if (adjacentText) promptParts.push(`【相邻群聊】\n${adjacentText}`)
+      if (quotedText) promptParts.push(`【引用消息】\n${quotedText}`)
+      promptParts.push(`【当前消息】\n${conversationText}`)
+      const modelMessage = promptParts.join('\n\n')
+      const combinedMemoryContext = memoryContext
       if (typeof handleImageGenerationRequest === 'function') {
         const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist, stripped).catch((error) => {
           const message = error && error.message ? String(error.message) : String(error)
@@ -335,9 +377,9 @@ function createMessageHandler(deps) {
         }
       }
       const result = await agentRunner.run({
-        message: modelInput,
+        message: modelMessage,
         media: content.media,
-        history: hist,
+        history: combinedHistory,
         contextImage: ctxImgUsed,
         memoryContext: combinedMemoryContext,
         runtime: { ws, payload },
@@ -356,6 +398,11 @@ function createMessageHandler(deps) {
       const firstAttempt = await sendReplyBatches(ws, action, payload, messageBatches)
       sentTexts.push(...firstAttempt.sentTexts)
       if (!firstAttempt.ok) {
+        if (firstAttempt.uncertain) {
+          console.log(`AI回复发送状态未知，停止重发以避免重复发送 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
+          pushHistory(payload, originalConversationText, sentTexts.join('\n').trim() || String(aiText || '').trim())
+          return
+        }
         console.log(`AI回复发送失败，尝试去掉引用重发 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
         const remainingText = extractRemainingText(messageBatches, firstAttempt.failedIndex)
         if (remainingText) {
@@ -367,6 +414,11 @@ function createMessageHandler(deps) {
           const secondAttempt = await sendReplyBatches(ws, action, payload, retryBatches)
           sentTexts.push(...secondAttempt.sentTexts)
           if (!secondAttempt.ok) {
+            if (secondAttempt.uncertain) {
+              console.log(`AI回复重发状态未知，停止继续重发以避免重复发送 index=${secondAttempt.failedIndex + 1}/${retryBatches.length}`)
+              pushHistory(payload, originalConversationText, sentTexts.join('\n').trim() || String(aiText || '').trim())
+              return
+            }
             const fallbackText = extractRemainingText(retryBatches, secondAttempt.failedIndex)
             const smallerChunkChars = Math.max(250, Math.min(AI_REPLY_CHUNK_CHARS - 1, Math.floor(AI_REPLY_CHUNK_CHARS * 0.6)))
             console.log(`AI回复发送失败，尝试更小分段重发 chunk=${smallerChunkChars}`)
@@ -389,6 +441,24 @@ function createMessageHandler(deps) {
       }
       const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
       pushHistory(payload, originalConversationText, deliveredText)
+      }
+      try {
+        if (aiRequestQueue) await aiRequestQueue.enqueue(key, reply)
+        else await reply()
+      } catch (error) {
+        if (!error || !['QUEUE_FULL', 'QUEUE_EXPIRED', 'QUEUE_CLOSED'].includes(error.code)) throw error
+        if (error.code === 'QUEUE_CLOSED' || (typeof ws.readyState === 'number' && ws.readyState !== 1)) return
+        const now = Date.now()
+        const last = queueNoticeTimes.get(key)
+        if (last !== undefined && now - last < 30000) return
+        queueNoticeTimes.delete(key)
+        queueNoticeTimes.set(key, now)
+        while (queueNoticeTimes.size > 1000) queueNoticeTimes.delete(queueNoticeTimes.keys().next().value)
+        const text = error.code === 'QUEUE_EXPIRED'
+          ? '这条请求等待太久了，请稍后重新发送。'
+          : '现在等待回复的请求有点多，请稍后再试。'
+        await sendReplyBatches(ws, isGroup ? 'send_group_msg' : 'send_private_msg', payload, buildReplySegments(payload.message_id, text))
+      }
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)

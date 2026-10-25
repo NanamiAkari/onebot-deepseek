@@ -9,6 +9,7 @@ poke_replies.json
 custom_replies.json
 scheduled_tasks.json
 memory_data/
+tool_workspace/
 banned.json
 *.log
 
@@ -27,3 +28,7 @@ coverage/
 !test/message-handler.test.js
 !test/member-memory.test.js
 !test/image-generation-intent.test.js
+!test/session-store.test.js
+!test/tool-executor.test.js
+!test/request-queue.test.js
+!test/agent-runner.test.js

@@ -51,6 +51,14 @@ function normalizeStringList(value, maxItems = 8) {
   return value.map((item) => String(item || '').trim().slice(0, 120)).filter(Boolean).slice(0, maxItems)
 }
 
+function normalizeImpressions(value, maxItems = 8) {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => ({
+    content: String(typeof item === 'string' ? item : item && item.content || '').trim().slice(0, 120),
+    createdAt: Number(typeof item === 'object' && item ? item.createdAt : 0) || Date.now()
+  })).filter((item) => item.content).slice(-maxItems)
+}
+
 function normalizeProfile(value, fallback = {}) {
   const profile = value && typeof value === 'object' ? value : {}
   return {
@@ -63,6 +71,7 @@ function normalizeProfile(value, fallback = {}) {
     stableFacts: normalizeStringList(profile.stableFacts),
     uncertainInferences: normalizeStringList(profile.uncertainInferences, 5),
     recentEvents: normalizeRecentEvents(profile.recentEvents),
+    impressions: normalizeImpressions(profile.impressions),
     dailyHistory: normalizeDailyHistory(profile.dailyHistory),
     version: Math.max(0, Number(profile.version || fallback.version || 0)),
     messageCount: Math.max(0, Number(profile.messageCount || fallback.messageCount || 0)),
@@ -159,11 +168,16 @@ function createMemberMemory(options = {}) {
   const dedupeMax = Math.max(100, Number(options.dedupeMax || 5000))
   const retryBaseMs = Math.max(60, Number(options.retryBaseSeconds || 3600)) * 1000
   const maxRetries = Math.max(1, Number(options.maxRetries || 3))
+  const recentScanMaxFiles = Math.max(1, Math.min(2000, Number(options.recentScanMaxFiles) || 1000))
+  const recentScanMaxBytes = Math.max(1024, Math.min(32 * 1024 * 1024, Number(options.recentScanMaxBytes) || 8 * 1024 * 1024))
+  const recentFileMaxBytes = Math.max(1024, Math.min(1024 * 1024, Number(options.recentFileMaxBytes) || 256 * 1024))
   const profileCache = new Map()
   const recentMessageIds = new Map()
   const memberCache = new Map()
   const aliasIndexCache = new Map()
+  const groupDirectoryCache = new Map()
   let dailyJobRunning = false
+  let groupJobRunning = false
 
   if (enabled) {
     fs.mkdirSync(journalDir, { recursive: true })
@@ -189,12 +203,13 @@ function createMemberMemory(options = {}) {
   function readRetryState(date, key) {
     try { return JSON.parse(fs.readFileSync(retryStatePath(date, key), 'utf8')) } catch { return { attempts: 0, nextRetryAt: 0 } }
   }
-  function canRetry(date, key) {
+  function retryStatus(date, key) {
     const state = readRetryState(date, key)
-    return state.attempts < maxRetries && Date.now() >= Number(state.nextRetryAt || 0)
+    if (Number(state.attempts || 0) >= maxRetries) return 'paused'
+    return Date.now() < Number(state.nextRetryAt || 0) ? 'deferred' : 'ready'
   }
   function recordRetryFailure(date, key) {
-    const attempts = readRetryState(date, key).attempts + 1
+    const attempts = Number(readRetryState(date, key).attempts || 0) + 1
     const nextRetryAt = Date.now() + retryBaseMs * Math.pow(2, attempts - 1)
     const filePath = retryStatePath(date, key)
     fs.mkdirSync(path.dirname(filePath), { recursive: true })
@@ -226,6 +241,9 @@ function createMemberMemory(options = {}) {
     for (const [key, item] of aliasIndexCache.entries()) {
       if (!item || item.expiresAt <= now) aliasIndexCache.delete(key)
     }
+    for (const [key, item] of groupDirectoryCache.entries()) {
+      if (!item || item.expiresAt <= now) groupDirectoryCache.delete(key)
+    }
   }
 
   function readMember(groupId, userId) {
@@ -250,11 +268,12 @@ function createMemberMemory(options = {}) {
     const names = [sender.card, sender.nickname].map((value) => String(value || '').trim().slice(0, 80)).filter(Boolean)
     const title = String(sender.title || '').trim().slice(0, 80)
     const previous = readMember(groupId, userId) || {}
+    const role = ['owner', 'admin', 'member'].includes(sender.role) ? sender.role : String(previous.role || '')
     const aliases = Array.from(new Set([...(Array.isArray(previous.aliases) ? previous.aliases : []), ...names])).slice(-12)
     const currentName = String(sender.card || sender.nickname || previous.currentName || '').trim().slice(0, 80)
     const now = Number(timestamp || Date.now())
     const titles = Array.from(new Set([...(Array.isArray(previous.titles) ? previous.titles : []), ...(title ? [title] : [])])).slice(-8)
-    const identityChanged = currentName !== String(previous.currentName || '') || names.some((name) => !(previous.aliases || []).includes(name)) || title !== String(previous.currentTitle || '')
+    const identityChanged = currentName !== String(previous.currentName || '') || names.some((name) => !(previous.aliases || []).includes(name)) || title !== String(previous.currentTitle || '') || role !== String(previous.role || '')
     if (!identityChanged && now - Number(previous.persistedAt || 0) < 3600000) return
     const value = {
       groupId,
@@ -263,6 +282,7 @@ function createMemberMemory(options = {}) {
       aliases,
       currentTitle: title || String(previous.currentTitle || ''),
       titles,
+      role,
       firstSeenAt: Number(previous.firstSeenAt || now),
       lastSeenAt: now,
       persistedAt: now
@@ -275,7 +295,53 @@ function createMemberMemory(options = {}) {
     const key = cacheKey(groupId, userId)
     memberCache.set(key, { value, expiresAt: Date.now() + cacheTtlMs })
     aliasIndexCache.delete(groupId)
+    if (role !== String(previous.role || '')) groupDirectoryCache.delete(groupId)
     while (memberCache.size > cacheMax) memberCache.delete(memberCache.keys().next().value)
+  }
+
+  function persistDirectoryMember(groupId, raw) {
+    const userId = String(raw && (raw.user_id || raw.userId) || '')
+    if (!groupId || !userId) return null
+    const nickname = String(raw.nickname || '').trim().slice(0, 80)
+    const card = String(raw.card || '').trim().slice(0, 80)
+    const title = String(raw.title || '').trim().slice(0, 80)
+    const role = String(raw.role || '').trim().slice(0, 20)
+    const previous = readMember(groupId, userId) || {}
+    const names = [card, nickname].filter(Boolean)
+    const aliases = Array.from(new Set([...(previous.aliases || []), ...names])).slice(-12)
+    const value = {
+      ...previous,
+      groupId: String(groupId), userId,
+      currentName: card || nickname || previous.currentName || '',
+      aliases,
+      currentTitle: title || previous.currentTitle || '',
+      titles: Array.from(new Set([...(previous.titles || []), ...(title ? [title] : [])])).slice(-8),
+      role: role || previous.role || '',
+      lastSeenAt: Date.now(),
+      persistedAt: Date.now()
+    }
+    const filePath = memberPath(groupId, userId)
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    const tempPath = `${filePath}.${process.pid}.tmp`
+    fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+    fs.renameSync(tempPath, filePath)
+    memberCache.set(cacheKey(groupId, userId), { value, expiresAt: Date.now() + cacheTtlMs })
+    aliasIndexCache.delete(String(groupId))
+    return { userId, nickname, card, title, role }
+  }
+
+  async function getGroupMemberDirectory(groupId, fetcher, force = false) {
+    if (!enabled || !groupId || typeof fetcher !== 'function') return []
+    const key = String(groupId)
+    const cached = groupDirectoryCache.get(key)
+    if (!force && cached && cached.expiresAt > Date.now()) return cached.members
+    const rawMembers = await fetcher()
+    const members = (Array.isArray(rawMembers) ? rawMembers : [])
+      .map((raw) => persistDirectoryMember(key, raw))
+      .filter(Boolean)
+    groupDirectoryCache.set(key, { members, expiresAt: Date.now() + cacheTtlMs })
+    while (groupDirectoryCache.size > Math.max(10, Math.min(cacheMax, 200))) groupDirectoryCache.delete(groupDirectoryCache.keys().next().value)
+    return members
   }
 
   function getProfile(groupId, userId) {
@@ -309,10 +375,136 @@ function createMemberMemory(options = {}) {
     return true
   }
 
+  function appendImpression(groupId, userId, content, name = '') {
+    const uid = String(userId || '').trim()
+    const text = String(content || '').trim().slice(0, 120)
+    if (!uid || !text) return { ok: false, error: 'userId 和 content 不能为空' }
+    const previous = getProfile(groupId, uid) || normalizeProfile({ groupId, userId: uid, nickname: name })
+    if (previous.impressions.some((item) => item.content === text)) return { ok: true, deduped: true, profile: previous }
+    const next = normalizeProfile({
+      ...previous,
+      groupId: String(groupId), userId: uid,
+      nickname: String(name || previous.nickname || '').slice(0, 80),
+      impressions: [...previous.impressions, { content: text, createdAt: Date.now() }].slice(-8),
+      updatedAt: Date.now()
+    })
+    saveProfile(next)
+    return { ok: true, deduped: false, impression: text, profile: next }
+  }
+
+  function queryImpressions(groupId, userId = '') {
+    if (userId) {
+      const profile = getProfile(groupId, userId)
+      return profile ? { userId: String(userId), name: profile.nickname, impressions: profile.impressions.slice(-8) } : { userId: String(userId), name: '', impressions: [] }
+    }
+    const dir = path.join(profileDir, safeId(groupId))
+    let files = []
+    try { files = fs.readdirSync(dir).filter((name) => name.endsWith('.json')) } catch {}
+    const members = []
+    for (const file of files) {
+      try {
+        const profile = normalizeProfile(JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')))
+        if (profile.impressions.length) members.push({ userId: profile.userId, name: profile.nickname, impressions: profile.impressions.slice(-3) })
+      } catch {}
+    }
+    return { members: members.slice(0, 15) }
+  }
+
+  function removeImpression(groupId, userId, content = '') {
+    const profile = getProfile(groupId, userId)
+    if (!profile) return { ok: false, error: '没有该成员画像' }
+    const before = profile.impressions.length
+    const nextImpressions = content
+      ? profile.impressions.filter((item) => item.content !== String(content).trim())
+      : []
+    if (nextImpressions.length === before) return { ok: false, error: '没有匹配的印象' }
+    profile.impressions = nextImpressions
+    profile.updatedAt = Date.now()
+    saveProfile(profile)
+    return { ok: true, removed: before - nextImpressions.length }
+  }
+
+  async function getRecentGroupMessages(groupId, limit = 30, maxChars = 6000) {
+    if (!enabled || !groupId) return []
+    const countLimit = Math.max(1, Math.min(100, Math.floor(Number(limit) || 30)))
+    const charLimit = Math.max(1, Math.min(12000, Math.floor(Number(maxChars) || 6000)))
+    const files = []
+    const entries = []
+    let scanTruncated = false
+    let scannedBytes = 0
+    const dates = [localDate(), localDate(Date.now() - 86400000)]
+    for (const date of dates) {
+      const dir = path.join(journalDir, date, safeId(groupId))
+      try {
+        const directory = await fs.promises.opendir(dir)
+        for await (const file of directory) {
+          if (!file.isFile() || !file.name.endsWith('.jsonl')) continue
+          if (files.length >= recentScanMaxFiles) { scanTruncated = true; break }
+          const filePath = path.join(dir, file.name)
+          try {
+            const stat = await fs.promises.stat(filePath)
+            files.push({ filePath, size: stat.size, modifiedAt: stat.mtimeMs })
+          } catch { scanTruncated = true }
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') scanTruncated = true
+      }
+    }
+    files.sort((a, b) => b.modifiedAt - a.modifiedAt)
+    for (const file of files) {
+      if (!file.size) continue
+      const bytes = Math.min(file.size, recentFileMaxBytes, recentScanMaxBytes - scannedBytes)
+      if (bytes <= 0) { scanTruncated = true; break }
+      const start = file.size - bytes
+      if (start > 0) scanTruncated = true
+      scannedBytes += bytes
+      const input = fs.createReadStream(file.filePath, { encoding: 'utf8', start, end: file.size - 1, highWaterMark: 16384 })
+      const lines = readline.createInterface({ input, crlfDelay: Infinity })
+      input.once('error', () => { scanTruncated = true; lines.close() })
+      // A tail may start inside a JSON record. Discard only that first fragment.
+      let firstLine = true
+      try {
+        for await (const line of lines) {
+          if (firstLine) {
+            firstLine = false
+            if (start > 0) {
+              try { JSON.parse(line) } catch { continue }
+            }
+          }
+          try {
+            const entry = JSON.parse(line)
+            const text = describeJournalEntry(entry).slice(0, 1000)
+            if (!text) continue
+            const timestamp = Number(entry.timestamp || 0)
+            entries.push({ messageId: entry.messageId, userId: entry.userId, name: entry.nickname, text, timestamp: Number.isFinite(timestamp) ? timestamp : 0 })
+            entries.sort((a, b) => a.timestamp - b.timestamp)
+            if (entries.length > countLimit) entries.shift()
+          } catch {}
+        }
+      } catch { scanTruncated = true } finally {
+        lines.close()
+        input.destroy()
+      }
+    }
+    const out = []
+    let chars = 0
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const item = entries[index]
+      const remaining = charLimit - chars
+      if (remaining <= 0) break
+      const text = item.text.slice(0, remaining)
+      out.unshift(text.length === item.text.length ? item : { ...item, text, truncated: true })
+      chars += text.length
+    }
+    Object.defineProperty(out, 'scanTruncated', { value: scanTruncated })
+    return out
+  }
+
   function mergeProfile(previousValue, updateValue, fallback, date, interactionCount) {
     const previous = normalizeProfile(previousValue || {}, fallback)
     const update = updateValue && typeof updateValue === 'object' ? updateValue : {}
     const has = (key) => Object.prototype.hasOwnProperty.call(update, key)
+    const canCreateImpressions = previous.version === 0 && previous.impressions.length === 0
     const next = normalizeProfile({
       ...previous,
       nickname: fallback.nickname || previous.nickname,
@@ -321,6 +513,9 @@ function createMemberMemory(options = {}) {
       communicationStyle: has('communicationStyle') ? update.communicationStyle : previous.communicationStyle,
       stableFacts: has('stableFacts') ? update.stableFacts : previous.stableFacts,
       uncertainInferences: has('uncertainInferences') ? update.uncertainInferences : previous.uncertainInferences,
+      impressions: has('impressions') && Array.isArray(update.impressions) && (canCreateImpressions || update.impressions.length <= previous.impressions.length)
+        ? update.impressions
+        : previous.impressions,
       recentEvents: [...previous.recentEvents, ...(Array.isArray(update.recentEvents) ? update.recentEvents : [])],
       messageCount: fallback.messageCount,
       lastSummaryDate: date,
@@ -433,8 +628,9 @@ function createMemberMemory(options = {}) {
     let groups
     try {
       groups = fs.readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory())
-    } catch {
-      return
+    } catch (error) {
+      if (error.code === 'ENOENT') return
+      throw error
     }
     for (const group of groups) {
       const groupDir = path.join(dir, group.name)
@@ -481,7 +677,8 @@ function createMemberMemory(options = {}) {
       '不得推断或保存政治、宗教、健康、性取向、真实身份、住址、联系方式等敏感信息。',
       '玩笑、反讽和一次性情绪不能写成稳定事实。不确定内容放 uncertainInferences。',
       '这是累计画像的每日迭代，不是用当天内容覆盖旧画像。保留仍然有效的旧认识，只有新证据支持时才修改、增加或移除。',
-      '字段：dailySummary(string，当天增量观察), summary(string，更新后的累计概括), interests(string[]，更新后的完整列表), communicationStyle(string[]，更新后的完整列表), stableFacts(string[]，更新后的完整列表), uncertainInferences(string[]), recentEvents(string[])。',
+      '长期印象 impressions 只允许合并、改写和删除，不得增加已有印象条数；最多保留8条，每条不超过120字。',
+      '字段：dailySummary(string，当天增量观察), summary(string，更新后的累计概括), impressions(string[]，整理后的长期印象), interests(string[]，更新后的完整列表), communicationStyle(string[]，更新后的完整列表), stableFacts(string[]，更新后的完整列表), uncertainInferences(string[]), recentEvents(string[])。',
       `旧画像：${JSON.stringify(previous || {})}`,
       `当日本人发言（最多 ${dailyMaxMessages} 条）：\n${member.messages.map((text, index) => `${index + 1}. ${text}`).join('\n')}`,
       `当天其他成员对他的@、引用和回复：\n${(member.interactions || []).map((item) => JSON.stringify(item)).join('\n') || '无'}`
@@ -493,7 +690,10 @@ function createMemberMemory(options = {}) {
     const messages = []
     let chars = 0
     let files
-    try { files = fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')) } catch { return messages }
+    try { files = fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')) } catch (error) {
+      if (error.code === 'ENOENT') return messages
+      throw error
+    }
     for (const file of files) {
       const input = fs.createReadStream(path.join(dir, file), { encoding: 'utf8' })
       const lines = readline.createInterface({ input, crlfDelay: Infinity })
@@ -558,59 +758,89 @@ function createMemberMemory(options = {}) {
   }
 
   async function summarizeGroupsDay(date = previousLocalDate(), summarize) {
-    if (!enabled || typeof summarize !== 'function') return { skipped: true, processed: 0, failed: 0 }
-    const dayDir = path.join(journalDir, date)
-    let groups
-    try { groups = fs.readdirSync(dayDir, { withFileTypes: true }).filter((item) => item.isDirectory()) } catch { return { skipped: false, processed: 0, failed: 0 } }
+    if (!enabled || groupJobRunning || typeof summarize !== 'function') return { skipped: true, processed: 0, failed: 0, complete: false }
+    groupJobRunning = true
     let processed = 0
     let failed = 0
-    for (const group of groups) {
-      const markerPath = path.join(rootDir, 'jobs', date, `group_${group.name}.done`)
-      if (fs.existsSync(markerPath)) continue
-      const retryKey = `group_${group.name}`
-      if (!canRetry(date, retryKey)) { failed += 1; continue }
-      try {
-        const messages = await collectGroupDay(date, group.name)
-        if (!messages.length) continue
-        const groupId = String(messages[0].groupId || group.name)
-        const output = await summarize(buildGroupSummaryPrompt(groupId, messages, readGroupMemory(groupId)), { groupId })
-        const parsed = parseJsonObject(output)
-        if (!parsed) throw new Error('群级总结未返回有效 JSON')
-        const allowedUserIds = new Set()
-        for (const item of messages) {
-          if (item.userId) allowedUserIds.add(String(item.userId))
-          if (item.replyToUserId) allowedUserIds.add(String(item.replyToUserId))
-          for (const mentioned of Array.isArray(item.mentionedUserIds) ? item.mentionedUserIds : []) {
-            if (mentioned) allowedUserIds.add(String(mentioned))
-          }
-        }
-        saveGroupMemory(normalizeGroupMemory(parsed, groupId, date, allowedUserIds))
-        fs.mkdirSync(path.dirname(markerPath), { recursive: true })
-        fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`, 'utf8')
-        clearRetryFailure(date, retryKey)
-        processed += 1
-      } catch {
-        recordRetryFailure(date, retryKey)
-        failed += 1
+    let deferred = 0
+    let paused = 0
+    let attempted = 0
+    try {
+      const dayDir = path.join(journalDir, date)
+      let groups
+      try { groups = fs.readdirSync(dayDir, { withFileTypes: true }).filter((item) => item.isDirectory()) } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+        groups = []
       }
+      for (const group of groups) {
+        const markerPath = path.join(rootDir, 'jobs', date, `group_${group.name}.done`)
+        const retryKey = `group_${group.name}`
+        if (fs.existsSync(markerPath) && !fs.existsSync(retryStatePath(date, retryKey))) continue
+        const status = retryStatus(date, retryKey)
+        if (status === 'paused') { paused += 1; continue }
+        if (status === 'deferred') { deferred += 1; continue }
+        attempted += 1
+        try {
+          const messages = await collectGroupDay(date, group.name)
+          if (!messages.length) continue
+          const groupId = String(messages[0].groupId || group.name)
+          const output = await summarize(buildGroupSummaryPrompt(groupId, messages, readGroupMemory(groupId)), { groupId })
+          const parsed = parseJsonObject(output)
+          if (!parsed) throw new Error('群级总结未返回有效 JSON')
+          const allowedUserIds = new Set()
+          for (const item of messages) {
+            if (item.userId) allowedUserIds.add(String(item.userId))
+            if (item.replyToUserId) allowedUserIds.add(String(item.replyToUserId))
+            for (const mentioned of Array.isArray(item.mentionedUserIds) ? item.mentionedUserIds : []) {
+              if (mentioned) allowedUserIds.add(String(mentioned))
+            }
+          }
+          saveGroupMemory(normalizeGroupMemory(parsed, groupId, date, allowedUserIds))
+          fs.mkdirSync(path.dirname(markerPath), { recursive: true })
+          fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`, 'utf8')
+          clearRetryFailure(date, retryKey)
+          processed += 1
+        } catch {
+          recordRetryFailure(date, retryKey)
+          failed += 1
+        }
+      }
+      return { skipped: false, processed, failed, deferred, paused, attempted, complete: failed === 0 && deferred === 0 && paused === 0 }
+    } finally {
+      groupJobRunning = false
     }
-    return { skipped: false, processed, failed }
   }
 
   async function summarizeDay(date = previousLocalDate(), summarize) {
-    if (!enabled || dailyJobRunning || typeof summarize !== 'function') return { skipped: true, processed: 0 }
+    if (!enabled || dailyJobRunning || typeof summarize !== 'function') return { skipped: true, processed: 0, complete: false }
     const markerPath = path.join(rootDir, 'jobs', `${date}.done`)
-    if (fs.existsSync(markerPath)) return { skipped: true, processed: 0 }
+    if (fs.existsSync(markerPath)) {
+      let pendingRetries = []
+      try {
+        pendingRetries = fs.readdirSync(path.join(rootDir, 'jobs', date))
+          .filter((name) => name.endsWith('.retry.json') && !name.startsWith('group_'))
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+      }
+      // Older versions could mark a day done while members were still cooling down.
+      if (!pendingRetries.length) return { skipped: true, processed: 0, complete: true }
+    }
     dailyJobRunning = true
     let processed = 0
     let failed = 0
+    let deferred = 0
+    let paused = 0
+    let attempted = 0
     try {
       for await (const member of iterateDayMembers(date)) {
         if (member.messages.length === 0) continue
         const memberMarker = path.join(rootDir, 'jobs', date, `${safeId(member.groupId)}_${safeId(member.userId)}.done`)
         if (fs.existsSync(memberMarker)) continue
         const retryKey = `${safeId(member.groupId)}_${safeId(member.userId)}`
-        if (!canRetry(date, retryKey)) { failed += 1; continue }
+        const status = retryStatus(date, retryKey)
+        if (status === 'paused') { paused += 1; continue }
+        if (status === 'deferred') { deferred += 1; continue }
+        attempted += 1
         try {
           const previous = getProfile(member.groupId, member.userId)
           const output = await summarize(buildSummaryPrompt(member, previous), member)
@@ -633,14 +863,16 @@ function createMemberMemory(options = {}) {
           processed += 1
         } catch (error) {
           recordRetryFailure(date, retryKey)
+          if (process.env.QQ_AGENT_DEBUG_MEMORY) console.error(`[memory] 成员总结失败 ${member.groupId}/${member.userId}:`, error && error.stack ? error.stack : error)
           failed += 1
         }
       }
-      if (failed === 0) {
+      const complete = failed === 0 && deferred === 0 && paused === 0
+      if (complete) {
         fs.mkdirSync(path.dirname(markerPath), { recursive: true })
         fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`, 'utf8')
       }
-      return { skipped: false, processed, failed }
+      return { skipped: false, processed, failed, deferred, paused, attempted, complete }
     } finally {
       dailyJobRunning = false
     }
@@ -700,7 +932,9 @@ function createMemberMemory(options = {}) {
       try { member = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) } catch { continue }
       const aliases = Array.isArray(member.aliases) ? member.aliases.map((name) => String(name || '').trim()).filter(Boolean) : []
       const titles = Array.isArray(member.titles) ? member.titles.map((name) => String(name || '').trim()).filter(Boolean) : []
-      const officialNames = [...aliases, ...titles]
+      const role = String(member.role || '').trim()
+      const roleAliases = role === 'owner' ? ['群主'] : role === 'admin' ? ['管理员', '管理'] : []
+      const officialNames = [...aliases, ...titles, ...roleAliases]
       const exact = officialNames.some((name) => name.toLowerCase() === query)
       const partial = !exact && officialNames.some((name) => name.toLowerCase().includes(query) || query.includes(name.toLowerCase()))
       if (!exact && !partial) continue
@@ -709,6 +943,7 @@ function createMemberMemory(options = {}) {
         currentName: String(member.currentName || ''),
         aliases: aliases.slice(-5),
         titles: titles.slice(-3),
+        role,
         match: exact ? 'exact' : 'partial',
         source: titles.some((title) => title.toLowerCase() === query) ? 'title' : 'profile',
         confidence: exact ? 1 : 0.8
@@ -762,8 +997,9 @@ function createMemberMemory(options = {}) {
     for (const file of files) {
       let member
       try { member = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')) } catch { continue }
-      const base = { userId: String(member.userId || ''), currentName: String(member.currentName || ''), source: 'directory', confidence: 1 }
-      for (const alias of [...(member.aliases || []), ...(member.titles || [])]) add(alias, base)
+      const base = { userId: String(member.userId || ''), currentName: String(member.currentName || ''), role: String(member.role || ''), source: 'directory', confidence: 1 }
+      const roleAliases = member.role === 'owner' ? ['群主'] : member.role === 'admin' ? ['管理员', '管理'] : []
+      for (const alias of [...(member.aliases || []), ...(member.titles || []), ...roleAliases]) add(alias, base)
     }
     const groupMemory = readGroupMemory(groupId)
     for (const item of groupMemory && Array.isArray(groupMemory.inferredAliases) ? groupMemory.inferredAliases : []) {
@@ -809,7 +1045,7 @@ function createMemberMemory(options = {}) {
     const lines = resolved.map((item) => {
       if (item.matches.length === 1) {
         const match = item.matches[0]
-        return `“${item.alias}”指当前群成员 ${match.currentName || item.alias}（内部QQ标识：${match.userId}）`
+        return `确定身份：“${item.alias}”就是当前群成员 ${match.currentName || item.alias}（内部QQ标识：${match.userId}）。涉及这个称呼时，按该成员理解。`
       }
       return `“${item.alias}”存在多个候选：${item.matches.map((match) => `${match.currentName || item.alias}(${match.userId})`).join('、')}，不要擅自确定`
     })
@@ -830,7 +1066,7 @@ function createMemberMemory(options = {}) {
     return { available: true, material: lines.join('\n').slice(0, contextMaxChars) }
   }
 
-  return { recordMessage, getProfile, saveProfile, buildStyleContext, buildIdentityContext, getReplyMaterial, getGroupMemoryMaterial, findMembersByAlias, resolveAliasesInText, summarizeDay, summarizeGroupsDay, cleanupCache, cleanupJournals, collectDay, cacheSize: () => profileCache.size + memberCache.size + aliasIndexCache.size }
+  return { recordMessage, getProfile, saveProfile, appendImpression, queryImpressions, removeImpression, getRecentGroupMessages, buildStyleContext, buildIdentityContext, getReplyMaterial, getGroupMemoryMaterial, getGroupMemberDirectory, findMembersByAlias, resolveAliasesInText, summarizeDay, summarizeGroupsDay, cleanupCache, cleanupJournals, collectDay, cacheSize: () => profileCache.size + memberCache.size + aliasIndexCache.size + groupDirectoryCache.size }
 }
 
 module.exports = { createMemberMemory, localDate, previousLocalDate, normalizeProfile }

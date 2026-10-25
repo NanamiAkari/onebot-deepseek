@@ -12,6 +12,7 @@ const { createToolExecutor } = require('./src/agent/tool-executor')
 const { createMessageHandler } = require('./src/app/message-handler')
 const { createMemberMemory, previousLocalDate } = require('./src/memory/member-memory')
 const { shouldGenerateImage } = require('./src/image-generation/intent')
+const { createRequestQueue } = require('./src/app/request-queue')
 
 const {
   PROJECT_ROOT,
@@ -102,14 +103,25 @@ const memberMemory = createMemberMemory({
   retryBaseSeconds: AI_MEMORY_RETRY_BASE_SECONDS,
   maxRetries: AI_MEMORY_MAX_RETRIES
 })
-const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, clearHistory, cleanup: cleanupSessionStore } = sessionStore
-const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE })
-const toolExecutor = createToolExecutor({ sendAction, getHistoryRaw, workspaceRoot: PROJECT_ROOT, memberMemory })
+const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, recordGroupMessage, getRecentGroupContext, clearHistory, cleanup: cleanupSessionStore } = sessionStore
+const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE, fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE })
+const toolExecutor = createToolExecutor({
+  sendAction, getHistoryRaw, memberMemory,
+  workspaceRoot: path.join(PROJECT_ROOT, 'tool_workspace'),
+  fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
+  fileToolAdminUserIds: ADMIN_USER_IDS
+})
+const aiRequestQueue = createRequestQueue({
+  maxConcurrent: config.AI_MAX_CONCURRENT_REQUESTS,
+  maxPendingPerKey: config.AI_QUEUE_MAX_PER_SESSION,
+  maxPendingTotal: config.AI_QUEUE_MAX_TOTAL,
+  waitTimeoutMs: config.AI_QUEUE_WAIT_TIMEOUT_MS
+})
 const agentRunner = createAgentRunner({
   toolRegistry,
   toolExecutor,
-  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, structured: true }),
-  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, structured: true }),
+  invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, toolResults: input.toolResults, structured: true }),
+  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, toolResults: input.toolResults, structured: true }),
   maxSteps: 10
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
@@ -999,11 +1011,14 @@ async function runMemberMemoryTick() {
   }
   const memberResult = await memberMemory.summarizeDay(summaryDate, summarizeMemory)
   const groupResult = await memberMemory.summarizeGroupsDay(summaryDate, summarizeMemory)
-  if (!memberResult.failed && !groupResult.failed) {
+  const attempted = Number(memberResult.attempted || 0) + Number(groupResult.attempted || 0)
+  const deferred = Number(memberResult.deferred || 0) + Number(groupResult.deferred || 0)
+  if (!attempted && deferred) return
+  if (memberResult.complete && groupResult.complete) {
     lastMemorySummaryDate = summaryDate
     console.log(`记忆总结完成 date=${summaryDate} members=${memberResult.processed} groups=${groupResult.processed}`)
   } else {
-    console.log(`记忆总结部分失败 date=${summaryDate} memberFailed=${memberResult.failed || 0} groupFailed=${groupResult.failed || 0}`)
+    console.log(`记忆总结部分失败 date=${summaryDate} memberFailed=${memberResult.failed || 0} groupFailed=${groupResult.failed || 0} deferred=${deferred}`)
   }
   memberMemory.cleanupJournals()
 }
@@ -1060,6 +1075,8 @@ const onMessage = createMessageHandler({
   mediaCache,
   getKey,
   pushHistory,
+  recordGroupMessage,
+  getRecentGroupContext,
   sendAction,
   extractContent,
   resolveMediaSources,
@@ -1078,6 +1095,7 @@ const onMessage = createMessageHandler({
   getContext,
   memberMemory,
   agentRunner,
+  aiRequestQueue,
   buildReplySegments,
   AI_POKE_ENABLE,
   AI_POKE_COOLDOWN,
@@ -1218,6 +1236,12 @@ async function callLLM(text, media, hist, opts) {
 
 function sanitizeText(s) {
   let t = String(s || '')
+  t = t.replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, '')
+  t = t.replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, '')
+  t = t.replace(/<reasoning\b[^>]*>[\s\S]*?<\/reasoning>/gi, '')
+  t = t.replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/gi, '')
+  t = t.replace(/<analysis\b[^>]*>[\s\S]*$/gi, '')
+  t = t.replace(/<reasoning\b[^>]*>[\s\S]*$/gi, '')
   t = t.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, _lang, body) => `${body}\n`)
   t = t.replace(/`([^`]*)`/g, '$1')
   t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '')
@@ -1239,6 +1263,25 @@ function requestSystemPrompt(opts) {
   const base = String(opts && opts.systemPrompt || SYSTEM_PROMPT).trim()
   const memory = String(opts && opts.memoryContext || '').trim()
   return memory ? `${base}\n\n${memory}` : base
+}
+
+function serializeToolResult(toolCall) {
+  const value = {
+    ok: Boolean(toolCall && toolCall.ok),
+    data: toolCall && Object.prototype.hasOwnProperty.call(toolCall, 'data') ? toolCall.data : null,
+    ...(toolCall && toolCall.error ? { error: String(toolCall.error) } : {})
+  }
+  try {
+    const json = JSON.stringify(value)
+    if (json.length <= 12000) return json
+    return JSON.stringify({
+      ok: value.ok,
+      data: { preview: json.slice(0, 11800), truncated: true },
+      error: value.error
+    })
+  } catch {
+    return JSON.stringify({ ok: false, error: '工具结果不可序列化' })
+  }
 }
 
 async function callGemini(text, media, opts) {
@@ -1327,6 +1370,25 @@ async function callOpenAI(text, media, hist, opts) {
         }
       }
       msg.push({ role: 'user', content })
+      for (const toolCall of Array.isArray(opts && opts.toolResults) ? opts.toolResults : []) {
+        msg.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: String(toolCall.id || toolCall.name || 'tool_call'),
+            type: 'function',
+            function: {
+              name: String(toolCall.name || 'tool'),
+              arguments: JSON.stringify(toolCall.arguments || {})
+            }
+          }]
+        })
+        msg.push({
+          role: 'tool',
+          tool_call_id: String(toolCall.id || toolCall.name || 'tool_call'),
+          content: serializeToolResult(toolCall)
+        })
+      }
     }
     const tools = formatOpenAITools(opts && opts.tools, useResponses)
     if (wantsImageGeneration && useResponses) tools.push({ type: 'image_generation' })
@@ -1340,6 +1402,21 @@ async function callOpenAI(text, media, hist, opts) {
       }
     }
     if (useResponses) responseInput.push({ role: 'user', content })
+    if (useResponses) {
+      for (const toolCall of Array.isArray(opts && opts.toolResults) ? opts.toolResults : []) {
+        responseInput.push({
+          type: 'function_call',
+          call_id: String(toolCall.id || toolCall.name || 'tool_call'),
+          name: String(toolCall.name || 'tool'),
+          arguments: JSON.stringify(toolCall.arguments || {})
+        })
+        responseInput.push({
+          type: 'function_call_output',
+          call_id: String(toolCall.id || toolCall.name || 'tool_call'),
+          output: serializeToolResult(toolCall)
+        })
+      }
+    }
     const buildPayload = (includeTools) => useResponses
       ? {
           model: OPENAI_MODEL,
@@ -2024,6 +2101,7 @@ async function handleCustomReplyMatch(ws, payload, text) {
 }
 
 process.on('SIGINT', () => {
+  try { aiRequestQueue.close() } catch {}
   try { wss.close() } catch {}
   process.exit(0)
 })

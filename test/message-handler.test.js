@@ -47,7 +47,8 @@ function createHarness(message, options = {}) {
     getContext: () => [],
     memberMemory: {
       recordMessage: (payload, text, relations) => calls.archived.push({ payload, text, relations }),
-      buildStyleContext: () => ''
+      buildStyleContext: () => '',
+      buildIdentityContext: (_payload, text) => text.includes('灯灯') ? '确定身份：“灯灯”就是当前群成员（内部QQ标识：20）。' : ''
     },
     agentRunner: {
       run: async (input) => {
@@ -100,7 +101,7 @@ test('keeps the AI trigger name as part of quoted conversation input', async () 
     quotedMessage: { user_id: 20, message: [{ type: 'text', data: { text: '前面的内容' } }] }
   })
   await harness.run()
-  assert.match(harness.calls.modelMessages[0], /当前消息：\n用户原话：阿卡林 你觉得呢/)
+  assert.match(harness.calls.modelMessages[0], /【当前消息】\n用户原话：阿卡林 你觉得呢/)
   assert.match(harness.calls.modelMessages[0], /实际话题：你觉得呢/)
 })
 
@@ -109,6 +110,13 @@ test('separates the AI trigger name from a following member nickname', async () 
   await harness.run()
   assert.match(harness.calls.modelMessages[0], /用户原话：阿卡林灯灯今天怎么了/)
   assert.match(harness.calls.modelMessages[0], /句首“阿卡林”是用户对你的称呼/)
+  assert.match(harness.calls.modelMessages[0], /实际话题：灯灯今天怎么了/)
+})
+
+test('injects deterministic member identity into the model message', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林灯灯今天怎么了' } }])
+  await harness.run()
+  assert.match(harness.calls.modelMessages[0], /确定身份：“灯灯”就是当前群成员/)
   assert.match(harness.calls.modelMessages[0], /实际话题：灯灯今天怎么了/)
 })
 
@@ -144,6 +152,13 @@ test('archives mentions and quoted author as structured memory evidence', async 
   await harness.run()
   assert.deepEqual(harness.calls.archived[0].relations.mentionedUserIds, ['20'])
   assert.equal(harness.calls.archived[0].relations.replyToUserId, '20')
+})
+
+test('does not process the same inbound message twice', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林重复测试' } }])
+  await harness.run()
+  await harness.run()
+  assert.equal(harness.calls.ai, 1)
 })
 
 test('archives multimedia metadata and expanded forwarded text', async () => {

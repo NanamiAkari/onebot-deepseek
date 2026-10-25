@@ -19,7 +19,7 @@
     - `OPENAI_API_KEY=sk-...`
     - `OPENAI_BASE_URL=http://127.0.0.1:30080`
     - `LLM_PROVIDER=openai`
-    - `OPENAI_MODEL=gpt-5.4`
+    - `OPENAI_MODEL=gpt-6-astra`
     - `OPENAI_WIRE_API=responses`
   - 如果需要外置提示词文件：
     - `PROMPT_FILE=prompt.txt`
@@ -55,7 +55,7 @@
 - 模型输入会同时标明句首“阿卡林”只是称呼/触发词，并提供去前缀后的实际话题，避免把“阿卡林灯灯……”误解成复合名字或以阿卡林为主语。
 - 消息进入 `message-handler -> agent runner -> provider -> tool executor` 主链路
 - 当前已支持多轮 agent loop、工具注册表、dispatch map、统一 tool result 格式
-- 若上游或工具链失败，服务会返回失败提示而不是自动回退到其他模型
+- 上游或工具链失败时通常返回失败提示；图片回复被上游判定为未读到图片时会尝试 Gemini，特定 OpenAI 403 限制会尝试已配置的 DeepSeek
 - 使用 `send_group_msg` 或 `send_private_msg` 动作帧回复
 
 ## 上游协议
@@ -68,11 +68,11 @@
 
 ## Agent Loop
 - 当前服务已升级为有限步数的多轮 agent loop
-- 默认最大步数为 `5`
+- 默认最大步数为 `10`
 - 每轮流程：
   - 调用模型
   - 若模型返回工具调用，则执行首个工具
-  - 将工具结果写回历史
+  - 通过标准工具结果消息把工具输出交回模型；超长结果会带截断标记
   - 继续下一轮，直到得到最终文本或达到步数上限
 - 当前已接入的工具包括：
   - `get_msg`
@@ -80,11 +80,10 @@
   - `send_group_msg`
   - `send_private_msg`
   - `history`
-  - `read_file`
-  - `write_file`
-  - `edit_file`
-  - `list_dir`
-- 文件类工具带工作区路径沙箱，不能逃逸项目目录
+  - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
+- 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
+- `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
+- 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。
@@ -287,10 +286,8 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_IMAGE_CONTEXT_MAX`
   - `AI_IMAGE_ONLY_NO_CALL=true`
 - 图片预处理：
-  - 默认启用 `sharp` 预处理
-  - 会在发送给上游前按图片类型缩放 / 压缩
-  - 普通图片、截图、长图采用不同策略
-  - 预处理结果会按图片内容 hash 做进程内缓存
+  - `sharp` 与预处理参数已保留在配置中，当前主链路仍发送原图或 base64，尚未启用按图片类型缩放 / 压缩
+  - 需要启用预处理时，应先在目标 Linux 服务器重新安装对应平台的 `sharp`
 - 关键配置：
   - `AI_IMAGE_PREPROCESS_ENABLE=true`
   - `AI_IMAGE_CACHE_ENABLE=true`
@@ -467,9 +464,12 @@ AI_ADMIN_USER_IDS=123456789,987654321
 - 成员画像完全由大模型每日归纳，只作为 AI 回复的内部辅助材料，不会替代当前消息或人设提示词。
 - 画像按版本累计迭代，保留当前累计画像和最近30天每日增量；模型漏字段时不会清空旧认识。
 - 成员级总结只处理当天实际发过言的人，但材料同时包含其他成员当天对他的 `@`、引用和定向回复。
+- AI对话触发时会附带当前群最近几条相邻消息，并标注发言者；默认最多6条、3000字、5分钟内有效。
+- AI 可按需调用 `memory_append/query/remove` 管理高价值成员印象，也可调用 `get_recent_messages` 查询更早的群聊上下文；触发方式仍是 `@机器人` 或 `AI_PREFIXES`。
 - AI 对话默认只加载交流风格；完整画像由大模型在确有帮助时通过 `member_memory` 工具按需读取。
 - 消息会维护 QQ 号与群名片、QQ 昵称、历史别名的对应关系；大模型可通过 `resolve_group_member` 理解对话中的成员指代。
 - 当前消息出现已知昵称、群名片、群头衔或高可信推断别名时，会先自动注入对应成员身份，不再完全依赖大模型主动调用工具。
+- 新增 `group_member_directory` 工具：需要判断群主、管理员或群头衔指代时，大模型可按需获取完整群成员目录；目录会短时缓存并同步到成员身份索引。
 - 群头衔、`@`关系和引用消息作者也会作为每日群级总结的判断材料；自然称呼、群关系和群梗由大模型归纳。
 - 近期具体事件会进入带时效的情景记忆，完整画像和群级记忆仍只在相关时按需加载。
 - 纯图片、视频和语音消息也会记录媒体类型与有限元数据；合并转发会通过 OneBot 展开并提取其中的文本和媒体类型。

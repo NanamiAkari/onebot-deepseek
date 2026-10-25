@@ -1,6 +1,50 @@
 function createAgentRunner(deps) {
   const { toolRegistry, toolExecutor, invokeModel, invokeModelWithToolResult, maxSteps = 5 } = deps
 
+  function compactToolData(value, maxChars = 12000) {
+    if (value == null) return value
+    if (typeof value === 'string') return value.length > maxChars ? `${value.slice(0, maxChars)}…[结果已截断]` : value
+    let serialized = ''
+    try { serialized = JSON.stringify(value) } catch { return '[工具结果不可序列化]' }
+    if (serialized.length <= maxChars) return value
+    if (Array.isArray(value)) {
+      const items = []
+      for (const item of value) {
+        const candidate = items.concat([item])
+        if (JSON.stringify(candidate).length > maxChars - 80) break
+        items.push(item)
+      }
+      return { items, truncated: true, omitted: Math.max(0, value.length - items.length) }
+    }
+    if (typeof value === 'object') {
+      const output = {}
+      const keys = Object.keys(value).sort((a, b) => {
+        const metadata = new Set(['scan_truncated', 'instruction', 'truncated', 'omitted'])
+        return Number(metadata.has(b)) - Number(metadata.has(a))
+      })
+      for (const key of keys) {
+        const candidate = value[key]
+        const next = Array.isArray(candidate)
+          ? compactToolData(candidate, Math.max(200, Math.floor(maxChars * 0.85)))
+          : typeof candidate === 'string' && candidate.length > 2000
+          ? `${candidate.slice(0, 2000)}…[字段已截断]`
+          : candidate
+        output[key] = next
+        try {
+          if (JSON.stringify(output).length > maxChars - 80) {
+            delete output[key]
+            output[key] = '[字段已截断]'
+          }
+        } catch {
+          output[key] = '[字段不可序列化]'
+        }
+      }
+      output.truncated = true
+      return output
+    }
+    return { preview: serialized.slice(0, Math.max(0, maxChars - 80)), truncated: true }
+  }
+
   function normalizeModelOutput(output) {
     if (!output) return { text: '', toolCalls: [] }
     if (typeof output === 'string') return { text: output, toolCalls: [] }
@@ -36,7 +80,7 @@ function createAgentRunner(deps) {
   }
 
   async function run(input) {
-    const tools = toolRegistry ? toolRegistry.list().map((tool) => ({
+    const tools = toolRegistry ? toolRegistry.list().filter((tool) => !toolExecutor || typeof toolExecutor.isAllowed !== 'function' || toolExecutor.isAllowed(tool.name, input.runtime || {})).map((tool) => ({
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema
@@ -95,9 +139,6 @@ function createAgentRunner(deps) {
         }
         executedToolCalls.push(toolEntry)
         agentInput.toolResults = executedToolCalls.slice()
-        agentInput.history = agentInput.history.concat([
-          { role: 'system', content: formatToolResultForHistory(toolEntry) }
-        ])
         agentInput.tools = agentInput.tools.filter((tool) => tool.name !== currentCall.name)
         continue
       }
@@ -108,16 +149,13 @@ function createAgentRunner(deps) {
         name: currentCall.name,
         arguments: currentCall.arguments || {},
         ok: Boolean(toolResult && toolResult.ok),
-        data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? toolResult.data : null,
+        data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? compactToolData(toolResult.data) : null,
         error: toolResult && toolResult.error ? String(toolResult.error) : ''
       }
       console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} ${toolEntry.ok ? '成功' : '失败'}`)
 
       executedToolCalls.push(toolEntry)
       agentInput.toolResults = executedToolCalls.slice()
-      agentInput.history = agentInput.history.concat([
-        { role: 'system', content: formatToolResultForHistory(toolEntry) }
-      ])
     }
 
     return {
