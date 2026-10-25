@@ -71,6 +71,12 @@ module.exports = {
   AI_QUEUE_MAX_PER_SESSION: Math.max(1, Math.min(100, parseInt(process.env.AI_QUEUE_MAX_PER_SESSION || '10', 10) || 10)),
   AI_QUEUE_MAX_TOTAL: Math.max(1, Math.min(500, parseInt(process.env.AI_QUEUE_MAX_TOTAL || '50', 10) || 50)),
   AI_QUEUE_WAIT_TIMEOUT_MS: Math.max(1000, Math.min(600000, parseInt(process.env.AI_QUEUE_WAIT_TIMEOUT_MS || '120000', 10) || 120000)),
+  AI_NAME_INTENT_ENABLE: String(process.env.AI_NAME_INTENT_ENABLE || 'true').toLowerCase() === 'true',
+  AI_NAME_INTENT_THRESHOLD: (() => {
+    const value = parseFloat(process.env.AI_NAME_INTENT_THRESHOLD || '0.65')
+    return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.65
+  })(),
+  AI_NAME_INTENT_TIMEOUT_MS: Math.max(1000, Math.min(30000, parseInt(process.env.AI_NAME_INTENT_TIMEOUT_MS || '10000', 10) || 10000)),
   IGNORE_REGEX: process.env.AI_IGNORE_REGEX ? new RegExp(process.env.AI_IGNORE_REGEX, 'i') : DEFAULT_IGNORE_REGEX,
   MAX_MEDIA_BYTES: parseInt(process.env.AI_MAX_MEDIA_BYTES || '5242880', 10),
   MEDIA_REFERER: process.env.AI_MEDIA_REFERER || '',

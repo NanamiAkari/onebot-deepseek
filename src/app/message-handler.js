@@ -12,6 +12,7 @@ function createMessageHandler(deps) {
     resolveMediaSources,
     checkMention,
     checkModeration,
+    classifyAddressing,
     handleCommands,
     handleImageGenerationRequest,
     handleScheduleTaskDraftInput,
@@ -20,8 +21,12 @@ function createMessageHandler(deps) {
     hasCustomReplyTrigger,
     shouldIgnoreText,
     GROUP_REQUIRE_MENTION,
+    REQUIRE_PREFIX,
+    PREFIXES,
     shouldRespond,
     stripPrefix,
+    AI_NAME_INTENT_ENABLE,
+    AI_NAME_INTENT_THRESHOLD,
     getContext,
     memberMemory,
     agentRunner,
@@ -305,9 +310,20 @@ function createMessageHandler(deps) {
       if (customDraftHandled) return
       const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
       const rawText = String(raw.text || '').trim()
-      const prefixTriggered = shouldRespond(rawText)
+      let prefixTriggered = shouldRespond(rawText)
+      const requirePrefix = REQUIRE_PREFIX !== false
+      const prefixMentioned = Array.isArray(PREFIXES) && PREFIXES.some((prefix) => prefix && rawText.includes(String(prefix)))
+      if (isGroup && requirePrefix && AI_NAME_INTENT_ENABLE !== false && prefixMentioned && typeof classifyAddressing === 'function') {
+        try {
+          const decision = await classifyAddressing(rawText, payload)
+          prefixTriggered = Boolean(decision && decision.addressed && Number(decision.confidence) >= Number(AI_NAME_INTENT_THRESHOLD))
+        } catch (error) {
+          prefixTriggered = false
+          console.log('阿卡林意图判断失败', error && error.message ? error.message : 'unknown')
+        }
+      }
       const addressedByPrefix = prefixTriggered && stripPrefix(rawText) !== rawText
-      const aiExplicitlyTriggered = isGroup && (mentioned || addressedByPrefix)
+      const aiExplicitlyTriggered = isGroup && (mentioned || prefixTriggered)
       const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
         ? hasCustomReplyTrigger(payload.group_id, raw.text)
         : false

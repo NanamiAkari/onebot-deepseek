@@ -45,6 +45,9 @@ const {
   OPENAI_TIMEOUT_MS,
   OPENAI_IMAGE_TIMEOUT_MS,
   AI_IMAGE_GENERATION_INTENT_THRESHOLD,
+  AI_NAME_INTENT_ENABLE,
+  AI_NAME_INTENT_THRESHOLD,
+  AI_NAME_INTENT_TIMEOUT_MS,
   AI_REPLY_MAX_CHARS,
   AI_REPLY_CHUNK_CHARS,
   AI_POKE_ENABLE,
@@ -1090,8 +1093,13 @@ const onMessage = createMessageHandler({
   hasCustomReplyTrigger,
   shouldIgnoreText,
   GROUP_REQUIRE_MENTION,
+  REQUIRE_PREFIX,
+  PREFIXES,
   shouldRespond,
   stripPrefix,
+  classifyAddressing,
+  AI_NAME_INTENT_ENABLE,
+  AI_NAME_INTENT_THRESHOLD,
   getContext,
   memberMemory,
   agentRunner,
@@ -1200,6 +1208,46 @@ function shouldRespond(text) {
   if (shouldIgnoreText(t)) return false
   if (!REQUIRE_PREFIX) return true
   return PREFIXES.some((p) => t.startsWith(p))
+}
+
+function parseNameIntentResponse(value) {
+  const text = String(value || '').trim()
+  const candidates = [text]
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fenced) candidates.push(fenced[1].trim())
+  const objectMatch = text.match(/\{[\s\S]*\}/)
+  if (objectMatch) candidates.push(objectMatch[0])
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (!parsed || typeof parsed !== 'object') continue
+      const addressed = parsed.addressedToBot ?? parsed.addressed ?? parsed.shouldRespond
+      const confidence = Number(parsed.confidence)
+      if (typeof addressed === 'boolean' && Number.isFinite(confidence)) {
+        return { addressed: addressed, confidence: Math.max(0, Math.min(1, confidence)) }
+      }
+    } catch {}
+  }
+  return { addressed: false, confidence: 0 }
+}
+
+async function classifyAddressing(text, payload) {
+  if (!AI_NAME_INTENT_ENABLE) return { addressed: false, confidence: 0 }
+  const prompt = [
+    '判断下面这条 QQ 消息是否是在直接呼叫当前机器人。当前机器人的称呼包括“阿卡林”。',
+    '只输出 JSON：{"addressedToBot":true或false,"confidence":0到1}。',
+    '直接问机器人、请求机器人执行操作、使用“阿卡林在吗/阿卡林你怎么看”等表达，判为 true。',
+    '把“我喜欢阿卡林这个角色”“阿卡林是某作品人物”、第三人称讨论、转述、引用内容，判为 false。',
+    '涉及机器人已有管理命令时，即使句式简短，也判为 true。',
+    `消息类型：${payload && payload.message_type === 'private' ? '私聊' : '群聊'}`,
+    `消息：${String(text || '').slice(0, 2000)}`
+  ].join('\n')
+  const response = await callLLM(prompt, [], [], {
+    structured: true,
+    timeoutMs: AI_NAME_INTENT_TIMEOUT_MS,
+    systemPrompt: '你是 QQ 机器人消息意图分类器。严格只输出有效 JSON，不要解释。'
+  })
+  return parseNameIntentResponse(response && response.text)
 }
 
 function shouldIgnoreText(text) {

@@ -50,9 +50,10 @@
 
 ## 工作方式
 - 入口层仍使用 OneBot v11 反向 WebSocket，不改变 Napcat 接法
-- 私聊默认可直接回复；群聊可按 `@机器人` / 前缀规则触发
+- 私聊默认可直接回复；群聊可按 `@机器人` / 模型判断的称呼意图触发
 - 使用 `AI_PREFIXES`（如“阿卡林”）触发AI对话时，前缀仍会作为用户原话的一部分传给模型，不会从对话内容中删除。
 - 模型输入会同时标明句首“阿卡林”只是称呼/触发词，并提供去前缀后的实际话题，避免把“阿卡林灯灯……”误解成复合名字或以阿卡林为主语。
+- 群消息中出现 `AI_PREFIXES` 的称呼时，会先交给上游模型判断是在呼叫机器人还是在讨论角色；分类失败时默认不插话。`@机器人` 仍直接触发。
 - 消息进入 `message-handler -> agent runner -> provider -> tool executor` 主链路
 - 当前已支持多轮 agent loop、工具注册表、dispatch map、统一 tool result 格式
 - 上游或工具链失败时通常返回失败提示；图片回复被上游判定为未读到图片时会尝试 Gemini，特定 OpenAI 403 限制会尝试已配置的 DeepSeek
@@ -228,15 +229,18 @@ sudo chmod 664 /opt/onebot-deepseek/poke_replies.json
 ```
 
 ## 触发控制
-- 默认群聊按前缀触发；私聊默认可直接回复。
+- 默认群聊由模型判断是否在直接呼叫机器人；私聊默认可直接回复。
 - 当前示例配置使用 `阿卡林` 作为前缀，不使用 `/ai`。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_GROUP_REQUIRE_MENTION=true|false`：群聊是否必须 `@机器人`
-  - `AI_PREFIXES=阿卡林`：多个前缀用逗号分隔，如 `阿卡林,ai`
+  - `AI_PREFIXES=阿卡林`：多个称呼用逗号分隔，如 `阿卡林,ai`
+  - `AI_NAME_INTENT_ENABLE=true`：是否用上游模型判断称呼意图
+  - `AI_NAME_INTENT_THRESHOLD=0.65`：模型判断置信度门槛
+  - `AI_NAME_INTENT_TIMEOUT_MS=10000`：称呼意图判断超时
   - `AI_ADMIN_USER_IDS=123456,234567`：额外管理员 QQ 号白名单，多个用英文逗号分隔
   - `AI_IGNORE_REGEX=`：忽略其他 WS 服务命令的正则；群聊和私聊都会生效
-- 示例：群聊不要求 `@`，只要以前缀 `阿卡林` 开头就触发：
+- 示例：群聊不要求 `@`，出现 `阿卡林` 后由模型判断是否在呼叫机器人：
 ```
 AI_REQUIRE_PREFIX=true
 AI_GROUP_REQUIRE_MENTION=false

@@ -29,6 +29,7 @@ function createHarness(message, options = {}) {
     resolveMediaSources: async (_ws, media) => media,
     checkMention: (segments) => segments.some((item) => item.type === 'at' && String(item.data.qq) === '1000'),
     checkModeration: async () => false,
+    classifyAddressing: options.classifyAddressing,
     handleCommands: async () => false,
     handleScheduleTaskDraftInput: async () => false,
     handleCustomReplyDraftInput: async () => false,
@@ -39,6 +40,10 @@ function createHarness(message, options = {}) {
     hasCustomReplyTrigger: () => true,
     shouldIgnoreText: () => false,
     GROUP_REQUIRE_MENTION: false,
+    REQUIRE_PREFIX: true,
+    PREFIXES: [prefix],
+    AI_NAME_INTENT_ENABLE: true,
+    AI_NAME_INTENT_THRESHOLD: 0.65,
     shouldRespond: (text) => String(text || '').trim().startsWith(prefix),
     stripPrefix: (text) => {
       const value = String(text || '').trim()
@@ -135,6 +140,49 @@ test('mention takes priority over a custom reply keyword', async () => {
   await harness.run()
   assert.equal(harness.calls.custom, 0)
   assert.equal(harness.calls.ai, 1)
+})
+
+test('uses model intent for an in-message bot name mention', async () => {
+  let classifications = 0
+  const harness = createHarness([{ type: 'text', data: { text: '有人知道阿卡林在吗' } }], {
+    classifyAddressing: async () => {
+      classifications += 1
+      return { addressed: true, confidence: 0.96 }
+    }
+  })
+  await harness.run()
+  assert.equal(classifications, 1)
+  assert.equal(harness.calls.ai, 1)
+  assert.match(harness.calls.modelMessages[0], /有人知道阿卡林在吗/)
+})
+
+test('does not reply when the model classifies the name as a character discussion', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '我喜欢阿卡林这个角色' } }], {
+    classifyAddressing: async () => ({ addressed: false, confidence: 0.98 })
+  })
+  await harness.run()
+  assert.equal(harness.calls.ai, 0)
+  assert.equal(harness.calls.custom, 1)
+})
+
+test('fails closed when the name intent classifier errors', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林你在吗' } }], {
+    classifyAddressing: async () => { throw new Error('classifier unavailable') }
+  })
+  await harness.run()
+  assert.equal(harness.calls.ai, 0)
+})
+
+test('does not call the name intent classifier for messages without the name', async () => {
+  let classifications = 0
+  const harness = createHarness([{ type: 'text', data: { text: '普通群聊内容' } }], {
+    classifyAddressing: async () => {
+      classifications += 1
+      return { addressed: true, confidence: 1 }
+    }
+  })
+  await harness.run()
+  assert.equal(classifications, 0)
 })
 
 test('archives mentions and quoted author as structured memory evidence', async () => {
