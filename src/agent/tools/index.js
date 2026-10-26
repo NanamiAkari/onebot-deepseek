@@ -49,6 +49,16 @@ function messageArraySchema(description) {
 
 function createDefaultToolRegistry(options = {}) {
   const registry = createToolRegistry()
+  if (options.webSearch === true) {
+    registry.register({
+      name: 'web_search',
+      description: '联网查询实时信息、新闻、价格、天气、赛事、软件版本、公开资料或需要核验的事实。仅在当前知识不足或用户明确要求查询最新信息时调用；不要把普通闲聊、已有确定答案或需要登录的私人数据交给搜索。',
+      inputSchema: objectSchema({
+        query: stringField('简洁、具体的搜索关键词；包含必要的对象、时间和限定条件'),
+        max_results: { type: 'integer', description: '最多返回几条网页来源，默认使用服务配置，最多8条', minimum: 1, maximum: 8 }
+      }, ['query'])
+    })
+  }
   registry.register({
     name: 'get_msg',
     description: '按 message_id 读取被引用消息内容',

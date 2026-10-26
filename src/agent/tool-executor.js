@@ -8,7 +8,7 @@ const MAX_DIRECTORY_ENTRIES = 500
 class ToolError extends Error {}
 
 function createToolExecutor(deps) {
-  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory } = deps
+  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch } = deps
   const policy = createToolPolicy(deps)
 
   function ensureWorkspace() {
@@ -289,6 +289,19 @@ function createToolExecutor(deps) {
     }
   }
 
+  async function runWebSearch(args) {
+    if (!webSearch || typeof webSearch.search !== 'function' || typeof webSearch.available === 'function' && !webSearch.available()) {
+      throw new ToolError('联网搜索不可用')
+    }
+    const query = String(args.query || '').trim()
+    if (!query) throw new ToolError('web_search requires query')
+    try {
+      return await webSearch.search(query, { maxResults: args.max_results })
+    } catch (error) {
+      throw new ToolError(String(error && error.message ? error.message : '联网搜索失败').slice(0, 200))
+    }
+  }
+
   const handlers = {
     get_msg: runGetMsg,
     get_image: runGetImage,
@@ -308,6 +321,7 @@ function createToolExecutor(deps) {
     edit_file: async (args) => runEditFile(args),
     list_dir: async (args) => runListDir(args)
   }
+  if (webSearch && typeof webSearch.search === 'function') handlers.web_search = runWebSearch
 
   async function execute(name, args, runtime) {
     const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {}

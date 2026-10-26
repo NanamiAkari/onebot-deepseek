@@ -179,3 +179,20 @@ test('recent-message tool awaits storage and reports incomplete scan coverage', 
   assert.equal(result.data.scan_truncated, true)
   assert.match(result.data.instruction, /未扫描完整历史/)
 })
+
+test('web search tool passes bounded arguments and returns structured sources', async (t) => {
+  const calls = []
+  const webSearch = {
+    available: () => true,
+    search: async (query, options) => {
+      calls.push({ query, options })
+      return { query, provider: 'test', answer: '实时答案', results: [{ title: '来源', url: 'https://example.com', snippet: '摘要' }] }
+    }
+  }
+  const { executor } = fixture(t, { webSearch })
+  assert.equal(executor.isAllowed('web_search', trustedRuntime), true)
+  const result = await executor.execute('web_search', { query: '最新消息', max_results: 3 }, trustedRuntime)
+  assert.equal(result.ok, true)
+  assert.equal(result.data.answer, '实时答案')
+  assert.deepEqual(calls, [{ query: '最新消息', options: { maxResults: 3 } }])
+})

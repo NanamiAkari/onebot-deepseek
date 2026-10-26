@@ -81,11 +81,21 @@
   - `send_group_msg`
   - `send_private_msg`
   - `history`
+  - `web_search`：按需联网查询实时信息，支持 Tavily、博查、SearXNG 和 DeepSeek 原生搜索
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
 - AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用
+- 联网搜索不会在每条消息上自动运行，而是由模型判断需要实时或外部资料时调用；`auto` 模式会依次选择已配置的 Tavily、博查、SearXNG、DeepSeek，DeepSeek 默认复用 `DEEPSEEK_API_KEY`
 - 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
+
+## 联网搜索
+- `web_search` 由模型按需调用，适合查询新闻、天气、价格、赛事、软件版本和需要核验的公开资料
+- `AI_WEB_SEARCH_PROVIDER=auto` 时，依次选择已配置的 Tavily、博查、SearXNG、DeepSeek；也可以明确指定其中一个
+- DeepSeek 原生搜索默认复用 `DEEPSEEK_API_KEY`，通过 `DEEPSEEK_SEARCH_API_URL` 和 `DEEPSEEK_SEARCH_MODEL` 调整接口与模型
+- `AI_WEB_SEARCH_MAX_RESULTS`、`AI_WEB_SEARCH_TIMEOUT_MS`、`AI_WEB_SEARCH_MAX_CHARS` 分别限制来源数量、请求时间和返回内容长度
+- SearXNG 需要开启 JSON 输出；Tavily、博查分别使用 `TAVILY_API_KEY`、`BOCHA_API_KEY`
+- 搜索结果是外部资料，工具提示会要求模型忽略网页中的指令，并在回复中给出相关来源链接
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。

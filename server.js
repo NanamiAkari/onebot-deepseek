@@ -13,6 +13,7 @@ const { createMessageHandler } = require('./src/app/message-handler')
 const { createMemberMemory, previousLocalDate } = require('./src/memory/member-memory')
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
+const { createWebSearch } = require('./src/web-search')
 
 const {
   PROJECT_ROOT,
@@ -32,6 +33,17 @@ const {
   GROUP_REQUIRE_MENTION,
   PREFIXES,
   ADMIN_USER_IDS,
+  AI_WEB_SEARCH_ENABLE,
+  AI_WEB_SEARCH_PROVIDER,
+  AI_WEB_SEARCH_MAX_RESULTS,
+  AI_WEB_SEARCH_TIMEOUT_MS,
+  AI_WEB_SEARCH_MAX_CHARS,
+  TAVILY_API_KEY,
+  BOCHA_API_KEY,
+  SEARXNG_BASE_URL,
+  DEEPSEEK_SEARCH_API_KEY,
+  DEEPSEEK_SEARCH_API_URL,
+  DEEPSEEK_SEARCH_MODEL,
   IGNORE_REGEX,
   MAX_MEDIA_BYTES,
   MEDIA_REFERER,
@@ -107,9 +119,23 @@ const memberMemory = createMemberMemory({
   maxRetries: AI_MEMORY_MAX_RETRIES
 })
 const { pending, pokeCooldown, roleCache, mediaCache, customReplyDrafts, scheduleTaskDrafts, getKey, pushHistory, getHistoryRaw, needContext, getContext, recordGroupMessage, getRecentGroupContext, clearHistory, cleanup: cleanupSessionStore } = sessionStore
-const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE, fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE })
+const webSearch = createWebSearch({
+  enabled: AI_WEB_SEARCH_ENABLE,
+  provider: AI_WEB_SEARCH_PROVIDER,
+  maxResults: AI_WEB_SEARCH_MAX_RESULTS,
+  timeoutMs: AI_WEB_SEARCH_TIMEOUT_MS,
+  maxChars: AI_WEB_SEARCH_MAX_CHARS,
+  tavilyApiKey: TAVILY_API_KEY,
+  bochaApiKey: BOCHA_API_KEY,
+  searxngBaseUrl: SEARXNG_BASE_URL,
+  deepseekApiKey: DEEPSEEK_SEARCH_API_KEY,
+  deepseekApiUrl: DEEPSEEK_SEARCH_API_URL,
+  deepseekModel: DEEPSEEK_SEARCH_MODEL,
+  httpsAgent: HTTPS_AGENT
+})
+const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE, fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE, webSearch: webSearch.available() })
 const toolExecutor = createToolExecutor({
-  sendAction, getHistoryRaw, memberMemory,
+  sendAction, getHistoryRaw, memberMemory, webSearch,
   workspaceRoot: path.join(PROJECT_ROOT, 'tool_workspace'),
   fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
   fileToolAdminUserIds: ADMIN_USER_IDS

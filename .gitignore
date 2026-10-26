@@ -32,3 +32,4 @@ coverage/
 !test/tool-executor.test.js
 !test/request-queue.test.js
 !test/agent-runner.test.js
+!test/web-search.test.js
