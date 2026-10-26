@@ -78,7 +78,7 @@ jobs:
             -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
             "$PROD_USER@$PROD_HOST" \
-            'set -e; cd /opt/onebot-deepseek; npm install --omit=dev --no-audit --no-fund; node scripts/check-syntax.js; sudo -n systemctl restart onebot-deepseek; test "$(sudo -n systemctl is-active onebot-deepseek)" = active'
+            'set -e; cd /opt/onebot-deepseek; NPM_CONFIG_CACHE=/tmp/onebot-deepseek-npm-cache npm install --omit=dev --no-audit --no-fund; node scripts/check-syntax.js; sudo -n systemctl restart onebot-deepseek; test "$(sudo -n systemctl is-active onebot-deepseek)" = active'
 
           printf '%s\n' "$GITHUB_SHA" \
             | ssh -i "$HOME/.ssh/onebot_deploy_key" \
