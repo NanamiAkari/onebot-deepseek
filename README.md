@@ -53,7 +53,7 @@
 - 私聊默认可直接回复；群聊可按 `@机器人` / 模型判断的称呼意图触发
 - 使用 `AI_PREFIXES`（如“阿卡林”）触发AI对话时，前缀仍会作为用户原话的一部分传给模型，不会从对话内容中删除。
 - 模型输入会同时标明句首“阿卡林”只是称呼/触发词，并提供去前缀后的实际话题，避免把“阿卡林灯灯……”误解成复合名字或以阿卡林为主语。
-- 群消息中出现 `AI_PREFIXES` 的称呼时，会先交给上游模型判断是在呼叫机器人还是在讨论角色；分类失败时默认不插话。`@机器人` 仍直接触发。
+- 群消息中出现 `AI_PREFIXES` 的称呼时，会结合当前句、最近群聊和近期机器人对话，交给上游模型判断是在呼叫机器人还是第三人称讨论；称呼出现在句中或句尾同样适用。分类失败时默认不插话，`@机器人` 仍直接触发。
 - 消息进入 `message-handler -> agent runner -> provider -> tool executor` 主链路
 - 当前已支持多轮 agent loop、工具注册表、dispatch map、统一 tool result 格式
 - 上游或工具链失败时通常返回失败提示；图片回复被上游判定为未读到图片时会尝试 Gemini，特定 OpenAI 403 限制会尝试已配置的 DeepSeek
@@ -84,6 +84,7 @@
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
+- AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用
 - 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
 
 ## 服务器部署（systemd）

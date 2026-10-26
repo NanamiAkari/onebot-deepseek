@@ -7,6 +7,7 @@ function createMessageHandler(deps) {
     pushHistory,
     recordGroupMessage,
     getRecentGroupContext,
+    getHistoryRaw,
     sendAction,
     extractContent,
     resolveMediaSources,
@@ -315,7 +316,17 @@ function createMessageHandler(deps) {
       const prefixMentioned = Array.isArray(PREFIXES) && PREFIXES.some((prefix) => prefix && rawText.includes(String(prefix)))
       if (isGroup && requirePrefix && AI_NAME_INTENT_ENABLE !== false && prefixMentioned && typeof classifyAddressing === 'function') {
         try {
-          const decision = await classifyAddressing(rawText, payload)
+          const intentContext = {
+            recentGroupMessages: typeof getRecentGroupContext === 'function'
+              ? getRecentGroupContext(payload, rawText).map((item) => String(item.content || '')).filter(Boolean).slice(-8)
+              : [],
+            recentConversation: typeof getHistoryRaw === 'function'
+              ? getHistoryRaw(payload).map((item) => `${item.role === 'assistant' ? '机器人' : '用户'}：${String(item.content || '')}`).filter(Boolean).slice(-8)
+              : [],
+            quotedText: String(content.quotedText || '').trim(),
+            senderName: String((payload.sender && (payload.sender.card || payload.sender.nickname)) || '').trim().slice(0, 80)
+          }
+          const decision = await classifyAddressing(rawText, payload, intentContext)
           prefixTriggered = Boolean(decision && decision.addressed && Number(decision.confidence) >= Number(AI_NAME_INTENT_THRESHOLD))
         } catch (error) {
           prefixTriggered = false
@@ -410,7 +421,7 @@ function createMessageHandler(deps) {
       if (!aiText) return
       const action = isGroup ? 'send_group_msg' : 'send_private_msg'
       const sentTexts = []
-      const messageBatches = buildReplySegments(payload.message_id, aiText)
+      const messageBatches = buildReplySegments(payload.message_id, aiText, { includeReply: Boolean(content.replyId) })
       const firstAttempt = await sendReplyBatches(ws, action, payload, messageBatches)
       sentTexts.push(...firstAttempt.sentTexts)
       if (!firstAttempt.ok) {

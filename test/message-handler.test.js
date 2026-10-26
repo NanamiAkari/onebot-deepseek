@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const { createMessageHandler } = require('../src/app/message-handler')
 
 function createHarness(message, options = {}) {
-  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [] }
+  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [], replyBuildOptions: [] }
   const prefix = '阿卡林'
   const handler = createMessageHandler({
     pending: new Map(),
@@ -50,6 +50,8 @@ function createHarness(message, options = {}) {
       return value.startsWith(prefix) ? value.slice(prefix.length).trim() : value
     },
     getContext: () => [],
+    getHistoryRaw: () => options.recentConversation || [],
+    getRecentGroupContext: () => options.recentGroupMessages || [],
     memberMemory: {
       recordMessage: (payload, text, relations) => calls.archived.push({ payload, text, relations }),
       buildStyleContext: () => '',
@@ -62,7 +64,10 @@ function createHarness(message, options = {}) {
         return { text: 'AI回复' }
       }
     },
-    buildReplySegments: (_messageId, text) => [[{ type: 'text', data: { text } }]],
+    buildReplySegments: (_messageId, text, buildOptions = {}) => {
+      calls.replyBuildOptions.push(buildOptions)
+      return [[{ type: 'text', data: { text } }]]
+    },
     AI_POKE_ENABLE: false,
     AI_POKE_COOLDOWN: 0,
     AI_POKE_REPLY_TEXT: '',
@@ -154,6 +159,47 @@ test('uses model intent for an in-message bot name mention', async () => {
   assert.equal(classifications, 1)
   assert.equal(harness.calls.ai, 1)
   assert.match(harness.calls.modelMessages[0], /有人知道阿卡林在吗/)
+})
+
+test('passes recent group and bot conversation context to the name classifier', async () => {
+  let capturedContext = null
+  const harness = createHarness([{ type: 'text', data: { text: '这个功能你会吗，阿卡林' } }], {
+    recentGroupMessages: [{ role: 'user', content: '小明：刚才那个队列问题还没解决' }],
+    recentConversation: [
+      { role: 'user', content: '阿卡林帮我看看队列' },
+      { role: 'assistant', content: '可以，先检查超时配置。' }
+    ],
+    classifyAddressing: async (_text, _payload, context) => {
+      capturedContext = context
+      return { addressed: true, confidence: 0.93 }
+    }
+  })
+  await harness.run()
+  assert.deepEqual(capturedContext.recentGroupMessages, ['小明：刚才那个队列问题还没解决'])
+  assert.deepEqual(capturedContext.recentConversation, [
+    '用户：阿卡林帮我看看队列',
+    '机器人：可以，先检查超时配置。'
+  ])
+  assert.equal(harness.calls.ai, 1)
+})
+
+test('does not quote the triggering message for a normal AI reply', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林你好' } }])
+  await harness.run()
+  assert.equal(harness.calls.ai, 1)
+  assert.equal(harness.calls.replyBuildOptions[0].includeReply, false)
+})
+
+test('quotes the original message only when the user explicitly replied to it', async () => {
+  const harness = createHarness([
+    { type: 'reply', data: { id: '88' } },
+    { type: 'text', data: { text: '阿卡林你怎么看' } }
+  ], {
+    quotedMessage: { user_id: 20, message: [{ type: 'text', data: { text: '前面的内容' } }] }
+  })
+  await harness.run()
+  assert.equal(harness.calls.ai, 1)
+  assert.equal(harness.calls.replyBuildOptions[0].includeReply, true)
 })
 
 test('does not reply when the model classifies the name as a character discussion', async () => {
