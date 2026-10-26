@@ -1,0 +1,89 @@
+name: Deploy OneBot
+
+on:
+  push:
+    branches:
+      - official
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onebot-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to the light server
+    runs-on: ubuntu-latest
+    environment: OneBot
+
+    steps:
+      - name: Checkout official
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$PROD_HOST"
+          test -n "$PROD_PORT"
+          test -n "$PROD_SSH_KEY"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_KEY" > "$HOME/.ssh/onebot_deploy_key"
+          chmod 600 "$HOME/.ssh/onebot_deploy_key"
+          ssh-keyscan -p "$PROD_PORT" -H "$PROD_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+
+      - name: Upload application files
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -euo pipefail
+          tar -czf - \
+            --exclude='./.git' \
+            --exclude='./.env' \
+            --exclude='./node_modules' \
+            --exclude='./memory_data' \
+            --exclude='./generated_images' \
+            --exclude='./sticker_data' \
+            --exclude='./tool_workspace' \
+            --exclude='./guild1.db*' \
+            --exclude='./.playwright-cli' \
+            . \
+            | ssh -i "$HOME/.ssh/onebot_deploy_key" \
+                -p "$PROD_PORT" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "$PROD_USER@$PROD_HOST" \
+                'tar -xzf - -C /opt/onebot-deepseek'
+
+      - name: Install dependencies and restart service
+        shell: bash
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/onebot_deploy_key" \
+            -p "$PROD_PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$PROD_USER@$PROD_HOST" \
+            'set -e; cd /opt/onebot-deepseek; npm install --omit=dev --no-audit --no-fund; node scripts/check-syntax.js; sudo -n systemctl restart onebot-deepseek; test "$(sudo -n systemctl is-active onebot-deepseek)" = active'
+
+          printf '%s\n' "$GITHUB_SHA" \
+            | ssh -i "$HOME/.ssh/onebot_deploy_key" \
+                -p "$PROD_PORT" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "$PROD_USER@$PROD_HOST" \
+                'cat > /opt/onebot-deepseek/.deploy-commit'

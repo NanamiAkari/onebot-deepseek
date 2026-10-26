@@ -115,6 +115,11 @@
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。
+
+## GitHub Actions 自动部署
+- `official` 分支已配置部署工作流，推送提交或手动运行工作流都会部署到生产服务器。
+- 工作流使用仓库环境 `OneBot` 中的 `PROD_HOST`、`PROD_PORT`、`PROD_USER` 和 `PROD_SSH_KEY`，通过 SSH 上传代码后执行依赖安装、语法检查并重启 `onebot-deepseek.service`。
+- 部署会保留服务器上的 `.env`、`memory_data/`、`generated_images/`、`sticker_data/`、`tool_workspace/` 和数据库文件，不把这些运行数据提交到仓库。
 - 首次部署或更新依赖时，请在服务器项目目录重新安装依赖：
 ```
 cd /opt/onebot-deepseek

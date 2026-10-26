@@ -8,6 +8,7 @@ generated_images/
 poke_replies.json
 custom_replies.json
 scheduled_tasks.json
+.deploy-commit
 memory_data/
 tool_workspace/
 sticker_data/
