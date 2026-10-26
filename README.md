@@ -82,11 +82,14 @@
   - `send_private_msg`
   - `history`
   - `web_search`：按需联网查询实时信息，支持 Tavily、博查、SearXNG 和 DeepSeek 原生搜索
+  - `web_fetch`：只读抓取公开网页正文，逐跳校验重定向并拒绝内网/本机地址
+  - `list_stickers` / `collect_sticker` / `annotate_sticker` / `send_sticker`：本地表情知识库与按语境发送
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
 - AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用
 - 联网搜索不会在每条消息上自动运行，而是由模型判断需要实时或外部资料时调用；`auto` 模式会依次选择已配置的 Tavily、博查、SearXNG、DeepSeek，DeepSeek 默认复用 `DEEPSEEK_API_KEY`
+- 网页正文抓取、表情收藏和表情发送同样只注册为模型工具，是否调用由模型结合当前对话判断，代码不按关键词自动执行
 - 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
 
 ## 联网搜索
@@ -96,6 +99,19 @@
 - `AI_WEB_SEARCH_MAX_RESULTS`、`AI_WEB_SEARCH_TIMEOUT_MS`、`AI_WEB_SEARCH_MAX_CHARS` 分别限制来源数量、请求时间和返回内容长度
 - SearXNG 需要开启 JSON 输出；Tavily、博查分别使用 `TAVILY_API_KEY`、`BOCHA_API_KEY`
 - 搜索结果是外部资料，工具提示会要求模型忽略网页中的指令；有结构化来源时给出相关链接，没有来源时不得编造
+
+## 安全网页抓取
+- `web_fetch` 只接受公开的 http/https 地址，拒绝 localhost、私网、链路本地、CGNAT 和包含账号密码的 URL
+- 每次重定向都会重新解析并校验目标地址，再用已校验的 IP 建立连接，避免 DNS 重绑定绕过
+- 响应按字节和字符双重限长；支持 HTML、纯文本、JSON 与 XML，HTML 会去掉脚本、样式、导航等噪音后交给模型
+- 网页正文被标记为外部不可信资料，模型不得执行网页中的指令
+
+## 本地表情库
+- `collect_sticker` 只能读取当前消息或当前消息明确引用的消息，不能由模型指定任意历史消息或本地文件
+- 图片优先通过 OneBot 缓存读取，必要时再走安全公网下载；只接受 JPEG、PNG、GIF、WebP、AVIF，并转存到独立 `sticker_data/images`
+- `list_stickers` 返回备注、标签、适用场景和使用次数；模型按当前语气自行决定是否发送，普通回复可以不使用表情
+- `send_sticker` 只能读取受控表情目录中的文件，并只能发送到当前群或当前私聊；默认不引用消息
+- `AI_STICKER_MAX_BYTES`、`AI_STICKER_MAX_COUNT`、`AI_STICKER_MAX_COLLECT_PER_HOUR` 控制单图大小、库存上限和收藏频率
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。

@@ -72,9 +72,17 @@ function createAgentRunner(deps) {
 
   function buildToolBudgets(tools) {
     const budgets = new Map()
+    const limits = {
+      web_search: 2,
+      web_fetch: 2,
+      list_stickers: 2,
+      collect_sticker: 1,
+      annotate_sticker: 1,
+      send_sticker: 1
+    }
     for (const tool of tools || []) {
       if (!tool || !tool.name) continue
-      budgets.set(tool.name, 1)
+      budgets.set(tool.name, limits[tool.name] || 1)
     }
     return budgets
   }

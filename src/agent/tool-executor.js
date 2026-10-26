@@ -8,7 +8,7 @@ const MAX_DIRECTORY_ENTRIES = 500
 class ToolError extends Error {}
 
 function createToolExecutor(deps) {
-  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch } = deps
+  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes } = deps
   const policy = createToolPolicy(deps)
 
   function ensureWorkspace() {
@@ -302,6 +302,176 @@ function createToolExecutor(deps) {
     }
   }
 
+  async function runWebFetch(args) {
+    if (!webFetch || typeof webFetch.fetch !== 'function' || typeof webFetch.available === 'function' && !webFetch.available()) {
+      throw new ToolError('网页正文抓取不可用')
+    }
+    const url = String(args.url || '').trim()
+    if (!url) throw new ToolError('web_fetch requires url')
+    try {
+      return await webFetch.fetch(url)
+    } catch (error) {
+      throw new ToolError(String(error && error.message ? error.message : '网页正文抓取失败').slice(0, 200))
+    }
+  }
+
+  function imageCandidates(message) {
+    const candidates = []
+    if (Array.isArray(message)) {
+      for (const segment of message) {
+        if (!segment || segment.type !== 'image' || !segment.data) continue
+        const file = String(segment.data.file || segment.data.file_id || '').trim()
+        const url = String(segment.data.url || segment.data.path || '').trim()
+        if (file || url) candidates.push({ file, url })
+      }
+      return candidates
+    }
+    const text = String(message || '')
+    for (const match of text.matchAll(/\[CQ:image,([^\]]+)\]/g)) {
+      const values = {}
+      for (const part of match[1].split(',')) {
+        const index = part.indexOf('=')
+        if (index > 0) values[part.slice(0, index)] = part.slice(index + 1)
+      }
+      const file = String(values.file || values.file_id || '').trim()
+      const url = String(values.url || values.path || '').trim()
+      if (file || url) candidates.push({ file, url })
+    }
+    return candidates
+  }
+
+  function allowedStickerMessageIds(payload) {
+    const ids = new Set()
+    if (payload && payload.message_id != null) ids.add(String(payload.message_id))
+    const message = payload && payload.message
+    if (Array.isArray(message)) {
+      for (const segment of message) {
+        if (segment && segment.type === 'reply' && segment.data) {
+          const id = String(segment.data.id || segment.data.message_id || '')
+          if (id) ids.add(id)
+        }
+      }
+    } else {
+      for (const match of String(message || '').matchAll(/\[CQ:reply,(?:id|message_id)=([^,\]]+)/g)) ids.add(match[1])
+    }
+    return ids
+  }
+
+  function readLocalImage(filePath) {
+    const stat = fs.lstatSync(filePath)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0) throw new ToolError('图片缓存文件不可用')
+    const maxBytes = Math.max(65536, Math.min(20 * 1024 * 1024, Number(stickerMaxBytes) || 10 * 1024 * 1024))
+    if (stat.size > maxBytes) throw new ToolError('图片超过大小上限')
+    const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+    try {
+      return fs.readFileSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+
+  function decodeBase64Image(value) {
+    const text = String(value || '').trim().replace(/^base64:\/\//i, '')
+    if (!text || !/^[a-z0-9+/=\s]+$/i.test(text)) return null
+    const buffer = Buffer.from(text, 'base64')
+    return buffer.length ? buffer : null
+  }
+
+  async function stickerBytes(candidate, runtime) {
+    if (!candidate) throw new ToolError('没有可收藏的图片')
+    let remoteUrl = /^https?:\/\//i.test(candidate.url || '') ? candidate.url : ''
+    if (/^base64:\/\//i.test(candidate.file || '')) {
+      const buffer = decodeBase64Image(candidate.file)
+      if (buffer) return buffer
+    }
+    if (/^https?:\/\//i.test(candidate.file || '')) remoteUrl = candidate.file
+    if (candidate.file && !/^https?:\/\//i.test(candidate.file) && !/^base64:\/\//i.test(candidate.file)) {
+      const response = await oneBotAction(runtime.ws, 'get_image', { file: candidate.file })
+      const data = response.data && typeof response.data === 'object' ? response.data : {}
+      const base64 = decodeBase64Image(data.base64 || data.file_base64 || '')
+      if (base64) return base64
+      if (data.file && fs.existsSync(String(data.file))) return readLocalImage(String(data.file))
+      if (data.url) remoteUrl = String(data.url)
+    }
+    if (!remoteUrl) throw new ToolError('OneBot 没有返回可读取的图片')
+    if (!webFetch || typeof webFetch.fetchBinary !== 'function') throw new ToolError('安全图片下载不可用')
+    const result = await webFetch.fetchBinary(remoteUrl, stickerMaxBytes)
+    return result.buffer
+  }
+
+  async function runListStickers(args) {
+    if (!stickers || typeof stickers.list !== 'function' || typeof stickers.available === 'function' && !stickers.available()) {
+      throw new ToolError('表情库不可用')
+    }
+    return stickers.list(args.query || '', args.limit)
+  }
+
+  async function runAnnotateSticker(args) {
+    if (!stickers || typeof stickers.annotate !== 'function') throw new ToolError('表情库不可用')
+    const entry = stickers.annotate(args.sticker_id, {
+      note: args.note,
+      tags: args.tags,
+      usage: args.usage
+    })
+    if (!entry) throw new ToolError('找不到这个表情')
+    return { updated: true, sticker: entry }
+  }
+
+  async function runCollectSticker(args, runtime) {
+    const payload = runtime && runtime.payload
+    if (!stickers || typeof stickers.collect !== 'function' || !payload) throw new ToolError('表情库不可用')
+    const messageId = String(args.message_id || payload.message_id || '')
+    if (!messageId || !allowedStickerMessageIds(payload).has(messageId)) {
+      throw new ToolError('只能收藏当前消息或当前消息引用的消息')
+    }
+    let message = payload.message
+    if (messageId !== String(payload.message_id || '')) {
+      const response = await oneBotAction(runtime.ws, 'get_msg', { message_id: messageId })
+      message = response.data && response.data.message
+    }
+    const candidates = imageCandidates(message)
+    const imageIndex = Math.max(1, Math.min(10, Number(args.image_index) || 1)) - 1
+    const candidate = candidates[imageIndex]
+    if (!candidate) throw new ToolError('指定消息没有可收藏的图片')
+    const sourceKey = `${payload.group_id || payload.user_id || ''}:${messageId}:${imageIndex}:${candidate.file || candidate.url}`
+    const entry = await stickers.collect({
+      key: sourceKey,
+      note: args.note,
+      tags: args.tags,
+      usage: args.usage,
+      getBytes: () => stickerBytes(candidate, runtime)
+    })
+    return { collected: true, sticker: entry }
+  }
+
+  async function runSendSticker(args, runtime) {
+    if (!stickers || typeof stickers.readForSend !== 'function' || !runtime || !runtime.ws || !runtime.payload) {
+      throw new ToolError('表情库不可用')
+    }
+    const payload = runtime.payload
+    const replyId = String(args.reply_to_message_id || '')
+    if (replyId && !allowedStickerMessageIds(payload).has(replyId)) {
+      throw new ToolError('只能引用当前消息或当前消息引用的消息')
+    }
+    const image = stickers.readForSend(args.sticker_id)
+    const message = [
+      ...(replyId ? [{ type: 'reply', data: { id: replyId } }] : []),
+      { type: 'image', data: { file: `base64://${image.buffer.toString('base64')}` } }
+    ]
+    const action = payload.message_type === 'group' ? 'send_group_msg' : 'send_private_msg'
+    const params = payload.message_type === 'group'
+      ? { group_id: payload.group_id, message }
+      : { user_id: payload.user_id, message }
+    const result = await oneBotAction(runtime.ws, action, params)
+    stickers.markUsed(args.sticker_id, String(payload.message || '').slice(0, 200))
+    return {
+      sent: true,
+      sticker_id: args.sticker_id,
+      message_id: result.data && (result.data.message_id || result.data.messageId) || null,
+      note: '表情已发送。不要向用户汇报工具调用过程。'
+    }
+  }
+
   const handlers = {
     get_msg: runGetMsg,
     get_image: runGetImage,
@@ -322,6 +492,13 @@ function createToolExecutor(deps) {
     list_dir: async (args) => runListDir(args)
   }
   if (webSearch && typeof webSearch.search === 'function') handlers.web_search = runWebSearch
+  if (webFetch && typeof webFetch.fetch === 'function') handlers.web_fetch = runWebFetch
+  if (stickers && typeof stickers.list === 'function') {
+    handlers.list_stickers = runListStickers
+    handlers.annotate_sticker = runAnnotateSticker
+    handlers.collect_sticker = runCollectSticker
+    handlers.send_sticker = runSendSticker
+  }
 
   async function execute(name, args, runtime) {
     const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {}

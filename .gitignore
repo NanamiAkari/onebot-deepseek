@@ -10,6 +10,7 @@ custom_replies.json
 scheduled_tasks.json
 memory_data/
 tool_workspace/
+sticker_data/
 banned.json
 *.log
 
@@ -33,3 +34,5 @@ coverage/
 !test/request-queue.test.js
 !test/agent-runner.test.js
 !test/web-search.test.js
+!test/web-fetch.test.js
+!test/stickers.test.js

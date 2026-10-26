@@ -196,3 +196,68 @@ test('web search tool passes bounded arguments and returns structured sources', 
   assert.equal(result.data.answer, '实时答案')
   assert.deepEqual(calls, [{ query: '最新消息', options: { maxResults: 3 } }])
 })
+
+test('web fetch tool returns readable page data through the safe fetch service', async (t) => {
+  const webFetch = {
+    available: () => true,
+    fetch: async (url) => ({ url, status_code: 200, title: '标题', content: '正文', truncated: false })
+  }
+  const { executor } = fixture(t, { webFetch })
+  const result = await executor.execute('web_fetch', { url: 'https://example.com/article' }, trustedRuntime)
+  assert.equal(result.ok, true)
+  assert.equal(result.data.content, '正文')
+  assert.equal(executor.isAllowed('web_fetch', trustedRuntime), true)
+})
+
+test('send sticker only targets the current conversation and defaults to no quote', async (t) => {
+  const stickers = {
+    list: () => ({ stickers: [] }),
+    readForSend: () => ({ buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' }),
+    markUsed: () => ({})
+  }
+  const { executor, actions } = fixture(t, { stickers })
+  const result = await executor.execute('send_sticker', { sticker_id: 'st_test' }, trustedRuntime)
+  assert.equal(result.ok, true)
+  assert.equal(actions.length, 1)
+  assert.equal(actions[0].action, 'send_group_msg')
+  assert.equal(actions[0].params.group_id, 10)
+  assert.equal(actions[0].params.message.length, 1)
+  assert.equal(actions[0].params.message[0].type, 'image')
+  assert.match(actions[0].params.message[0].data.file, /^base64:\/\//)
+})
+
+test('collect sticker reads only the current message image through safe download', async (t) => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
+  let collected = null
+  const stickers = {
+    list: () => ({ stickers: [] }),
+    collect: async (input) => {
+      collected = { ...input, bytes: await input.getBytes() }
+      return { id: 'st_test', note: input.note }
+    }
+  }
+  const webFetch = { fetchBinary: async () => ({ buffer: png, contentType: 'image/png' }) }
+  const { executor } = fixture(t, {
+    stickers,
+    webFetch,
+    sendAction: async (_ws, action) => {
+      assert.equal(action, 'get_image')
+      return { status: 'ok', retcode: 0, data: { url: 'https://example.com/image.png' } }
+    }
+  })
+  const runtime = {
+    ws: {},
+    payload: {
+      message_type: 'group',
+      group_id: 10,
+      user_id: 20,
+      message_id: 30,
+      message: [{ type: 'image', data: { file: 'image-file' } }]
+    }
+  }
+  const result = await executor.execute('collect_sticker', { note: '开心点赞', tags: ['点赞'] }, runtime)
+  assert.equal(result.ok, true)
+  assert.equal(collected.note, '开心点赞')
+  assert.deepEqual(collected.bytes, png)
+  assert.match(collected.key, /30/)
+})

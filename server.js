@@ -14,6 +14,8 @@ const { createMemberMemory, previousLocalDate } = require('./src/memory/member-m
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
 const { createWebSearch } = require('./src/web-search')
+const { createWebFetch } = require('./src/web-fetch')
+const { createStickerStore } = require('./src/stickers')
 
 const {
   PROJECT_ROOT,
@@ -38,6 +40,15 @@ const {
   AI_WEB_SEARCH_MAX_RESULTS,
   AI_WEB_SEARCH_TIMEOUT_MS,
   AI_WEB_SEARCH_MAX_CHARS,
+  AI_WEB_FETCH_ENABLE,
+  AI_WEB_FETCH_TIMEOUT_MS,
+  AI_WEB_FETCH_MAX_BYTES,
+  AI_WEB_FETCH_MAX_CHARS,
+  AI_STICKER_ENABLE,
+  AI_STICKER_DIR,
+  AI_STICKER_MAX_BYTES,
+  AI_STICKER_MAX_COUNT,
+  AI_STICKER_MAX_COLLECT_PER_HOUR,
   TAVILY_API_KEY,
   BOCHA_API_KEY,
   SEARXNG_BASE_URL,
@@ -133,12 +144,32 @@ const webSearch = createWebSearch({
   deepseekModel: DEEPSEEK_SEARCH_MODEL,
   httpsAgent: HTTPS_AGENT
 })
-const toolRegistry = createDefaultToolRegistry({ memberMemory: AI_MEMORY_ENABLE, fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE, webSearch: webSearch.available() })
+const webFetch = createWebFetch({
+  enabled: AI_WEB_FETCH_ENABLE,
+  timeoutMs: AI_WEB_FETCH_TIMEOUT_MS,
+  maxBytes: AI_WEB_FETCH_MAX_BYTES,
+  maxChars: AI_WEB_FETCH_MAX_CHARS
+})
+const stickers = createStickerStore({
+  enabled: AI_STICKER_ENABLE,
+  rootDir: resolveProjectFile(AI_STICKER_DIR),
+  maxBytes: AI_STICKER_MAX_BYTES,
+  maxCount: AI_STICKER_MAX_COUNT,
+  maxCollectPerHour: AI_STICKER_MAX_COLLECT_PER_HOUR
+})
+const toolRegistry = createDefaultToolRegistry({
+  memberMemory: AI_MEMORY_ENABLE,
+  fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
+  webSearch: webSearch.available(),
+  webFetch: webFetch.available(),
+  stickers: stickers.available()
+})
 const toolExecutor = createToolExecutor({
-  sendAction, getHistoryRaw, memberMemory, webSearch,
+  sendAction, getHistoryRaw, memberMemory, webSearch, webFetch, stickers,
   workspaceRoot: path.join(PROJECT_ROOT, 'tool_workspace'),
   fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
-  fileToolAdminUserIds: ADMIN_USER_IDS
+  fileToolAdminUserIds: ADMIN_USER_IDS,
+  stickerMaxBytes: AI_STICKER_MAX_BYTES
 })
 const aiRequestQueue = createRequestQueue({
   maxConcurrent: config.AI_MAX_CONCURRENT_REQUESTS,
