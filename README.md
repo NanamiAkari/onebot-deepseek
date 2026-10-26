@@ -95,7 +95,7 @@
 - DeepSeek 原生搜索默认复用 `DEEPSEEK_API_KEY`，通过 `DEEPSEEK_SEARCH_API_URL` 和 `DEEPSEEK_SEARCH_MODEL` 调整接口与模型
 - `AI_WEB_SEARCH_MAX_RESULTS`、`AI_WEB_SEARCH_TIMEOUT_MS`、`AI_WEB_SEARCH_MAX_CHARS` 分别限制来源数量、请求时间和返回内容长度
 - SearXNG 需要开启 JSON 输出；Tavily、博查分别使用 `TAVILY_API_KEY`、`BOCHA_API_KEY`
-- 搜索结果是外部资料，工具提示会要求模型忽略网页中的指令，并在回复中给出相关来源链接
+- 搜索结果是外部资料，工具提示会要求模型忽略网页中的指令；有结构化来源时给出相关链接，没有来源时不得编造
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。
