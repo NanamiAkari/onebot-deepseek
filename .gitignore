@@ -16,7 +16,7 @@ banned.json
 *.log
 
 # Local prompt/persona files
-prompt.txt
+# prompt.txt
 
 # Tests and coverage
 test/
