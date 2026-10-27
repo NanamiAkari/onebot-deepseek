@@ -546,6 +546,31 @@ function createToolExecutor(deps) {
     handlers.add_scheduled_task = (args, runtime) => runFeature('addScheduledTask', args, runtime, { admin: true })
     handlers.remove_scheduled_task = (args, runtime) => runFeature('removeScheduledTask', args, runtime, { admin: true })
     handlers.clear_scheduled_tasks = (args, runtime) => runFeature('clearScheduledTasks', args, runtime, { admin: true })
+    handlers.bot_feature = (args, runtime) => {
+      const action = String(args && args.action || '').trim()
+      const definitions = {
+        list_poke_replies: ['listPokeReplies', { group: true }],
+        add_poke_reply: ['addPokeReply', { group: true }],
+        remove_poke_reply: ['removePokeReply', { admin: true }],
+        clear_poke_replies: ['clearPokeReplies', { admin: true }],
+        dedupe_poke_replies: ['dedupePokeReplies', { admin: true }],
+        send_poke: ['sendPoke', { group: true }],
+        list_custom_replies: ['listCustomReplies', { group: true }],
+        get_custom_reply: ['getCustomReply', { group: true }],
+        add_custom_reply: ['addCustomReply', { admin: true }],
+        remove_custom_reply: ['removeCustomReply', { admin: true }],
+        clear_custom_replies: ['clearCustomReplies', { admin: true }],
+        list_scheduled_tasks: ['listScheduledTasks', { group: true }],
+        add_scheduled_task: ['addScheduledTask', { admin: true }],
+        remove_scheduled_task: ['removeScheduledTask', { admin: true }],
+        clear_scheduled_tasks: ['clearScheduledTasks', { admin: true }]
+      }
+      const definition = definitions[action]
+      if (!definition) throw new ToolError('未知的 bot_feature action')
+      const featureArgs = { ...(args || {}) }
+      delete featureArgs.action
+      return runFeature(definition[0], featureArgs, runtime, definition[1])
+    }
   }
 
   async function execute(name, args, runtime) {

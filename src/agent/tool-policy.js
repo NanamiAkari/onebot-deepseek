@@ -1,5 +1,6 @@
 const FILE_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'list_dir'])
 const GROUP_FEATURE_TOOLS = new Set([
+  'bot_feature',
   'list_poke_replies', 'add_poke_reply', 'remove_poke_reply', 'clear_poke_replies', 'dedupe_poke_replies', 'send_poke',
   'list_custom_replies', 'get_custom_reply', 'add_custom_reply', 'remove_custom_reply', 'clear_custom_replies',
   'list_scheduled_tasks', 'add_scheduled_task', 'remove_scheduled_task', 'clear_scheduled_tasks'

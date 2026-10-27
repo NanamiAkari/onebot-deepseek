@@ -84,10 +84,7 @@
   - `web_search`：按需联网查询实时信息，支持 Tavily、博查、SearXNG 和 DeepSeek 原生搜索
   - `web_fetch`：只读抓取公开网页正文，逐跳校验重定向并拒绝内网/本机地址
   - `list_stickers` / `collect_sticker` / `annotate_sticker` / `send_sticker`：本地表情知识库与按语境发送
-  - `list_poke_replies` / `add_poke_reply` / `remove_poke_reply` / `clear_poke_replies` / `dedupe_poke_replies`：按需管理拍一拍回复池
-  - `send_poke`：在当前群拍指定的当前发言者、@成员或已解析成员
-  - `list_custom_replies` / `get_custom_reply` / `add_custom_reply` / `remove_custom_reply` / `clear_custom_replies`：按需管理当前群自定义回复
-  - `list_scheduled_tasks` / `add_scheduled_task` / `remove_scheduled_task` / `clear_scheduled_tasks`：按需管理当前群定时任务
+  - `bot_feature`：通过 `action` 按需管理拍一拍回复池、自定义回复、定时任务，或在当前群拍指定成员；模型只在判断确有对应意图时调用
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
