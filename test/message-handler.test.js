@@ -161,6 +161,19 @@ test('uses model intent for an in-message bot name mention', async () => {
   assert.match(harness.calls.modelMessages[0], /有人知道阿卡林在吗/)
 })
 
+test('does not run a second intent request for an explicit prefix at the start', async () => {
+  let classifications = 0
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林 你好' } }], {
+    classifyAddressing: async () => {
+      classifications += 1
+      return { addressed: true, confidence: 1 }
+    }
+  })
+  await harness.run()
+  assert.equal(classifications, 0)
+  assert.equal(harness.calls.ai, 1)
+})
+
 test('passes recent group and bot conversation context to the name classifier', async () => {
   let capturedContext = null
   const harness = createHarness([{ type: 'text', data: { text: '这个功能你会吗，阿卡林' } }], {
@@ -211,8 +224,8 @@ test('does not reply when the model classifies the name as a character discussio
   assert.equal(harness.calls.custom, 1)
 })
 
-test('fails closed when the name intent classifier errors', async () => {
-  const harness = createHarness([{ type: 'text', data: { text: '阿卡林你在吗' } }], {
+test('fails closed when the ambiguous name intent classifier errors', async () => {
+  const harness = createHarness([{ type: 'text', data: { text: '你在吗，阿卡林' } }], {
     classifyAddressing: async () => { throw new Error('classifier unavailable') }
   })
   await harness.run()

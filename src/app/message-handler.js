@@ -314,7 +314,10 @@ function createMessageHandler(deps) {
       let prefixTriggered = shouldRespond(rawText)
       const requirePrefix = REQUIRE_PREFIX !== false
       const prefixMentioned = Array.isArray(PREFIXES) && PREFIXES.some((prefix) => prefix && rawText.includes(String(prefix)))
-      if (isGroup && requirePrefix && AI_NAME_INTENT_ENABLE !== false && prefixMentioned && typeof classifyAddressing === 'function') {
+      // A configured prefix at the beginning is already an explicit address. Keep
+      // the model classifier for ambiguous in-message or trailing mentions so a
+      // normal reply does not pay for two sequential model requests.
+      if (isGroup && requirePrefix && AI_NAME_INTENT_ENABLE !== false && prefixMentioned && !prefixTriggered && typeof classifyAddressing === 'function') {
         try {
           const intentContext = {
             recentGroupMessages: typeof getRecentGroupContext === 'function'
