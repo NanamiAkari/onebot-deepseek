@@ -162,14 +162,33 @@ const toolRegistry = createDefaultToolRegistry({
   fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
   webSearch: webSearch.available(),
   webFetch: webFetch.available(),
-  stickers: stickers.available()
+  stickers: stickers.available(),
+  botFeatures: true
 })
 const toolExecutor = createToolExecutor({
   sendAction, getHistoryRaw, memberMemory, webSearch, webFetch, stickers,
   workspaceRoot: path.join(PROJECT_ROOT, 'tool_workspace'),
   fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
   fileToolAdminUserIds: ADMIN_USER_IDS,
-  stickerMaxBytes: AI_STICKER_MAX_BYTES
+  stickerMaxBytes: AI_STICKER_MAX_BYTES,
+  featureTools: {
+    isAdmin: (runtime) => isFeatureToolAdmin(runtime),
+    listPokeReplies: (args, runtime) => listPokeRepliesTool(args, runtime),
+    addPokeReply: (args, runtime) => addPokeReplyTool(args, runtime),
+    removePokeReply: (args, runtime) => removePokeReplyTool(args, runtime),
+    clearPokeReplies: (args, runtime) => clearPokeRepliesTool(args, runtime),
+    dedupePokeReplies: (args, runtime) => dedupePokeRepliesTool(args, runtime),
+    sendPoke: (args, runtime) => sendPokeTool(args, runtime),
+    listCustomReplies: (args, runtime) => listCustomRepliesTool(args, runtime),
+    getCustomReply: (args, runtime) => getCustomReplyTool(args, runtime),
+    addCustomReply: (args, runtime) => addCustomReplyTool(args, runtime),
+    removeCustomReply: (args, runtime) => removeCustomReplyTool(args, runtime),
+    clearCustomReplies: (args, runtime) => clearCustomRepliesTool(args, runtime),
+    listScheduledTasks: (args, runtime) => listScheduledTasksTool(args, runtime),
+    addScheduledTask: (args, runtime) => addScheduledTaskTool(args, runtime),
+    removeScheduledTask: (args, runtime) => removeScheduledTaskTool(args, runtime),
+    clearScheduledTasks: (args, runtime) => clearScheduledTasksTool(args, runtime)
+  }
 })
 const aiRequestQueue = createRequestQueue({
   maxConcurrent: config.AI_MAX_CONCURRENT_REQUESTS,
@@ -1119,6 +1138,232 @@ function hasCustomReplyTrigger(groupId, text) {
 
 function isConfiguredAdmin(userId) {
   return ADMIN_USER_IDS.includes(String(userId || ''))
+}
+
+function featureToolPayload(runtime) {
+  return runtime && runtime.payload ? runtime.payload : null
+}
+
+async function isFeatureToolAdmin(runtime) {
+  const payload = featureToolPayload(runtime)
+  if (!payload || payload.message_type !== 'group' || !payload.group_id) return false
+  if (isConfiguredAdmin(payload.user_id)) return true
+  const role = await getUserRole(runtime && runtime.ws, payload.group_id, payload.user_id).catch(() => 'member')
+  return role === 'owner' || role === 'admin'
+}
+
+function toolReplySegments(entry) {
+  const normalized = normalizeCustomReplyEntry(entry)
+  if (!normalized) return []
+  return normalized.segments.map((segment) => {
+    if (segment.type === 'text') return { type: 'text', text: String(segment.data && segment.data.text || '') }
+    if (segment.type === 'image') return { type: 'image' }
+    return { type: segment.type }
+  })
+}
+
+function isAllowedFeatureImageSource(source) {
+  const value = String(source || '').trim()
+  if (!value) return false
+  if (/^(?:https?:\/\/|data:|base64:\/\/)/i.test(value)) return true
+  if (!isLocalFileSource(value)) return false
+  try {
+    const local = path.resolve(/^file:\/\//i.test(value) ? decodeURIComponent(value.replace(/^file:\/\//i, '')) : value)
+    return local === path.resolve(path.join(PROJECT_ROOT, 'poke_media')) || local.startsWith(`${path.resolve(path.join(PROJECT_ROOT, 'poke_media'))}${path.sep}`)
+  } catch {
+    return false
+  }
+}
+
+async function featureEntryFromArgs(args, runtime) {
+  const payload = featureToolPayload(runtime)
+  const ws = runtime && runtime.ws
+  if (Array.isArray(args && args.segments)) {
+    const entry = normalizeCustomReplyEntry({ segments: args.segments })
+    if (entry && entry.segments.every((segment) => segment.type !== 'image' || isAllowedFeatureImageSource(segment.source))) return entry
+  }
+  if (args && typeof args.content === 'string' && args.content.trim()) {
+    return { segments: [{ type: 'text', data: { text: args.content.replace(/\r/g, '').trim() } }] }
+  }
+  if (args && args.use_current_message && payload && ws) {
+    const segments = await captureCustomReplySegments(ws, payload.message)
+    if (segments.length > 0) return { segments }
+  }
+  return null
+}
+
+async function listPokeRepliesTool(_args, _runtime) {
+  const items = refreshPokeReplyTexts()
+  return {
+    count: items.length,
+    items: items.map((item, index) => ({
+      index: index + 1,
+      type: item.type,
+      preview: previewPokeReplyText(item)
+    }))
+  }
+}
+
+async function addPokeReplyTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  let item = null
+  if (args.use_current_image && payload && runtime && runtime.ws) {
+    const content = extractContent(payload.message)
+    const media = await resolveMediaSources(runtime.ws, content.media || [])
+    const image = media.find((entry) => entry && entry.kind === 'image')
+    const source = image && pickPokeImageSource(image)
+    if (source) item = { type: 'image', source: await persistPokeImageSource(source).catch(() => source) }
+  }
+  if (!item && args.source) {
+    if (!isAllowedFeatureImageSource(args.source)) return { ok: false, error: '图片来源只能使用公开图片地址或当前消息中的图片' }
+    item = { type: 'image', source: await persistPokeImageSource(args.source).catch(() => args.source) }
+  }
+  if (!item && typeof args.content === 'string' && args.content.trim()) {
+    item = { type: 'text', content: args.content.replace(/\r/g, '').trim() }
+  }
+  const normalized = normalizePokeReplyItem(item)
+  if (!normalized) return { ok: false, error: '请提供文本内容、图片地址，或在当前消息中附带图片' }
+  const items = refreshPokeReplyTexts()
+  const signature = pokeReplySignature(normalized)
+  if (items.some((entry) => pokeReplySignature(entry) === signature)) return { ok: false, error: '这条拍一拍回复已经存在' }
+  const saved = savePokeReplyTexts(items.concat(normalized))
+  return { added: true, index: saved.length, type: normalized.type, preview: previewPokeReplyText(normalized), count: saved.length }
+}
+
+async function removePokeReplyTool(args = {}, _runtime) {
+  const index = Number(args.index)
+  const items = refreshPokeReplyTexts()
+  if (!Number.isInteger(index) || index < 1 || index > items.length) return { ok: false, error: '没有找到这个拍一拍回复编号' }
+  const removed = items[index - 1]
+  const saved = savePokeReplyTexts(items.slice(0, index - 1).concat(items.slice(index)))
+  return { removed: true, index, preview: previewPokeReplyText(removed), count: saved.length }
+}
+
+async function clearPokeRepliesTool(_args, _runtime) {
+  const count = refreshPokeReplyTexts().length
+  savePokeReplyTexts([])
+  return { cleared: true, removedCount: count }
+}
+
+async function dedupePokeRepliesTool(_args, _runtime) {
+  const items = refreshPokeReplyTexts()
+  const saved = savePokeReplyTexts(dedupeTextList(items))
+  return { deduped: true, removedCount: items.length - saved.length, count: saved.length }
+}
+
+function mentionedUserIdsForFeature(message) {
+  if (Array.isArray(message)) {
+    return message
+      .filter((segment) => segment && segment.type === 'at' && segment.data && segment.data.qq != null)
+      .map((segment) => String(segment.data.qq))
+  }
+  const ids = []
+  for (const match of String(message || '').matchAll(/\[CQ:at,qq=(\d+)\]/g)) ids.push(match[1])
+  return ids
+}
+
+async function sendPokeTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const ws = runtime && runtime.ws
+  const target = String(args.user_id || '').trim()
+  if (!payload || payload.message_type !== 'group' || !ws || !/^\d+$/.test(target)) return { ok: false, error: '只能在当前群拍成员，且目标必须是有效成员' }
+  const allowed = new Set([String(payload.user_id || ''), ...mentionedUserIdsForFeature(payload.message)])
+  for (const id of runtime && runtime.allowedTargetUserIds instanceof Set ? runtime.allowedTargetUserIds : []) allowed.add(String(id))
+  if (!allowed.has(target)) return { ok: false, error: '目标必须是当前发言者、当前消息明确@的成员，或刚解析出的唯一成员' }
+  const result = await sendAction(ws, 'send_group_poke', { group_id: payload.group_id, user_id: target }).catch(() => null)
+  if (!(result && result.status === 'ok')) return { ok: false, error: '拍一拍发送失败' }
+  return { sent: true, group_id: payload.group_id, user_id: target }
+}
+
+async function listCustomRepliesTool(_args, runtime) {
+  const payload = featureToolPayload(runtime)
+  const rules = listCustomReplyTriggers(payload.group_id)
+  return {
+    count: rules.length,
+    items: rules.map((rule) => ({
+      trigger: rule.trigger,
+      count: rule.replies.length,
+      previews: rule.replies.slice(0, 5).map((entry) => previewCustomReplyEntry(entry))
+    }))
+  }
+}
+
+async function getCustomReplyTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const trigger = normalizeCustomReplyTrigger(args.trigger)
+  if (!trigger) return { ok: false, error: '请提供触发词' }
+  const entries = getCustomReplyEntries(payload.group_id, trigger)
+  if (entries.length === 0) return { ok: false, error: '没有找到这个触发词' }
+  return {
+    trigger,
+    count: entries.length,
+    replies: entries.map((entry, index) => ({ index: index + 1, preview: previewCustomReplyEntry(entry), segments: toolReplySegments(entry) }))
+  }
+}
+
+async function addCustomReplyTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const trigger = normalizeCustomReplyTrigger(args.trigger)
+  const entry = await featureEntryFromArgs(args, runtime)
+  if (!trigger || !entry) return { ok: false, error: '请同时提供触发词和回复内容' }
+  const added = addCustomReply(payload.group_id, trigger, entry)
+  if (!added.ok && added.reason === 'duplicate') return { ok: false, error: '这条自定义回复已经存在' }
+  if (!added.ok) return { ok: false, error: '自定义回复内容无效' }
+  return { added: true, trigger, index: added.count, preview: previewCustomReplyEntry(added.entry), count: added.count }
+}
+
+async function removeCustomReplyTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const trigger = normalizeCustomReplyTrigger(args.trigger)
+  if (!trigger) return { ok: false, error: '请提供触发词' }
+  if (Number.isInteger(Number(args.index))) {
+    const index = Number(args.index)
+    const removed = removeCustomReplyEntry(payload.group_id, trigger, index)
+    if (!removed.ok) return { ok: false, error: '没有找到这个自定义回复编号' }
+    return { removed: true, trigger, index, preview: previewCustomReplyEntry(removed.removed), remainingCount: removed.remainingCount }
+  }
+  const removed = removeCustomReply(payload.group_id, trigger)
+  if (!removed.ok) return { ok: false, error: '没有找到这个触发词' }
+  return { removed: true, trigger, removedCount: removed.removedCount }
+}
+
+async function clearCustomRepliesTool(_args, runtime) {
+  const payload = featureToolPayload(runtime)
+  const cleared = clearCustomReplies(payload.group_id)
+  return { cleared: true, removedTriggers: cleared.removedTriggers, removedReplies: cleared.removedReplies }
+}
+
+async function listScheduledTasksTool(_args, runtime) {
+  const payload = featureToolPayload(runtime)
+  const tasks = listScheduledTasks(payload.group_id)
+  return {
+    count: tasks.length,
+    items: tasks.map((task, index) => ({ index: index + 1, schedule: task.specText, nextRunAt: formatScheduleTime(task.nextRunAt), preview: previewCustomReplyEntry(task.content) }))
+  }
+}
+
+async function addScheduledTaskTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const schedule = parseScheduleSpec(args.schedule)
+  const entry = await featureEntryFromArgs(args, runtime)
+  if (!schedule || !entry) return { ok: false, error: '请提供有效的定时规则和发送内容' }
+  const added = addScheduledTask(payload.group_id, schedule, entry, payload.user_id)
+  if (!added.ok && added.reason === 'past') return { ok: false, error: '一次性定时任务的时间必须晚于当前时间' }
+  if (!added.ok) return { ok: false, error: '定时任务创建失败' }
+  return { added: true, index: added.count, id: added.task.id, schedule: added.task.specText, nextRunAt: formatScheduleTime(added.task.nextRunAt), preview: previewCustomReplyEntry(added.task.content) }
+}
+
+async function removeScheduledTaskTool(args = {}, runtime) {
+  const payload = featureToolPayload(runtime)
+  const removed = removeScheduledTask(payload.group_id, Number(args.index))
+  if (!removed.ok) return { ok: false, error: '没有找到这个定时任务编号' }
+  return { removed: true, index: Number(args.index), preview: previewScheduledTask(removed.removed), count: removed.count }
+}
+
+async function clearScheduledTasksTool(_args, runtime) {
+  const payload = featureToolPayload(runtime)
+  const cleared = clearScheduledTasks(payload.group_id)
+  return { cleared: true, removedCount: cleared.removedCount }
 }
 
 const wss = new WebSocketServer({ port: PORT, path: WS_PATH })

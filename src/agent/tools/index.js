@@ -107,6 +107,108 @@ function createDefaultToolRegistry(options = {}) {
       }, ['sticker_id'])
     })
   }
+  if (options.botFeatures === true) {
+    registry.register({
+      name: 'list_poke_replies',
+      description: '查看当前机器人的拍一拍回复池，返回编号、类型和简短预览。用户询问、检查或准备修改拍一拍回复时调用。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'add_poke_reply',
+      description: '向拍一拍回复池添加一条文本或图片回复。文本直接传 content；图片可传 source，或在当前消息带图片时传 use_current_image=true。重复内容不会重复添加。',
+      inputSchema: objectSchema({
+        content: stringField('文本回复内容；图片回复时可省略'),
+        source: stringField('图片地址或当前消息中的图片来源；图片回复时可选'),
+        use_current_image: { type: 'boolean', description: '是否使用当前消息中的第一张图片' }
+      }, [])
+    })
+    registry.register({
+      name: 'remove_poke_reply',
+      description: '删除指定编号的拍一拍回复。需要管理员权限。',
+      inputSchema: objectSchema({
+        index: integerField('回复编号，从1开始', 1)
+      }, ['index'])
+    })
+    registry.register({
+      name: 'clear_poke_replies',
+      description: '清空全部拍一拍回复。需要管理员权限；执行前应确认用户确实要清空。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'dedupe_poke_replies',
+      description: '去除拍一拍回复池中的重复文本或图片。需要管理员权限。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'send_poke',
+      description: '在当前群拍一下指定成员。只有当前发言者、当前消息明确@的成员，或刚通过成员昵称解析出的唯一成员可作为目标；不能指定其他群或任意 QQ 号。',
+      inputSchema: objectSchema({
+        user_id: stringField('目标成员 QQ 号，必须来自当前消息或 resolve_group_member 的唯一结果')
+      }, ['user_id'])
+    })
+    registry.register({
+      name: 'list_custom_replies',
+      description: '查看当前群的自定义回复触发词、回复数量和简短预览。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'get_custom_reply',
+      description: '查看当前群某个自定义回复触发词的具体回复内容。',
+      inputSchema: objectSchema({
+        trigger: stringField('自定义回复触发词')
+      }, ['trigger'])
+    })
+    registry.register({
+      name: 'add_custom_reply',
+      description: '在当前群添加一条自定义回复，需要管理员权限。可传 trigger 和 content 文本，也可传 segments；需要保存当前消息时传 use_current_message=true。',
+      inputSchema: objectSchema({
+        trigger: stringField('触发词'),
+        content: stringField('文本回复内容；使用 segments 或当前消息时可省略'),
+        segments: messageArraySchema('可保存的文本、图片或表情消息段'),
+        use_current_message: { type: 'boolean', description: '是否把当前消息内容作为回复保存' }
+      }, ['trigger'])
+    })
+    registry.register({
+      name: 'remove_custom_reply',
+      description: '删除当前群某个自定义回复触发词，或删除该触发词下指定编号的回复。需要管理员权限。',
+      inputSchema: objectSchema({
+        trigger: stringField('触发词'),
+        index: integerField('可选：该触发词下的回复编号，从1开始', 1)
+      }, ['trigger'])
+    })
+    registry.register({
+      name: 'clear_custom_replies',
+      description: '清空当前群全部自定义回复。需要管理员权限；执行前应确认用户确实要清空。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'list_scheduled_tasks',
+      description: '查看当前群的定时任务列表和下次执行时间。',
+      inputSchema: objectSchema({}, [])
+    })
+    registry.register({
+      name: 'add_scheduled_task',
+      description: '在当前群创建定时任务，需要管理员权限。schedule 格式为每天 HH:MM、每周一 HH:MM、每月 1号 HH:MM 或 YYYY-MM-DD HH:MM；内容可传 content、segments，或使用当前消息。',
+      inputSchema: objectSchema({
+        schedule: stringField('定时规则，例如每天 08:30 或 2026-05-07 08:30'),
+        content: stringField('文本内容；使用 segments 或当前消息时可省略'),
+        segments: messageArraySchema('可保存的文本、图片或表情消息段'),
+        use_current_message: { type: 'boolean', description: '是否把当前消息内容作为定时发送内容' }
+      }, ['schedule'])
+    })
+    registry.register({
+      name: 'remove_scheduled_task',
+      description: '删除当前群指定编号的定时任务。需要管理员权限。',
+      inputSchema: objectSchema({
+        index: integerField('任务编号，从1开始', 1)
+      }, ['index'])
+    })
+    registry.register({
+      name: 'clear_scheduled_tasks',
+      description: '清空当前群全部定时任务。需要管理员权限；执行前应确认用户确实要清空。',
+      inputSchema: objectSchema({}, [])
+    })
+  }
   registry.register({
     name: 'get_msg',
     description: '按 message_id 读取被引用消息内容',

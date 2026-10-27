@@ -226,6 +226,28 @@ test('send sticker only targets the current conversation and defaults to no quot
   assert.match(actions[0].params.message[0].data.file, /^base64:\/\//)
 })
 
+test('bot feature tools are exposed and stay within the active group', async (t) => {
+  const calls = []
+  const featureTools = {
+    isAdmin: async (runtime) => String(runtime.payload.user_id) === '20',
+    listPokeReplies: async (_args, runtime) => ({ group: runtime.payload.group_id, count: 2 }),
+    addCustomReply: async (args, runtime) => { calls.push({ args, group: runtime.payload.group_id }); return { added: true } }
+  }
+  const { executor } = fixture(t, { featureTools })
+  const registry = createDefaultToolRegistry({ botFeatures: true })
+  assert.ok(registry.get('send_poke'))
+  assert.ok(registry.get('add_custom_reply'))
+  assert.equal(executor.isAllowed('list_poke_replies', trustedRuntime), true)
+  assert.equal(executor.isAllowed('list_poke_replies', { payload: { message_type: 'private', user_id: 20 } }), false)
+  const listed = await executor.execute('list_poke_replies', {}, trustedRuntime)
+  assert.deepEqual(listed.data, { group: 10, count: 2 })
+  const added = await executor.execute('add_custom_reply', { trigger: '你好', content: '嗨' }, trustedRuntime)
+  assert.equal(added.ok, true)
+  assert.deepEqual(calls, [{ args: { trigger: '你好', content: '嗨' }, group: 10 }])
+  const denied = await executor.execute('add_custom_reply', { trigger: '你好', content: '嗨' }, { payload: { message_type: 'group', group_id: 10, user_id: 21 } })
+  assert.equal(denied.ok, false)
+})
+
 test('collect sticker reads only the current message image through safe download', async (t) => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
   let collected = null

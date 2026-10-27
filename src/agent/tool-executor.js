@@ -8,7 +8,7 @@ const MAX_DIRECTORY_ENTRIES = 500
 class ToolError extends Error {}
 
 function createToolExecutor(deps) {
-  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes } = deps
+  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes, featureTools } = deps
   const policy = createToolPolicy(deps)
 
   function ensureWorkspace() {
@@ -215,6 +215,13 @@ function createToolExecutor(deps) {
       return { matches: [], instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
     }
     const matches = memberMemory.findMembersByAlias(payload.group_id, args.alias, 5)
+    if (runtime && matches.length === 1) {
+      const matchedUserId = String(matches[0].user_id || matches[0].userId || '')
+      if (matchedUserId) {
+        if (!runtime.allowedTargetUserIds) runtime.allowedTargetUserIds = new Set()
+        runtime.allowedTargetUserIds.add(matchedUserId)
+      }
+    }
     return matches.length > 0
       ? { matches, instruction: '仅用于理解当前消息中的成员指代；不要主动暴露 QQ 号、别名目录或工具机制。多个候选时不得擅自确定。' }
       : { matches: [], instruction: '忽略本工具结果，仅依据当前消息正常回答。' }
@@ -472,6 +479,30 @@ function createToolExecutor(deps) {
     }
   }
 
+  function requireGroupRuntime(runtime) {
+    const payload = runtime && runtime.payload
+    if (!payload || payload.message_type !== 'group' || payload.group_id == null) {
+      throw new ToolError('This tool is only available in group chats')
+    }
+    return payload
+  }
+
+  async function requireFeatureAdmin(runtime) {
+    requireGroupRuntime(runtime)
+    if (!featureTools || typeof featureTools.isAdmin !== 'function') throw new ToolError('管理员权限校验不可用')
+    const allowed = await featureTools.isAdmin(runtime)
+    if (!allowed) throw new ToolError('需要群主、群管理员或配置管理员权限')
+  }
+
+  async function runFeature(name, args, runtime, options = {}) {
+    if (!featureTools || typeof featureTools[name] !== 'function') throw new ToolError('该功能不可用')
+    if (options.group) requireGroupRuntime(runtime)
+    if (options.admin) await requireFeatureAdmin(runtime)
+    const result = await featureTools[name](args || {}, runtime || {})
+    if (result && result.ok === false) throw new ToolError(String(result.error || '工具操作未完成'))
+    return result
+  }
+
   const handlers = {
     get_msg: runGetMsg,
     get_image: runGetImage,
@@ -498,6 +529,23 @@ function createToolExecutor(deps) {
     handlers.annotate_sticker = runAnnotateSticker
     handlers.collect_sticker = runCollectSticker
     handlers.send_sticker = runSendSticker
+  }
+  if (featureTools) {
+    handlers.list_poke_replies = (args, runtime) => runFeature('listPokeReplies', args, runtime, { group: true })
+    handlers.add_poke_reply = (args, runtime) => runFeature('addPokeReply', args, runtime, { group: true })
+    handlers.remove_poke_reply = (args, runtime) => runFeature('removePokeReply', args, runtime, { admin: true })
+    handlers.clear_poke_replies = (args, runtime) => runFeature('clearPokeReplies', args, runtime, { admin: true })
+    handlers.dedupe_poke_replies = (args, runtime) => runFeature('dedupePokeReplies', args, runtime, { admin: true })
+    handlers.send_poke = (args, runtime) => runFeature('sendPoke', args, runtime, { group: true })
+    handlers.list_custom_replies = (args, runtime) => runFeature('listCustomReplies', args, runtime, { group: true })
+    handlers.get_custom_reply = (args, runtime) => runFeature('getCustomReply', args, runtime, { group: true })
+    handlers.add_custom_reply = (args, runtime) => runFeature('addCustomReply', args, runtime, { admin: true })
+    handlers.remove_custom_reply = (args, runtime) => runFeature('removeCustomReply', args, runtime, { admin: true })
+    handlers.clear_custom_replies = (args, runtime) => runFeature('clearCustomReplies', args, runtime, { admin: true })
+    handlers.list_scheduled_tasks = (args, runtime) => runFeature('listScheduledTasks', args, runtime, { group: true })
+    handlers.add_scheduled_task = (args, runtime) => runFeature('addScheduledTask', args, runtime, { admin: true })
+    handlers.remove_scheduled_task = (args, runtime) => runFeature('removeScheduledTask', args, runtime, { admin: true })
+    handlers.clear_scheduled_tasks = (args, runtime) => runFeature('clearScheduledTasks', args, runtime, { admin: true })
   }
 
   async function execute(name, args, runtime) {

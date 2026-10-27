@@ -84,12 +84,19 @@
   - `web_search`：按需联网查询实时信息，支持 Tavily、博查、SearXNG 和 DeepSeek 原生搜索
   - `web_fetch`：只读抓取公开网页正文，逐跳校验重定向并拒绝内网/本机地址
   - `list_stickers` / `collect_sticker` / `annotate_sticker` / `send_sticker`：本地表情知识库与按语境发送
+  - `list_poke_replies` / `add_poke_reply` / `remove_poke_reply` / `clear_poke_replies` / `dedupe_poke_replies`：按需管理拍一拍回复池
+  - `send_poke`：在当前群拍指定的当前发言者、@成员或已解析成员
+  - `list_custom_replies` / `get_custom_reply` / `add_custom_reply` / `remove_custom_reply` / `clear_custom_replies`：按需管理当前群自定义回复
+  - `list_scheduled_tasks` / `add_scheduled_task` / `remove_scheduled_task` / `clear_scheduled_tasks`：按需管理当前群定时任务
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
 - AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用
 - 联网搜索不会在每条消息上自动运行，而是由模型判断需要实时或外部资料时调用；`auto` 模式会依次选择已配置的 Tavily、博查、SearXNG、DeepSeek，DeepSeek 默认复用 `DEEPSEEK_API_KEY`
 - 网页正文抓取、表情收藏和表情发送同样只注册为模型工具，是否调用由模型结合当前对话判断，代码不按关键词自动执行
+- 拍一拍回复、自定义回复和定时任务管理也只在模型判断用户确有对应意图时调用；旧的中文命令仍然兼容
+- 自定义回复和定时任务沿用管理员权限；拍一拍回复新增保持原有规则，新增可由群友执行，删除、清空和去重需要管理员权限
+- 工具只能作用于当前群；`send_poke` 只能使用当前消息明确提到或刚由成员解析工具唯一确认的目标
 - 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
 
 ## 联网搜索
