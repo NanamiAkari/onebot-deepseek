@@ -1241,6 +1241,7 @@ async function removePokeReplyTool(args = {}, _runtime) {
 
 async function clearPokeRepliesTool(_args, _runtime) {
   const count = refreshPokeReplyTexts().length
+  if (count === 0) return { ok: false, error: '当前没有拍一拍回复' }
   savePokeReplyTexts([])
   return { cleared: true, removedCount: count }
 }
@@ -1330,6 +1331,7 @@ async function removeCustomReplyTool(args = {}, runtime) {
 async function clearCustomRepliesTool(_args, runtime) {
   const payload = featureToolPayload(runtime)
   const cleared = clearCustomReplies(payload.group_id)
+  if (!cleared.ok) return { ok: false, error: '当前群没有自定义回复' }
   return { cleared: true, removedTriggers: cleared.removedTriggers, removedReplies: cleared.removedReplies }
 }
 
@@ -1363,6 +1365,7 @@ async function removeScheduledTaskTool(args = {}, runtime) {
 async function clearScheduledTasksTool(_args, runtime) {
   const payload = featureToolPayload(runtime)
   const cleared = clearScheduledTasks(payload.group_id)
+  if (!cleared.ok) return { ok: false, error: '当前群没有定时任务' }
   return { cleared: true, removedCount: cleared.removedCount }
 }
 
