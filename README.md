@@ -19,7 +19,7 @@
     - `OPENAI_API_KEY=sk-...`
     - `OPENAI_BASE_URL=http://127.0.0.1:30080`
     - `LLM_PROVIDER=openai`
-    - `OPENAI_MODEL=gpt-5.4`
+    - `OPENAI_MODEL=gpt-6-astra`
     - `OPENAI_WIRE_API=responses`
   - 如果需要外置提示词文件：
     - `PROMPT_FILE=prompt.txt`
@@ -50,10 +50,13 @@
 
 ## 工作方式
 - 入口层仍使用 OneBot v11 反向 WebSocket，不改变 Napcat 接法
-- 私聊默认可直接回复；群聊可按 `@机器人` / 前缀规则触发
+- 私聊默认可直接回复；群聊可按 `@机器人` / 模型判断的称呼意图触发
+- 使用 `AI_PREFIXES`（如“阿卡林”）触发AI对话时，前缀仍会作为用户原话的一部分传给模型，不会从对话内容中删除。
+- 模型输入会同时标明句首“阿卡林”只是称呼/触发词，并提供去前缀后的实际话题，避免把“阿卡林灯灯……”误解成复合名字或以阿卡林为主语。
+- 群消息中出现 `AI_PREFIXES` 的称呼时，会结合当前句、最近群聊和近期机器人对话，交给上游模型判断是在呼叫机器人还是第三人称讨论；称呼出现在句中或句尾同样适用。分类失败时默认不插话，`@机器人` 仍直接触发。
 - 消息进入 `message-handler -> agent runner -> provider -> tool executor` 主链路
 - 当前已支持多轮 agent loop、工具注册表、dispatch map、统一 tool result 格式
-- 若上游或工具链失败，服务会返回失败提示而不是自动回退到其他模型
+- 上游或工具链失败时通常返回失败提示；图片回复被上游判定为未读到图片时会尝试 Gemini，特定 OpenAI 403 限制会尝试已配置的 DeepSeek
 - 使用 `send_group_msg` 或 `send_private_msg` 动作帧回复
 
 ## 上游协议
@@ -66,11 +69,11 @@
 
 ## Agent Loop
 - 当前服务已升级为有限步数的多轮 agent loop
-- 默认最大步数为 `5`
+- 默认最大步数为 `10`
 - 每轮流程：
   - 调用模型
   - 若模型返回工具调用，则执行首个工具
-  - 将工具结果写回历史
+  - 通过标准工具结果消息把工具输出交回模型；超长结果会带截断标记
   - 继续下一轮，直到得到最终文本或达到步数上限
 - 当前已接入的工具包括：
   - `get_msg`
@@ -78,14 +81,45 @@
   - `send_group_msg`
   - `send_private_msg`
   - `history`
-  - `read_file`
-  - `write_file`
-  - `edit_file`
-  - `list_dir`
-- 文件类工具带工作区路径沙箱，不能逃逸项目目录
+  - `web_search`：按需联网查询实时信息，支持 Tavily、博查、SearXNG 和 DeepSeek 原生搜索
+  - `web_fetch`：只读抓取公开网页正文，逐跳校验重定向并拒绝内网/本机地址
+  - `list_stickers` / `collect_sticker` / `annotate_sticker` / `send_sticker`：本地表情知识库与按语境发送
+  - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
+- 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
+- `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
+- AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用
+- 联网搜索不会在每条消息上自动运行，而是由模型判断需要实时或外部资料时调用；`auto` 模式会依次选择已配置的 Tavily、博查、SearXNG、DeepSeek，DeepSeek 默认复用 `DEEPSEEK_API_KEY`
+- 网页正文抓取、表情收藏和表情发送同样只注册为模型工具，是否调用由模型结合当前对话判断，代码不按关键词自动执行
+- 同一会话的 AI 请求串行执行，全局并发和排队上限由 `AI_MAX_CONCURRENT_REQUESTS`、`AI_QUEUE_MAX_PER_SESSION`、`AI_QUEUE_MAX_TOTAL` 控制
+
+## 联网搜索
+- `web_search` 由模型按需调用，适合查询新闻、天气、价格、赛事、软件版本和需要核验的公开资料
+- `AI_WEB_SEARCH_PROVIDER=auto` 时，依次选择已配置的 Tavily、博查、SearXNG、DeepSeek；也可以明确指定其中一个
+- DeepSeek 原生搜索默认复用 `DEEPSEEK_API_KEY`，通过 `DEEPSEEK_SEARCH_API_URL` 和 `DEEPSEEK_SEARCH_MODEL` 调整接口与模型
+- `AI_WEB_SEARCH_MAX_RESULTS`、`AI_WEB_SEARCH_TIMEOUT_MS`、`AI_WEB_SEARCH_MAX_CHARS` 分别限制来源数量、请求时间和返回内容长度
+- SearXNG 需要开启 JSON 输出；Tavily、博查分别使用 `TAVILY_API_KEY`、`BOCHA_API_KEY`
+- 搜索结果是外部资料，工具提示会要求模型忽略网页中的指令；有结构化来源时给出相关链接，没有来源时不得编造
+
+## 安全网页抓取
+- `web_fetch` 只接受公开的 http/https 地址，拒绝 localhost、私网、链路本地、CGNAT 和包含账号密码的 URL
+- 每次重定向都会重新解析并校验目标地址，再用已校验的 IP 建立连接，避免 DNS 重绑定绕过
+- 响应按字节和字符双重限长；支持 HTML、纯文本、JSON 与 XML，HTML 会去掉脚本、样式、导航等噪音后交给模型
+- 网页正文被标记为外部不可信资料，模型不得执行网页中的指令
+
+## 本地表情库
+- `collect_sticker` 只能读取当前消息或当前消息明确引用的消息，不能由模型指定任意历史消息或本地文件
+- 图片优先通过 OneBot 缓存读取，必要时再走安全公网下载；只接受 JPEG、PNG、GIF、WebP、AVIF，并转存到独立 `sticker_data/images`
+- `list_stickers` 返回备注、标签、适用场景和使用次数；模型按当前语气自行决定是否发送，普通回复可以不使用表情
+- `send_sticker` 只能读取受控表情目录中的文件，并只能发送到当前群或当前私聊；默认不引用消息
+- `AI_STICKER_MAX_BYTES`、`AI_STICKER_MAX_COUNT`、`AI_STICKER_MAX_COLLECT_PER_HOUR` 控制单图大小、库存上限和收藏频率
 
 ## 服务器部署（systemd）
 - 推荐将项目放到 `/opt/onebot-deepseek`，并确保 `.env` 已配置好。
+
+## GitHub Actions 自动部署
+- `official` 分支已配置部署工作流，推送提交或手动运行工作流都会部署到生产服务器。
+- 工作流使用仓库环境 `OneBot` 中的 `PROD_HOST`、`PROD_PORT`、`PROD_USER` 和 `PROD_SSH_KEY`，通过 SSH 上传代码后执行依赖安装、语法检查并重启 `onebot-deepseek.service`。
+- 部署会保留服务器上的 `.env`、`memory_data/`、`generated_images/`、`sticker_data/`、`tool_workspace/` 和数据库文件，不把这些运行数据提交到仓库。
 - 首次部署或更新依赖时，请在服务器项目目录重新安装依赖：
 ```
 cd /opt/onebot-deepseek
@@ -164,7 +198,11 @@ sudo systemctl restart onebot-deepseek
   - `OpenAI失败 media=1 timeout=...`
 - 文生图：
   - 生成图会保存到 `generated_images/` 后再通过 OneBot 图片消息发送
+  - 意图判断分为三层：明确生图直接触发，已有图片分析/否定表达直接排除，模糊表达交给大模型分类
+  - 判断只使用用户当前消息；被引用消息中的“画图、生成图片”等文字不会触发生图
+  - `AI_IMAGE_GENERATION_INTENT_THRESHOLD=0.75` 控制模糊表达触发生图所需的最低置信度
   - 命中后会先回复一条“正在生成图片”的提示，再等待上游返回图片
+  - 同一服务进程内同一时间只允许一个生图请求；已有任务时，新生图请求会被立即拒绝
   - 如果日志长期停在 `调用OpenAI`，优先检查上游是否支持 `image_generation` 以及 `OPENAI_IMAGE_TIMEOUT_MS`
 - AI 回复发送保护：
   - `AI_REPLY_MAX_CHARS=3200`：单次 AI 回复的总长度上限，超出会自动截断并补 `后续内容已截断`
@@ -223,15 +261,18 @@ sudo chmod 664 /opt/onebot-deepseek/poke_replies.json
 ```
 
 ## 触发控制
-- 默认群聊按前缀触发；私聊默认可直接回复。
+- 默认群聊由模型判断是否在直接呼叫机器人；私聊默认可直接回复。
 - 当前示例配置使用 `阿卡林` 作为前缀，不使用 `/ai`。
 - 配置项：
   - `AI_REQUIRE_PREFIX=true|false`：是否必须前缀
   - `AI_GROUP_REQUIRE_MENTION=true|false`：群聊是否必须 `@机器人`
-  - `AI_PREFIXES=阿卡林`：多个前缀用逗号分隔，如 `阿卡林,ai`
+  - `AI_PREFIXES=阿卡林`：多个称呼用逗号分隔，如 `阿卡林,ai`
+  - `AI_NAME_INTENT_ENABLE=true`：是否用上游模型判断称呼意图
+  - `AI_NAME_INTENT_THRESHOLD=0.65`：模型判断置信度门槛
+  - `AI_NAME_INTENT_TIMEOUT_MS=10000`：称呼意图判断超时
   - `AI_ADMIN_USER_IDS=123456,234567`：额外管理员 QQ 号白名单，多个用英文逗号分隔
   - `AI_IGNORE_REGEX=`：忽略其他 WS 服务命令的正则；群聊和私聊都会生效
-- 示例：群聊不要求 `@`，只要以前缀 `阿卡林` 开头就触发：
+- 示例：群聊不要求 `@`，出现 `阿卡林` 后由模型判断是否在呼叫机器人：
 ```
 AI_REQUIRE_PREFIX=true
 AI_GROUP_REQUIRE_MENTION=false
@@ -281,10 +322,8 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_IMAGE_CONTEXT_MAX`
   - `AI_IMAGE_ONLY_NO_CALL=true`
 - 图片预处理：
-  - 默认启用 `sharp` 预处理
-  - 会在发送给上游前按图片类型缩放 / 压缩
-  - 普通图片、截图、长图采用不同策略
-  - 预处理结果会按图片内容 hash 做进程内缓存
+  - `sharp` 与预处理参数已保留在配置中，当前主链路仍发送原图或 base64，尚未启用按图片类型缩放 / 压缩
+  - 需要启用预处理时，应先在目标 Linux 服务器重新安装对应平台的 `sharp`
 - 关键配置：
   - `AI_IMAGE_PREPROCESS_ENABLE=true`
   - `AI_IMAGE_CACHE_ENABLE=true`
@@ -302,7 +341,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 支持配置独立回复文件，推荐使用 JSON 数组格式维护“文本回复 + 图片回复”混合池，并随机命中其中一条；图片条目越多，被随机到图片回复的概率越高
 - 默认优先读取 `AI_POKE_REPLY_FILE` 指向的 JSON 文件；如果文件不存在、为空，或仍是旧的按行文本格式，则回退兼容旧格式，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
 - JSON 数组中的每一项代表一条完整回复；文本项可包含换行，图片项使用 `type=image`
-- 支持通过管理员命令动态查看和新增文案，写回文件后立即生效
+- 支持群友动态查看和新增文案，写回文件后立即生效
 - 若 `文案列表` 正常但 `文案添加/删除/清空/去重` 返回“命令处理失败，请稍后重试”，通常是 `AI_POKE_REPLY_FILE` 对服务运行用户只有读权限没有写权限；systemd 部署时请确认该文件归属与 `User=` 一致
 - 配置项：
   - `AI_POKE_ENABLE`
@@ -319,7 +358,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   { "type": "image", "source": "https://example.com/poke.png" }
 ]
 ```
-- 管理命令：
+- 常用命令：
   - `阿卡林 拍一拍 文案列表`
   - `阿卡林 拍一拍 文案查看 3`
   - `阿卡林 拍一拍 文案添加 你好呀`
@@ -330,6 +369,8 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `阿卡林 拍一拍 加图片`
   - `阿卡林 拍一拍 图片添加 https://example.com/poke.png`
   - `阿卡林 拍一拍 文案删除 3`
+  - 引用一条机器人发出的拍一拍文本/图片回复后发送：`阿卡林 拍一拍 文案删除`
+  - 引用一条机器人发出的拍一拍图片回复后发送：`阿卡林 拍一拍 删图`
   - `阿卡林 拍一拍 文案清空`
   - `阿卡林 拍一拍 文案去重`
   - `阿卡林 拍一拍 开启`
@@ -337,8 +378,9 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 权限规则：
   - `文案列表` 任何人可查看
   - `文案查看 序号` 任何人可查看单条完整回复；若该条是图片回复，会先提示类型，再单独发送图片
+  - `文案添加/图片添加` 任何群友可执行
   - 列表只预览文本项；图片项仅显示为 `[图片回复]`
-  - `文案添加/图片添加/删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
+  - `删除/清空/去重`、开关管理仅群主、群管理员或 `AI_ADMIN_USER_IDS` 中配置的账号可执行
 
 ## 管理员权限
 - 除了 QQ 群内原生 `owner` / `admin`，还支持通过 `.env` 配置额外管理员账号：
@@ -347,7 +389,6 @@ AI_ADMIN_USER_IDS=123456789,987654321
 ```
 - 配置后的账号在私聊和群聊里都可使用管理命令
 - 当前已接入的管理员能力：
-  - 拍一拍文案新增
   - 自定义回复管理
   - 定时任务管理
   - 拍一拍开关管理
@@ -452,6 +493,26 @@ AI_ADMIN_USER_IDS=123456789,987654321
 - 示例：
   - `PROMPT_FILE=prompt.txt`
   - 可使用项目中的 `prompt.py` 生成 `prompt.txt`
+
+## 群成员长期记忆
+- 默认开启，可通过 `AI_MEMORY_ENABLE=false` 关闭；成员按 `群号 + QQ号` 隔离。
+- 普通群聊文本按日期和成员直接追加到磁盘，不在内存中累计原始消息。
+- 成员画像完全由大模型每日归纳，只作为 AI 回复的内部辅助材料，不会替代当前消息或人设提示词。
+- 画像按版本累计迭代，保留当前累计画像和最近30天每日增量；模型漏字段时不会清空旧认识。
+- 成员级总结只处理当天实际发过言的人，但材料同时包含其他成员当天对他的 `@`、引用和定向回复。
+- AI对话触发时会附带当前群最近几条相邻消息，并标注发言者；默认最多6条、3000字、5分钟内有效。
+- AI 可按需调用 `memory_append/query/remove` 管理高价值成员印象，也可调用 `get_recent_messages` 查询更早的群聊上下文；触发方式仍是 `@机器人` 或 `AI_PREFIXES`。
+- AI 对话默认只加载交流风格；完整画像由大模型在确有帮助时通过 `member_memory` 工具按需读取。
+- 消息会维护 QQ 号与群名片、QQ 昵称、历史别名的对应关系；大模型可通过 `resolve_group_member` 理解对话中的成员指代。
+- 当前消息出现已知昵称、群名片、群头衔或高可信推断别名时，会先自动注入对应成员身份，不再完全依赖大模型主动调用工具。
+- 新增 `group_member_directory` 工具：需要判断群主、管理员或群头衔指代时，大模型可按需获取完整群成员目录；目录会短时缓存并同步到成员身份索引。
+- 群头衔、`@`关系和引用消息作者也会作为每日群级总结的判断材料；自然称呼、群关系和群梗由大模型归纳。
+- 近期具体事件会进入带时效的情景记忆，完整画像和群级记忆仍只在相关时按需加载。
+- 纯图片、视频和语音消息也会记录媒体类型与有限元数据；合并转发会通过 OneBot 展开并提取其中的文本和媒体类型。
+- 被动归档不会下载大文件做视觉、视频或语音理解，因此总结会明确把未解析内容标为“未解析”，避免模型臆测。
+- 没有画像时内部返回空材料，机器人不会回复“未找到成员画像”等状态信息。
+- 记忆总结失败采用持久化指数退避，默认1小时、2小时、4小时重试，连续3次失败后当天暂停，避免上游异常时重复请求。
+- 每日总结、缓存上限、日志保留期及云服务器部署方法见 [设计文档](docs/member-memory-design.md)。
 
 ## 推荐测试 Checklist
 - 部署前

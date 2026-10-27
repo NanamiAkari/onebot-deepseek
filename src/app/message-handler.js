@@ -5,11 +5,15 @@ function createMessageHandler(deps) {
     mediaCache,
     getKey,
     pushHistory,
+    recordGroupMessage,
+    getRecentGroupContext,
+    getHistoryRaw,
     sendAction,
     extractContent,
     resolveMediaSources,
     checkMention,
     checkModeration,
+    classifyAddressing,
     handleCommands,
     handleImageGenerationRequest,
     handleScheduleTaskDraftInput,
@@ -18,10 +22,16 @@ function createMessageHandler(deps) {
     hasCustomReplyTrigger,
     shouldIgnoreText,
     GROUP_REQUIRE_MENTION,
+    REQUIRE_PREFIX,
+    PREFIXES,
     shouldRespond,
     stripPrefix,
+    AI_NAME_INTENT_ENABLE,
+    AI_NAME_INTENT_THRESHOLD,
     getContext,
+    memberMemory,
     agentRunner,
+    aiRequestQueue,
     buildReplySegments,
     AI_POKE_ENABLE,
     AI_POKE_COOLDOWN,
@@ -30,6 +40,7 @@ function createMessageHandler(deps) {
     getPokeReplyTexts,
     AI_POKE_ONLY_SELF,
     buildPokeReplyMessageSegments,
+    rememberPokeReplyMessage,
     AI_REPLY_CHUNK_CHARS,
     AI_IMAGE_CONTEXT_TTL,
     AI_IMAGE_CONTEXT_REQUIRE_HINTS,
@@ -40,6 +51,10 @@ function createMessageHandler(deps) {
     AI_IMAGE_ONLY_NO_CALL
   } = deps
   let sendGroupPokeSupported = true
+  const handledMessageIds = new Map()
+  const handledMessageTtlMs = 10 * 60 * 1000
+  const handledMessageMax = 2000
+  const queueNoticeTimes = new Map()
 
   function normalizePokeReplyItem(item) {
     if (typeof item === 'string') {
@@ -96,7 +111,13 @@ function createMessageHandler(deps) {
       const params = action === 'send_group_msg'
         ? { group_id: payload.group_id, message: messageSegments }
         : { user_id: payload.user_id, message: messageSegments }
-      const sendResult = await sendAction(ws, action, params).catch(() => null)
+      let sendResult
+      try {
+        sendResult = await sendAction(ws, action, params)
+      } catch (error) {
+        if (error && error.message === 'timeout') return { ok: false, uncertain: true, failedIndex: index, sentTexts }
+        return { ok: false, uncertain: false, failedIndex: index, sentTexts }
+      }
       if (!(sendResult && sendResult.status === 'ok')) {
         return { ok: false, failedIndex: index, sentTexts }
       }
@@ -104,6 +125,55 @@ function createMessageHandler(deps) {
       if (textPart) sentTexts.push(textPart)
     }
     return { ok: true, failedIndex: -1, sentTexts }
+  }
+
+  function extractMentionedUserIds(message) {
+    if (Array.isArray(message)) {
+      return Array.from(new Set(message
+        .filter((segment) => segment && segment.type === 'at' && segment.data && segment.data.qq)
+        .map((segment) => String(segment.data.qq))))
+    }
+    const ids = []
+    const regex = /\[CQ:at,qq=(\d+)\]/g
+    let match
+    while ((match = regex.exec(String(message || '')))) ids.push(match[1])
+    return Array.from(new Set(ids))
+  }
+
+  function formatConversationText(originalText, strippedText, addressedByPrefix) {
+    const original = String(originalText || '').trim()
+    const actual = String(strippedText || '').trim()
+    if (!addressedByPrefix || !original) return actual
+    return [
+      `用户原话：${original}`,
+      '语义说明：句首“阿卡林”是用户对你的称呼和AI触发词，不默认充当后续内容的主语，也不要与紧随其后的成员昵称连成一个名字。',
+      `实际话题：${actual || '用户只是在称呼你'}`
+    ].join('\n')
+  }
+
+  async function resolveForwardedRecords(ws, forwardIds) {
+    const records = []
+    let chars = 0
+    for (const forwardId of Array.isArray(forwardIds) ? forwardIds.slice(0, 3) : []) {
+      const response = await sendAction(ws, 'get_forward_msg', { id: forwardId, message_id: forwardId }).catch(() => null)
+      const nodes = response && response.status === 'ok' && response.data
+        ? (response.data.messages || response.data.message || [])
+        : []
+      for (const node of Array.isArray(nodes) ? nodes.slice(0, 50) : []) {
+        if (chars >= 5000) break
+        const nodeMessage = node && (node.content || node.message)
+        const extracted = extractContent(nodeMessage)
+        const text = String(extracted.text || '').slice(0, 5000 - chars)
+        chars += text.length
+        records.push({
+          userId: String(node.user_id || (node.sender && node.sender.user_id) || ''),
+          nickname: String(node.nickname || (node.sender && (node.sender.card || node.sender.nickname)) || '').slice(0, 80),
+          text,
+          mediaTypes: Array.from(new Set((extracted.media || []).map((item) => item.kind))).slice(0, 10)
+        })
+      }
+    }
+    return records
   }
 
   return async function onMessage(ws, data) {
@@ -146,7 +216,10 @@ function createMessageHandler(deps) {
             const variants = normalizeMessageVariants(built)
             for (const msg of variants) {
               const result = await sendAction(ws, 'send_group_msg', { group_id: gid, message: msg }).catch(() => null)
-              if (result && result.status === 'ok') break
+              if (result && result.status === 'ok') {
+                if (typeof rememberPokeReplyMessage === 'function') rememberPokeReplyMessage(result, pokeReply)
+                break
+              }
             }
           } catch {}
         } else {
@@ -157,16 +230,40 @@ function createMessageHandler(deps) {
             const variants = normalizeMessageVariants(built)
             for (const msg of variants) {
               const result = await sendAction(ws, 'send_private_msg', { user_id: uid, message: msg }).catch(() => null)
-              if (result && result.status === 'ok') break
+              if (result && result.status === 'ok') {
+                if (typeof rememberPokeReplyMessage === 'function') rememberPokeReplyMessage(result, pokeReply)
+                break
+              }
             }
           } catch {}
         }
         return
       }
       if (payload.post_type !== 'message') return
+      if (payload.self_id && String(payload.user_id) === String(payload.self_id)) return
+      const incomingMessageId = String(payload.message_id || payload.messageId || '')
+      if (incomingMessageId) {
+        const now = Date.now()
+        for (const [key, expiresAt] of handledMessageIds.entries()) {
+          if (expiresAt <= now) handledMessageIds.delete(key)
+        }
+        const eventKey = `${payload.message_type || ''}:${payload.group_id || payload.user_id || ''}:${incomingMessageId}`
+        if (handledMessageIds.has(eventKey)) return
+        handledMessageIds.set(eventKey, now + handledMessageTtlMs)
+        while (handledMessageIds.size > handledMessageMax) handledMessageIds.delete(handledMessageIds.keys().next().value)
+      }
       const isGroup = payload.message_type === 'group'
       const raw = extractContent(payload.message)
+      const originalText = raw.text
+      if (typeof recordGroupMessage === 'function') recordGroupMessage(payload, raw.text)
+      const memoryRelations = { mentionedUserIds: extractMentionedUserIds(payload.message), replyToUserId: '', media: [], forwarded: [] }
       raw.media = await resolveMediaSources(ws, raw.media)
+      memoryRelations.media = (raw.media || []).map((item) => ({
+        kind: String(item.kind || ''),
+        file: String(item.file || '').slice(0, 200),
+        duration: Math.max(0, Number(item.duration || 0))
+      })).filter((item) => item.kind).slice(0, 20)
+      memoryRelations.forwarded = await resolveForwardedRecords(ws, raw.forwardIds)
       const key = getKey(payload)
       let ctxImgUsed = false
       if (raw.media && raw.media.length > 0) {
@@ -200,7 +297,12 @@ function createMessageHandler(deps) {
             content.media = merged
           }
           if (quotedText) content.quotedText = quotedText
-          if (!content.text && quotedText) content.text = quotedText
+          memoryRelations.replyToUserId = String(resp.data.user_id || (resp.data.sender && resp.data.sender.user_id) || '')
+        }
+      }
+      if (memberMemory && typeof memberMemory.recordMessage === 'function') {
+        try { memberMemory.recordMessage(payload, originalText, memoryRelations) } catch (error) {
+          console.log('成员消息归档失败', error && error.message ? error.message : error)
         }
       }
       const scheduleDraftHandled = await handleScheduleTaskDraftInput(ws, payload).catch(() => false)
@@ -208,7 +310,31 @@ function createMessageHandler(deps) {
       const customDraftHandled = await handleCustomReplyDraftInput(ws, payload).catch(() => false)
       if (customDraftHandled) return
       const mentioned = !isGroup || checkMention(payload.message, payload.self_id)
-      const prefixTriggered = shouldRespond(raw.text)
+      const rawText = String(raw.text || '').trim()
+      let prefixTriggered = shouldRespond(rawText)
+      const requirePrefix = REQUIRE_PREFIX !== false
+      const prefixMentioned = Array.isArray(PREFIXES) && PREFIXES.some((prefix) => prefix && rawText.includes(String(prefix)))
+      if (isGroup && requirePrefix && AI_NAME_INTENT_ENABLE !== false && prefixMentioned && typeof classifyAddressing === 'function') {
+        try {
+          const intentContext = {
+            recentGroupMessages: typeof getRecentGroupContext === 'function'
+              ? getRecentGroupContext(payload, rawText).map((item) => String(item.content || '')).filter(Boolean).slice(-8)
+              : [],
+            recentConversation: typeof getHistoryRaw === 'function'
+              ? getHistoryRaw(payload).map((item) => `${item.role === 'assistant' ? '机器人' : '用户'}：${String(item.content || '')}`).filter(Boolean).slice(-8)
+              : [],
+            quotedText: String(content.quotedText || '').trim(),
+            senderName: String((payload.sender && (payload.sender.card || payload.sender.nickname)) || '').trim().slice(0, 80)
+          }
+          const decision = await classifyAddressing(rawText, payload, intentContext)
+          prefixTriggered = Boolean(decision && decision.addressed && Number(decision.confidence) >= Number(AI_NAME_INTENT_THRESHOLD))
+        } catch (error) {
+          prefixTriggered = false
+          console.log('阿卡林意图判断失败', error && error.message ? error.message : 'unknown')
+        }
+      }
+      const addressedByPrefix = prefixTriggered && stripPrefix(rawText) !== rawText
+      const aiExplicitlyTriggered = isGroup && (mentioned || prefixTriggered)
       const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
         ? hasCustomReplyTrigger(payload.group_id, raw.text)
         : false
@@ -220,8 +346,10 @@ function createMessageHandler(deps) {
       if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
       const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
-      const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
-      if (customMatched) return
+      if (!aiExplicitlyTriggered) {
+        const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)
+        if (customMatched) return
+      }
       const hasText = Boolean(String(content.text || '').trim())
       const hasMedia = Array.isArray(content.media) && content.media.length > 0
       if (hasText && shouldIgnoreText(content.text)) return
@@ -229,30 +357,58 @@ function createMessageHandler(deps) {
         if (AI_IMAGE_ONLY_NO_CALL && hasMedia) return
         if (!hasMedia) return
       }
-      const wantsReply = isGroup ? shouldRespond(content.text) : hasText
+      const wantsReply = isGroup ? (aiExplicitlyTriggered || shouldRespond(content.text)) : hasText
       if (!wantsReply) return
       const stripped = stripPrefix(content.text || '') || (hasMedia ? '请描述这张图片' : '')
-      const quotedText = String(content.quotedText || '').trim()
-      const modelInput = quotedText && quotedText !== stripped
-        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${stripped || '请结合被引用消息继续回答'}`
+      const originalConversationText = addressedByPrefix
+        ? (String(content.text || '').trim() || stripped)
         : stripped
-      const hist = getContext(payload, modelInput)
+      const conversationText = formatConversationText(originalConversationText, stripped, addressedByPrefix)
+      const quotedText = String(content.quotedText || '').trim()
+      const modelInput = quotedText && quotedText !== conversationText
+        ? `被引用消息：\n${quotedText}\n\n当前消息：\n${conversationText || '请结合被引用消息继续回答'}`
+        : conversationText
+      const reply = async () => {
+      if (typeof ws.readyState === 'number' && ws.readyState !== 1) return
+      // Context is read when the queued turn starts, after the previous reply is saved.
+      const hist = getContext(payload, stripped)
+      const adjacentContext = typeof getRecentGroupContext === 'function'
+        ? getRecentGroupContext(payload, stripped)
+        : []
+      const combinedHistory = hist
+      const memoryContext = memberMemory && typeof memberMemory.buildStyleContext === 'function'
+        ? memberMemory.buildStyleContext(payload)
+        : ''
+      const identityContext = memberMemory && typeof memberMemory.buildIdentityContext === 'function'
+        ? memberMemory.buildIdentityContext(payload, stripped)
+        : ''
+      const adjacentText = adjacentContext.length
+        ? adjacentContext.map((item) => String(item.content || '')).join('\n')
+        : ''
+      const promptParts = []
+      if (identityContext) promptParts.push(`【记忆中的确定身份】\n${identityContext}`)
+      if (adjacentText) promptParts.push(`【相邻群聊】\n${adjacentText}`)
+      if (quotedText) promptParts.push(`【引用消息】\n${quotedText}`)
+      promptParts.push(`【当前消息】\n${conversationText}`)
+      const modelMessage = promptParts.join('\n\n')
+      const combinedMemoryContext = memoryContext
       if (typeof handleImageGenerationRequest === 'function') {
-        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist).catch((error) => {
+        const imageGeneration = await handleImageGenerationRequest(ws, payload, modelInput, hist, stripped).catch((error) => {
           const message = error && error.message ? String(error.message) : String(error)
           console.log('生图处理异常', message)
           return { handled: false }
         })
         if (imageGeneration && imageGeneration.handled) {
-          pushHistory(payload, stripped, imageGeneration.deliveredText || '[已处理生图请求]')
+          pushHistory(payload, originalConversationText, imageGeneration.deliveredText || '[已处理生图请求]')
           return
         }
       }
       const result = await agentRunner.run({
-        message: modelInput,
+        message: modelMessage,
         media: content.media,
-        history: hist,
+        history: combinedHistory,
         contextImage: ctxImgUsed,
+        memoryContext: combinedMemoryContext,
         runtime: { ws, payload },
         session: {
           key,
@@ -265,10 +421,15 @@ function createMessageHandler(deps) {
       if (!aiText) return
       const action = isGroup ? 'send_group_msg' : 'send_private_msg'
       const sentTexts = []
-      const messageBatches = buildReplySegments(payload.message_id, aiText)
+      const messageBatches = buildReplySegments(payload.message_id, aiText, { includeReply: Boolean(content.replyId) })
       const firstAttempt = await sendReplyBatches(ws, action, payload, messageBatches)
       sentTexts.push(...firstAttempt.sentTexts)
       if (!firstAttempt.ok) {
+        if (firstAttempt.uncertain) {
+          console.log(`AI回复发送状态未知，停止重发以避免重复发送 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
+          pushHistory(payload, originalConversationText, sentTexts.join('\n').trim() || String(aiText || '').trim())
+          return
+        }
         console.log(`AI回复发送失败，尝试去掉引用重发 index=${firstAttempt.failedIndex + 1}/${messageBatches.length}`)
         const remainingText = extractRemainingText(messageBatches, firstAttempt.failedIndex)
         if (remainingText) {
@@ -280,6 +441,11 @@ function createMessageHandler(deps) {
           const secondAttempt = await sendReplyBatches(ws, action, payload, retryBatches)
           sentTexts.push(...secondAttempt.sentTexts)
           if (!secondAttempt.ok) {
+            if (secondAttempt.uncertain) {
+              console.log(`AI回复重发状态未知，停止继续重发以避免重复发送 index=${secondAttempt.failedIndex + 1}/${retryBatches.length}`)
+              pushHistory(payload, originalConversationText, sentTexts.join('\n').trim() || String(aiText || '').trim())
+              return
+            }
             const fallbackText = extractRemainingText(retryBatches, secondAttempt.failedIndex)
             const smallerChunkChars = Math.max(250, Math.min(AI_REPLY_CHUNK_CHARS - 1, Math.floor(AI_REPLY_CHUNK_CHARS * 0.6)))
             console.log(`AI回复发送失败，尝试更小分段重发 chunk=${smallerChunkChars}`)
@@ -301,7 +467,25 @@ function createMessageHandler(deps) {
         }
       }
       const deliveredText = sentTexts.join('\n').trim() || String(aiText || '').trim()
-      pushHistory(payload, stripped, deliveredText)
+      pushHistory(payload, originalConversationText, deliveredText)
+      }
+      try {
+        if (aiRequestQueue) await aiRequestQueue.enqueue(key, reply)
+        else await reply()
+      } catch (error) {
+        if (!error || !['QUEUE_FULL', 'QUEUE_EXPIRED', 'QUEUE_CLOSED'].includes(error.code)) throw error
+        if (error.code === 'QUEUE_CLOSED' || (typeof ws.readyState === 'number' && ws.readyState !== 1)) return
+        const now = Date.now()
+        const last = queueNoticeTimes.get(key)
+        if (last !== undefined && now - last < 30000) return
+        queueNoticeTimes.delete(key)
+        queueNoticeTimes.set(key, now)
+        while (queueNoticeTimes.size > 1000) queueNoticeTimes.delete(queueNoticeTimes.keys().next().value)
+        const text = error.code === 'QUEUE_EXPIRED'
+          ? '这条请求等待太久了，请稍后重新发送。'
+          : '现在等待回复的请求有点多，请稍后再试。'
+        await sendReplyBatches(ws, isGroup ? 'send_group_msg' : 'send_private_msg', payload, buildReplySegments(payload.message_id, text))
+      }
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error)
       console.log('onMessage异常', message)

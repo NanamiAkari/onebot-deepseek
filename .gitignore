@@ -8,6 +8,10 @@ generated_images/
 poke_replies.json
 custom_replies.json
 scheduled_tasks.json
+.deploy-commit
+memory_data/
+tool_workspace/
+sticker_data/
 banned.json
 *.log
 
@@ -20,3 +24,16 @@ tests/
 *.test.js
 *.spec.js
 coverage/
+
+# Keep message routing regressions under version control.
+!test/
+!test/message-handler.test.js
+!test/member-memory.test.js
+!test/image-generation-intent.test.js
+!test/session-store.test.js
+!test/tool-executor.test.js
+!test/request-queue.test.js
+!test/agent-runner.test.js
+!test/web-search.test.js
+!test/web-fetch.test.js
+!test/stickers.test.js
