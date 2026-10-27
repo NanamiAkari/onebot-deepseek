@@ -1575,7 +1575,8 @@ async function classifyAddressing(text, payload, context = {}) {
   ].join('\n')
   const response = await callLLM(prompt, [], [], {
     structured: true,
-    timeoutMs: AI_NAME_INTENT_TIMEOUT_MS,
+    timeoutMs: Math.max(AI_NAME_INTENT_TIMEOUT_MS, 30000),
+    reasoningEffort: 'none',
     systemPrompt: '你是 QQ 机器人消息意图分类器。严格只输出有效 JSON，不要解释。'
   })
   return parseNameIntentResponse(response && response.text)
@@ -1713,6 +1714,9 @@ async function callOpenAI(text, media, hist, opts) {
     : imageCount > 0
     ? Math.max(OPENAI_TIMEOUT_MS, 60000)
     : OPENAI_TIMEOUT_MS
+  const reasoningEffort = opts && Object.prototype.hasOwnProperty.call(opts, 'reasoningEffort')
+    ? opts.reasoningEffort
+    : OPENAI_REASONING_EFFORT
   try {
     const useResponses = OPENAI_WIRE_API === 'responses' || /ark\.cn-beijing\.volces\.com\/api\/v3$/i.test(OPENAI_BASE_URL)
     console.log(`调用OpenAI timeout=${requestTimeout}ms api=${useResponses ? 'responses' : 'chat'} image=${Boolean(opts && opts.generateImage)}`)
@@ -1801,7 +1805,7 @@ async function callOpenAI(text, media, hist, opts) {
           model: OPENAI_MODEL,
           instructions: requestSystemPrompt(opts),
           input: responseInput,
-          ...(OPENAI_REASONING_EFFORT ? { reasoning: { effort: OPENAI_REASONING_EFFORT } } : {}),
+          ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
           ...(OPENAI_NETWORK_ACCESS ? { metadata: { network_access: OPENAI_NETWORK_ACCESS } } : {}),
           ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
         }
