@@ -13,6 +13,38 @@ const { detectImageType } = require('../stickers')
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 15000
+const GIF_STATIC_MAX_EDGE = 1024
+
+let sharpModule = null
+function loadSharp() {
+  if (sharpModule !== null) return sharpModule || null
+  try {
+    // eslint-disable-next-line global-require
+    sharpModule = require('sharp')
+    return sharpModule
+  } catch {
+    sharpModule = false
+    return null
+  }
+}
+
+// QQ 表情包大多是 GIF，不少模型只会取第一帧，而第一帧经常是空白/纯白，
+// 于是模型把表情描述成“白色小团子”。这里取中间帧转成静态 PNG 再发。
+async function gifToStaticPng(buffer, options = {}) {
+  const sharp = options.sharp || loadSharp()
+  if (!sharp || !Buffer.isBuffer(buffer) || buffer.length === 0) return null
+  const metadata = await sharp(buffer, { animated: true }).metadata().catch(() => null)
+  const pages = Math.max(1, Number(metadata && metadata.pages) || 1)
+  // 动图取中间帧，静态图/单帧就取第 0 帧。
+  const page = pages > 1 ? Math.floor(pages / 2) : 0
+  const maxEdge = Math.max(256, Math.min(2048, Number(options.maxEdge) || GIF_STATIC_MAX_EDGE))
+  let pipeline = sharp(buffer, { page })
+  if (metadata && (metadata.width > maxEdge || metadata.height > maxEdge)) {
+    pipeline = pipeline.resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
+  }
+  const png = await pipeline.png().toBuffer()
+  return png && png.length ? png : null
+}
 
 function detectMime(buffer, fallback = '') {
   const image = detectImageType(buffer)
@@ -104,6 +136,7 @@ function writeContentAddressedImage(directory, buffer, options = {}) {
 module.exports = {
   DEFAULT_MAX_BYTES,
   detectMime,
+  gifToStaticPng,
   readSourceBuffer,
   writeContentAddressedImage
 }

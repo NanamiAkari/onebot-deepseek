@@ -16,7 +16,7 @@ const { createRequestQueue } = require('./src/app/request-queue')
 const { createSendRegistry } = require('./src/app/send-registry')
 const { extractContent } = require('./src/app/inbound-content')
 const { portablePokeSource, resolvePokeSource } = require('./src/app/poke-media')
-const { readSourceBuffer, writeContentAddressedImage } = require('./src/media/image-store')
+const { gifToStaticPng, readSourceBuffer, writeContentAddressedImage } = require('./src/media/image-store')
 const { isScheduledRetryDue, planScheduledFailure } = require('./src/app/scheduled-retry')
 const { createUsageTracker } = require('./src/usage/tracker')
 const { escapeCqText, sanitizeModelText, splitForQQ } = require('./src/outbound/text')
@@ -2206,7 +2206,13 @@ async function toOpenAIImageUrl(media) {
       const buffer = Buffer.from(String(media.inlineBase64), 'base64')
       if (buffer.length) {
         const mime = detectMimeFromBuffer(buffer, 'image/jpeg')
-        if (/^image\//i.test(mime)) return `data:${mime};base64,${buffer.toString('base64')}`
+        if (/^image\//i.test(mime)) {
+          if (/image\/gif/i.test(mime)) {
+            const png = await gifToStaticPng(buffer).catch(() => null)
+            if (png) return `data:image/png;base64,${png.toString('base64')}`
+          }
+          return `data:${mime};base64,${buffer.toString('base64')}`
+        }
       }
     } catch {}
   }
@@ -2215,7 +2221,18 @@ async function toOpenAIImageUrl(media) {
     if (!src) continue
     if (!/^https?:\/\//i.test(src) || isQqImageUrl(src)) {
       const file = await sourceToBase64(src)
-      if (file && file.data && /^image\//i.test(file.mime)) return `data:${file.mime};base64,${file.data}`
+      if (file && file.data && /^image\//i.test(file.mime)) {
+        if (/image\/gif/i.test(file.mime)) {
+          // 模型大多只看第一帧，而表情包第一帧可能是空白；转成中间帧的静态 PNG。
+          const png = await gifToStaticPng(Buffer.from(file.data, 'base64')).catch(() => null)
+          if (png) {
+            console.log(`GIF 转静态 PNG：${Math.round((file.data.length * 3) / 4 / 1024)}KB -> ${Math.round(png.length / 1024)}KB`)
+            return `data:image/png;base64,${png.toString('base64')}`
+          }
+          console.log('GIF 转 PNG 不可用（sharp 未加载），按原图发送')
+        }
+        return `data:${file.mime};base64,${file.data}`
+      }
     }
   }
   for (const src of candidates) {

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { readSourceBuffer, writeContentAddressedImage, detectMime } = require('../src/media/image-store')
+const { readSourceBuffer, writeContentAddressedImage, detectMime, gifToStaticPng } = require('../src/media/image-store')
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
 
@@ -56,4 +56,20 @@ test('non-image and oversized buffers are rejected', (t) => {
 test('mime detection falls back to the provided content type', () => {
   assert.equal(detectMime(PNG), 'image/png')
   assert.equal(detectMime(Buffer.from('xxxx'), 'audio/mpeg'), 'audio/mpeg')
+})
+
+test('animated gifs are flattened to a middle-frame png', async () => {
+  const calls = []
+  const fakeSharp = (_buffer, options = {}) => {
+    calls.push(options)
+    return {
+      metadata: async () => ({ pages: 3, width: 10, height: 10 }),
+      resize() { return this },
+      png() { return this },
+      toBuffer: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47])
+    }
+  }
+  const png = await gifToStaticPng(Buffer.from('GIF89a fake'), { sharp: fakeSharp })
+  assert.deepEqual(png, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  assert.equal(calls.some((call) => call.page === 1), true)
 })
