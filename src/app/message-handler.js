@@ -18,6 +18,7 @@ function createMessageHandler(deps) {
     checkModeration,
     classifyAddressing,
     handleCommands,
+    isCommandMessage,
     handleImageGenerationRequest,
     handleScheduleTaskDraftInput,
     handleCustomReplyDraftInput,
@@ -369,6 +370,21 @@ function createMessageHandler(deps) {
       let prefixTriggered = shouldRespond(rawText)
       const requirePrefix = REQUIRE_PREFIX !== false
       const prefixMentioned = Array.isArray(PREFIXES) && PREFIXES.some((prefix) => prefix && rawText.includes(String(prefix)))
+      const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
+        ? hasCustomReplyTrigger(payload.group_id, raw.text)
+        : false
+      if (isGroup) {
+        const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
+        if (ban) return
+      }
+      // 命令优先：命中命令就直接执行，跳过名称意图分类（一次模型调用）和后面的 AI/tool 选择。
+      let commandAttempted = false
+      if ((mentioned || prefixTriggered) && typeof isCommandMessage === 'function' && isCommandMessage(content.text)) {
+        commandAttempted = true
+        console.log('命令命中，直接执行（跳过意图分类和 AI）')
+        const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
+        if (cmdHandled) return
+      }
       // A configured prefix at the beginning is already an explicit address. Keep
       // the model classifier for ambiguous in-message or trailing mentions so a
       // normal reply does not pay for two sequential model requests.
@@ -393,16 +409,9 @@ function createMessageHandler(deps) {
       }
       const addressedByPrefix = prefixTriggered && stripPrefix(rawText) !== rawText
       const aiExplicitlyTriggered = isGroup && (mentioned || prefixTriggered)
-      const customReplyTriggered = isGroup && typeof hasCustomReplyTrigger === 'function'
-        ? hasCustomReplyTrigger(payload.group_id, raw.text)
-        : false
-      if (isGroup) {
-        const ban = await checkModeration(ws, payload.group_id, payload.user_id, payload.self_id, content.text).catch(() => false)
-        if (ban) return
-      }
       if (isGroup && GROUP_REQUIRE_MENTION && !mentioned && !customReplyTriggered) return
       if (isGroup && !GROUP_REQUIRE_MENTION && !mentioned && !prefixTriggered && !customReplyTriggered) return
-      const cmdHandled = await handleCommands(ws, payload, content.text).catch(() => false)
+      const cmdHandled = commandAttempted ? false : await handleCommands(ws, payload, content.text).catch(() => false)
       if (cmdHandled) return
       if (!aiExplicitlyTriggered) {
         const customMatched = await handleCustomReplyMatch(ws, payload, content.text).catch(() => false)

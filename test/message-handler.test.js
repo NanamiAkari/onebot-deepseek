@@ -34,7 +34,8 @@ function createHarness(message, options = {}) {
     checkMention: (segments) => segments.some((item) => item.type === 'at' && String(item.data.qq) === '1000'),
     checkModeration: async () => false,
     classifyAddressing: options.classifyAddressing,
-    handleCommands: async () => false,
+    handleCommands: options.handleCommands || (async () => false),
+    isCommandMessage: options.isCommandMessage,
     handleScheduleTaskDraftInput: async () => false,
     handleCustomReplyDraftInput: async () => false,
     handleCustomReplyMatch: async () => {
@@ -363,4 +364,44 @@ test('remembers a delivered reply and skips the identical text inside the window
   const second = createHarness([{ type: 'text', data: { text: '阿卡林再问一次' } }], { sendRegistry })
   await second.run()
   assert.equal(second.calls.actions.filter((item) => item.action === 'send_group_msg').length, 0)
+})
+
+test('commands are dispatched before the name intent classifier', async () => {
+  let classified = 0
+  let commands = 0
+  const harness = createHarness([
+    { type: 'at', data: { qq: '1000' } },
+    { type: 'text', data: { text: '定时任务 列表 阿卡林' } }
+  ], {
+    isCommandMessage: () => true,
+    handleCommands: async () => {
+      commands += 1
+      return true
+    },
+    classifyAddressing: async () => {
+      classified += 1
+      return { addressed: true, confidence: 1 }
+    }
+  })
+  await harness.run()
+  assert.equal(commands, 1)
+  assert.equal(classified, 0)
+  assert.equal(harness.calls.ai, 0)
+})
+
+test('non-command messages still go through intent classification and the model', async () => {
+  let classified = 0
+  const harness = createHarness([
+    { type: 'at', data: { qq: '1000' } },
+    { type: 'text', data: { text: '在吗阿卡林' } }
+  ], {
+    isCommandMessage: () => false,
+    classifyAddressing: async () => {
+      classified += 1
+      return { addressed: true, confidence: 1 }
+    }
+  })
+  await harness.run()
+  assert.equal(classified, 1)
+  assert.equal(harness.calls.ai, 1)
 })

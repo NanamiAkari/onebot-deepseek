@@ -1483,6 +1483,7 @@ const onMessage = createMessageHandler({
   checkMention,
   checkModeration,
   handleCommands,
+  isCommandMessage,
   handleImageGenerationRequest,
   handleScheduleTaskDraftInput,
   handleCustomReplyDraftInput,
@@ -2826,7 +2827,8 @@ function buildBannedCommandHelp(isAdminUser) {
   return lines.join('\n')
 }
 
-async function handleCommands(ws, payload, text) {
+// 命令识别只做正则判断，不调用模型；handler 用它决定“命令优先、跳过意图分类”。
+function parseCommandIntent(text) {
   const rawCommandText = stripPrefix(text || '')
   const t = normalizeCommandText(rawCommandText)
   const nt = t.replace(/\s+/g, ' ')
@@ -2837,8 +2839,36 @@ async function handleCommands(ws, payload, text) {
   const isSchedule = /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(nt) || /^(创建定时任务|取消定时任务|定时任务|定时|计划任务|定时提醒)/i.test(compact)
   const isCustomReply = /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(nt)
     || /^(创建自定义回复|取消自定义回复|自定义回复|关键词回复|关键字回复)/i.test(compact)
-  const matchedCommand = isBanned || isContext || isPoke || isSchedule || isCustomReply
-  if (!matchedCommand) return false
+  return {
+    rawCommandText,
+    nt,
+    compact,
+    isBanned,
+    isContext,
+    isPoke,
+    isSchedule,
+    isCustomReply,
+    matched: isBanned || isContext || isPoke || isSchedule || isCustomReply
+  }
+}
+
+function isCommandMessage(text) {
+  return parseCommandIntent(text).matched
+}
+
+async function handleCommands(ws, payload, text) {
+  const {
+    rawCommandText,
+    nt,
+    compact,
+    isBanned,
+    isContext,
+    isPoke,
+    isSchedule,
+    isCustomReply,
+    matched
+  } = parseCommandIntent(text)
+  if (!matched) return false
   try {
     const isGroup = payload.message_type === 'group'
     const roleUser = isGroup ? await getUserRole(ws, payload.group_id, payload.user_id).catch(() => 'member') : 'member'
