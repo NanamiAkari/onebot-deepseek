@@ -1765,6 +1765,8 @@ async function callOpenAI(text, media, hist, opts) {
           console.log(`图片附件跳过：sources=${summarizeMediaSources(m)}`)
           continue
         }
+        const form = imageUrl.startsWith('data:') ? 'base64' : 'url'
+        console.log(`图片附件 ${attached + 1}: ${form}${form === 'url' ? ` ${imageUrl.slice(0, 80)}` : ''}`)
         if (useResponses) content.push({ type: 'input_image', image_url: imageUrl })
         else content.push({ type: 'image_url', image_url: { url: imageUrl } })
         attached += 1
