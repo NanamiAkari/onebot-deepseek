@@ -274,6 +274,19 @@ function createMessageHandler(deps) {
       if (typeof recordGroupMessage === 'function') recordGroupMessage(payload, raw.text)
       const memoryRelations = { mentionedUserIds: extractMentionedUserIds(payload.message), replyToUserId: '', media: [], forwarded: [] }
       raw.media = await resolveMediaSources(ws, raw.media)
+      // 排查「机器人说没收到图片」：打印段类型、图片来源字段名和可用数量，不打印内容。
+      const PLAIN_SEGMENTS = new Set(['text', 'at', 'reply', 'face', 'emoji'])
+      const richSegments = Array.isArray(payload.message)
+        ? payload.message.filter((seg) => seg && !PLAIN_SEGMENTS.has(seg.type))
+        : (/\[CQ:(?:image|mface|video|record|audio|forward|json|xml)/.test(String(payload.message || '')) ? [{ type: 'cq-string' }] : [])
+      if (richSegments.length > 0) {
+        const describe = richSegments
+          .map((seg) => (seg.type === 'cq-string' ? 'cq-string' : `${seg.type}:${Object.keys(seg.data || {}).join('+') || '-'}`))
+          .join(',')
+        const images = (raw.media || []).filter((item) => item && item.kind === 'image')
+        const usable = images.filter((item) => item.localPath || item.url || item.inlineBase64).length
+        console.log(`入站段=${describe} 图片=${images.length} 可用=${usable}`)
+      }
       memoryRelations.media = (raw.media || []).map((item) => ({
         kind: String(item.kind || ''),
         file: String(item.file || '').slice(0, 200),

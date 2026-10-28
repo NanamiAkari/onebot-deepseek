@@ -1756,16 +1756,21 @@ async function callOpenAI(text, media, hist, opts) {
     }
     if (useResponses) content.push({ type: 'input_text', text: text || 'Hello' })
     else content.push({ type: 'text', text: text || 'Hello' })
-    if (Array.isArray(effectiveMedia) && effectiveMedia.length > 0) {
-      const limited = effectiveMedia.filter((m) => m && m.kind === 'image').slice(0, AI_IMAGE_CONTEXT_MAX)
+    const imageAttachments = Array.isArray(effectiveMedia) ? effectiveMedia.filter((m) => m && m.kind === 'image') : []
+    if (imageAttachments.length > 0) {
+      const limited = imageAttachments.slice(0, AI_IMAGE_CONTEXT_MAX)
       for (const m of limited) {
         const imageUrl = await toOpenAIImageUrl(m)
-        if (!imageUrl) continue
+        if (!imageUrl) {
+          console.log(`图片附件跳过：sources=${summarizeMediaSources(m)}`)
+          continue
+        }
         if (useResponses) content.push({ type: 'input_image', image_url: imageUrl })
         else content.push({ type: 'image_url', image_url: { url: imageUrl } })
         attached += 1
       }
-      console.log(`OpenAI媒体数量: ${attached}`)
+      console.log(`OpenAI媒体数量: ${attached}/${limited.length}`)
+      if (attached === 0) console.log('图片附件为 0：图片没有可用来源（本地路径不可读、协议端没有返回 url/base64）')
     }
     const msg = []
     if (!useResponses) {
@@ -2019,6 +2024,20 @@ function sendAction(ws, action, params) {
   })
 }
 
+function isLocalPathValue(src) {
+  const value = String(src || '').trim()
+  return /^[\\/]/.test(value) || /^[a-zA-Z]:[\\/]/.test(value)
+}
+
+function isReadableFile(src) {
+  if (!isLocalPathValue(src)) return false
+  try {
+    return fs.statSync(src).isFile()
+  } catch {
+    return false
+  }
+}
+
 async function resolveMediaSources(ws, media) {
   if (!Array.isArray(media) || media.length === 0) return []
   const out = []
@@ -2029,15 +2048,24 @@ async function resolveMediaSources(ws, media) {
     }
     let url = item.url || ''
     let localPath = item.localPath || ''
+    let inlineBase64 = item.inlineBase64 || ''
     const fileRef = item.file || ''
-    if (!localPath && fileRef && !isDirectMediaSource(fileRef)) {
+    // 协议端可能给的是它自己机器上的路径（Docker/远程 NapCat）：本机读不到，
+    // 就再向协议端要一次，拿它返回的 base64 / 本地缓存路径 / url。
+    const unreadableLocal = isLocalPathValue(fileRef) && !isReadableFile(fileRef)
+    if (!localPath && !inlineBase64 && fileRef && (!isDirectMediaSource(fileRef) || unreadableLocal)) {
       const resp = await sendAction(ws, 'get_image', { file: fileRef }).catch(() => null)
       if (resp && resp.status === 'ok' && resp.data) {
-        if (resp.data.file) localPath = String(resp.data.file)
-        if (!url && resp.data.url) url = String(resp.data.url)
+        const data = resp.data
+        const base64 = typeof data.base64 === 'string' ? data.base64 : (typeof data.file_base64 === 'string' ? data.file_base64 : '')
+        if (base64) inlineBase64 = base64.replace(/^base64:\/\//i, '')
+        const responseFile = data.file ? String(data.file) : ''
+        if (responseFile && isReadableFile(responseFile)) localPath = responseFile
+        else if (responseFile && /^https?:\/\//i.test(responseFile)) url = url || responseFile
+        if (!url && data.url) url = String(data.url)
       }
     }
-    out.push({ ...item, url, localPath })
+    out.push({ ...item, url, localPath, ...(inlineBase64 ? { inlineBase64 } : {}) })
   }
   return out
 }
@@ -2151,8 +2179,27 @@ async function sourceToBuffer(src) {
   })
 }
 
+function summarizeMediaSources(media) {
+  if (!media) return 'none'
+  const parts = []
+  if (media.inlineBase64) parts.push('inlineBase64')
+  if (media.localPath) parts.push(`localPath(${String(media.localPath).slice(0, 60)})`)
+  if (media.file) parts.push(`file(${String(media.file).slice(0, 40)})`)
+  if (media.url) parts.push(`url(${String(media.url).slice(0, 60)})`)
+  return parts.join('|') || 'none'
+}
+
 async function toOpenAIImageUrl(media) {
   if (!media) return ''
+  if (media.inlineBase64) {
+    try {
+      const buffer = Buffer.from(String(media.inlineBase64), 'base64')
+      if (buffer.length) {
+        const mime = detectMimeFromBuffer(buffer, 'image/jpeg')
+        if (/^image\//i.test(mime)) return `data:${mime};base64,${buffer.toString('base64')}`
+      }
+    } catch {}
+  }
   const candidates = [media.localPath, media.file, media.url].filter(Boolean)
   for (const src of candidates) {
     if (!src) continue
