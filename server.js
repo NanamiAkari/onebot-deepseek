@@ -1767,7 +1767,14 @@ async function callOpenAI(text, media, hist, opts) {
           continue
         }
         const form = imageUrl.startsWith('data:') ? 'base64' : 'url'
-        console.log(`图片附件 ${attached + 1}: ${form}${form === 'url' ? ` ${imageUrl.slice(0, 80)}` : ''}`)
+        if (form === 'base64') {
+          const mimeMatch = imageUrl.match(/^data:([^;,]+)/)
+          const comma = imageUrl.indexOf(',')
+          const bytes = comma > 0 ? Math.round((imageUrl.length - comma - 1) * 0.75) : 0
+          console.log(`图片附件 ${attached + 1}: base64 ${mimeMatch ? mimeMatch[1] : 'unknown'} ${bytes}B`)
+        } else {
+          console.log(`图片附件 ${attached + 1}: url ${imageUrl.slice(0, 80)}`)
+        }
         if (useResponses) content.push({ type: 'input_image', image_url: imageUrl })
         else content.push({ type: 'image_url', image_url: { url: imageUrl } })
         attached += 1
