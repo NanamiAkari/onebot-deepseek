@@ -295,8 +295,13 @@ function createMessageHandler(deps) {
       memoryRelations.forwarded = await resolveForwardedRecords(ws, raw.forwardIds)
       const key = getKey(payload)
       let ctxImgUsed = false
+      // 当前消息本身就是表情包但没取到图时，不要把缓存里上一张图塞进来——
+      // 模型会去描述那张旧图，看起来像“读到了表情包”，实际是拿错图。
+      const stickerWithoutImage = /\[表情包\]/.test(String(raw.text || '')) && !(raw.media && raw.media.length > 0)
       if (raw.media && raw.media.length > 0) {
         mediaCache.set(key, { media: raw.media.slice(0, AI_IMAGE_CONTEXT_MAX), ts: Date.now(), userId: payload.user_id })
+      } else if (stickerWithoutImage) {
+        console.log('上下文图片：当前是表情包但没有取到图，跳过缓存避免拿错图')
       } else {
         const cached = mediaCache.get(key)
         if (cached && Date.now() - cached.ts <= AI_IMAGE_CONTEXT_TTL * 1000) {
@@ -345,6 +350,10 @@ function createMessageHandler(deps) {
         } else {
           console.log(`引用消息读取失败 id=${content.replyId}`)
         }
+      }
+      // 表情包的图实在取不到时，明确告诉模型“图片未能加载”，避免它假装看见或去描述缓存里的旧图。
+      if (/\[表情包\]/.test(String(content.text || '')) && !(content.media && content.media.length > 0)) {
+        content.text = String(content.text).replace(/\[表情包\]/g, '[表情包（图片未能加载）]')
       }
       if (memberMemory && typeof memberMemory.recordMessage === 'function') {
         try { memberMemory.recordMessage(payload, originalText, memoryRelations) } catch (error) {
