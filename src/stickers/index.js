@@ -57,9 +57,12 @@ function createStickerStore(options = {}) {
     const file = cleanText(raw.file, 200).replace(/\\/g, '/')
     if (!/^st_[a-f0-9]{16,32}$/i.test(id)) return null
     if (!/^images\/st_[a-f0-9]{16,32}\.(?:jpg|png|gif|webp|avif)$/i.test(file)) return null
+    const contentHash = cleanText(raw.contentHash, 64).toLowerCase()
     return {
       id,
       file,
+      // 图片字节的 sha256：同一张图从不同消息收藏时据此去重。
+      contentHash: /^[a-f0-9]{64}$/.test(contentHash) ? contentHash : '',
       note: cleanText(raw.note, 240),
       tags: normalizeTags(raw.tags),
       usage: cleanText(raw.usage, 300),
@@ -160,13 +163,15 @@ function createStickerStore(options = {}) {
     if (buffer.length > maxBytes) throw new Error(`图片超过 ${Math.floor(maxBytes / 1024 / 1024)} MB 上限`)
     const type = detectImageType(buffer)
     if (!type) throw new Error('文件不是受支持的图片格式')
-    const file = writeImage(id, buffer, type.ext)
-    if (existing && existing.file !== file) {
-      const oldPath = path.join(rootDir, existing.file)
-      try { fs.unlinkSync(oldPath) } catch {}
-    }
+    const contentHash = crypto.createHash('sha256').update(buffer).digest('hex')
     if (existing) {
+      const file = writeImage(id, buffer, type.ext)
+      if (existing.file !== file) {
+        const oldPath = path.join(rootDir, existing.file)
+        try { fs.unlinkSync(oldPath) } catch {}
+      }
       existing.file = file
+      existing.contentHash = contentHash
       existing.note = cleanText(note || existing.note, 240)
       existing.tags = tags !== undefined ? normalizeTags(tags) : existing.tags
       existing.usage = usage !== undefined ? cleanText(usage, 300) : existing.usage
@@ -174,9 +179,21 @@ function createStickerStore(options = {}) {
       save()
       return publicEntry(existing)
     }
+    // 同一张图从不同消息收藏时，按内容哈希复用已有条目，不重复占库存。
+    const duplicate = load().find((entry) => entry.contentHash && entry.contentHash === contentHash)
+    if (duplicate) {
+      if (note) duplicate.note = cleanText(note, 240)
+      if (tags !== undefined) duplicate.tags = normalizeTags(tags)
+      if (usage !== undefined) duplicate.usage = cleanText(usage, 300)
+      duplicate.updatedAt = now
+      save()
+      return publicEntry(duplicate)
+    }
+    const file = writeImage(id, buffer, type.ext)
     const entry = {
       id,
       file,
+      contentHash,
       note: cleanText(note, 240),
       tags: normalizeTags(tags),
       usage: cleanText(usage, 300),
@@ -209,7 +226,7 @@ function createStickerStore(options = {}) {
     }
     const type = detectImageType(buffer)
     if (!type) throw new Error('表情文件格式已损坏')
-    return { entry: publicEntry(entry), buffer, mime: type.mime }
+    return { entry: publicEntry(entry), buffer, mime: type.mime, localPath: file }
   }
 
   function markUsed(id, context = '') {

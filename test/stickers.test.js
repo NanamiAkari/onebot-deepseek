@@ -74,3 +74,23 @@ test('image type detection only accepts supported real image signatures', () => 
   assert.deepEqual(detectImageType(PNG), { ext: '.png', mime: 'image/png' })
   assert.equal(detectImageType(Buffer.from('not an image')), null)
 })
+
+test('the same image collected from different messages reuses one entry', async (t) => {
+  const { rootDir, store } = fixture(t)
+  const first = await store.collect({
+    key: 'group:1:message:2:image:1',
+    note: '第一张',
+    getBytes: async () => PNG
+  })
+  const second = await store.collect({
+    key: 'group:1:message:99:image:1',
+    note: '同一张图',
+    getBytes: async () => PNG
+  })
+  assert.equal(second.id, first.id)
+  assert.equal(store.list().total, 1)
+  assert.equal(store.list().stickers[0].note, '同一张图')
+  const index = JSON.parse(fs.readFileSync(path.join(rootDir, 'stickers.json'), 'utf8'))
+  assert.equal(index[0].contentHash.length, 64)
+  assert.equal(fs.readdirSync(path.join(rootDir, 'images')).length, 1)
+})

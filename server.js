@@ -14,6 +14,9 @@ const { createMemberMemory, previousLocalDate } = require('./src/memory/member-m
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
 const { createSendRegistry } = require('./src/app/send-registry')
+const { extractContent } = require('./src/app/inbound-content')
+const { portablePokeSource, resolvePokeSource } = require('./src/app/poke-media')
+const { readSourceBuffer, writeContentAddressedImage } = require('./src/media/image-store')
 const { isScheduledRetryDue, planScheduledFailure } = require('./src/app/scheduled-retry')
 const { createUsageTracker } = require('./src/usage/tracker')
 const { escapeCqText, sanitizeModelText, splitForQQ } = require('./src/outbound/text')
@@ -230,6 +233,10 @@ const usageTracker = createUsageTracker({
   log: (message) => console.log(message)
 })
 
+// 拍一拍图片转存上限：防止一个超大图把内存和磁盘拖垮。
+const POKE_IMAGE_MAX_BYTES = Math.max(64 * 1024, Math.min(20 * 1024 * 1024, Number(config.AI_POKE_IMAGE_MAX_BYTES) || 10 * 1024 * 1024))
+const POKE_MEDIA_DIR = path.join(PROJECT_ROOT, 'poke_media')
+
 function getPokeReplyFilePath() {
   return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
 }
@@ -286,7 +293,7 @@ function normalizePokeReplyItem(item) {
   }
   if (!item || typeof item !== 'object') return null
   if (item.type === 'image') {
-    const source = pickPokeImageSource(item)
+    const source = resolvePokeSource(pickPokeImageSource(item), { dir: POKE_MEDIA_DIR, projectRoot: PROJECT_ROOT })
     if (!source) return null
     const name = String(item.name || '').trim()
     return name ? { type: 'image', source, name } : { type: 'image', source }
@@ -302,7 +309,8 @@ function normalizePokeReplyList(items) {
 function serializePokeReplyItem(item) {
   if (!item || typeof item !== 'object') return null
   if (item.type === 'image') {
-    const source = String(item.source || '').trim()
+    // 存相对路径，换部署目录后还能按文件名找回。
+    const source = portablePokeSource(String(item.source || '').trim(), { dir: POKE_MEDIA_DIR })
     if (!source) return null
     const name = String(item.name || '').trim()
     return name ? { type: 'image', source, name } : { type: 'image', source }
@@ -438,6 +446,27 @@ function savePokeReplyTexts(list) {
   fs.writeFileSync(filePath, `${JSON.stringify(serialized, null, 2)}\n`, 'utf8')
   currentPokeReplyTexts = items
   return items.slice()
+}
+
+// 启动时把历史绝对路径迁移成相对路径；文件不存在或内容为空时不动，
+// 避免把环境变量里的默认文案误写进一个本来就是空的文件。
+function healPokeReplyStore() {
+  const filePath = getPokeReplyFilePath()
+  let raw = ''
+  let parsed = null
+  try {
+    raw = fs.readFileSync(filePath, 'utf8')
+    parsed = JSON.parse(raw)
+  } catch {
+    return 0
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return 0
+  const items = normalizePokeReplyList(parsed)
+  const next = `${JSON.stringify(items.map(serializePokeReplyItem).filter(Boolean), null, 2)}\n`
+  if (next === raw) return 0
+  savePokeReplyTexts(items)
+  console.log(`已迁移拍一拍回复的图片路径（${items.length} 条）`)
+  return items.length
 }
 
 function dedupeTextList(list) {
@@ -1123,6 +1152,13 @@ setInterval(() => {
   runScheduledTasksTick().catch((err) => console.log('runScheduledTasksTick', err && err.stack ? err.stack : err))
 }, 15000)
 
+// 启动时迁移一次拍一拍图片路径（幂等，只在内容变化时写盘）。
+try {
+  healPokeReplyStore()
+} catch (error) {
+  console.log('拍一拍路径迁移失败', error && error.message ? error.message : error)
+}
+
 let lastMemorySummaryDate = ''
 
 async function runMemberMemoryTick() {
@@ -1505,53 +1541,6 @@ process.on('uncaughtException', (error) => {
   const text = error && error.stack ? String(error.stack) : String(error)
   console.log('uncaughtException', text)
 })
-
-function extractContent(message) {
-  let text = ''
-  const media = []
-  let replyId = ''
-  if (Array.isArray(message)) {
-    for (const seg of message) {
-      if (seg.type === 'text') {
-        text += (seg.data && seg.data.text) || ''
-      } else if (seg.type === 'image' && seg.data) {
-        const url = seg.data.url || ''
-        const file = seg.data.file || ''
-        if (url || file) media.push({ kind: 'image', url, file })
-      } else if ((seg.type === 'record' || seg.type === 'audio') && seg.data) {
-        const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'audio', url, file: seg.data.file || '', duration: Number(seg.data.duration || 0) })
-      } else if (seg.type === 'video' && seg.data) {
-        const url = seg.data.url || seg.data.file
-        if (url) media.push({ kind: 'video', url, file: seg.data.file || '', duration: Number(seg.data.duration || 0) })
-      } else if (seg.type === 'face') {
-        text += '[表情]'
-      } else if (seg.type === 'emoji' && seg.data && seg.data.id) {
-        text += `[emoji:${seg.data.id}]`
-      } else if (seg.type === 'reply' && seg.data) {
-        replyId = String(seg.data.id || seg.data.message_id || '')
-      } else if (seg.type === 'at') {
-        text += ' '
-      }
-    }
-    text = text.trim()
-    text = text.replace(/\s*\[CQ:at,qq=\d+\]\s*/g, '')
-    const forwardIds = message.filter((seg) => seg && seg.type === 'forward' && seg.data && (seg.data.id || seg.data.resid))
-      .map((seg) => String(seg.data.id || seg.data.resid)).slice(0, 3)
-    return { text, media, replyId, forwardIds }
-  }
-  if (typeof message === 'string') {
-    const t = message
-      .replace(/\[CQ:at,qq=\d+\]/g, '')
-      .replace(/\[CQ:face,[^\]]*\]/g, '[表情]')
-      .replace(/\[CQ:(?:image|record|audio|video|reply|forward),[^\]]*\]/g, '')
-      .trim()
-    const cqMedia = parseCQMedia(message)
-    const forwardIds = Array.from(message.matchAll(/\[CQ:forward,(?:id|resid)=([^,\]]+)/g)).map((match) => match[1]).slice(0, 3)
-    return { text: t, media: cqMedia.length ? cqMedia : media, replyId, forwardIds }
-  }
-  return { text: '', media, replyId, forwardIds: [] }
-}
 
 function checkMention(message, selfId) {
   if (Array.isArray(message)) {
@@ -2030,30 +2019,6 @@ function sendAction(ws, action, params) {
   })
 }
 
-function parseCQMedia(str) {
-  const out = []
-  const re = /\[CQ:(image|record|audio|video|emoji|face)(?:,([^\]]*))?\]/g
-  let m
-  while ((m = re.exec(str)) !== null) {
-    const type = m[1]
-    const kv = {}
-    if (m[2]) {
-      m[2].split(',').forEach((pair) => {
-        const [k, v] = pair.split('=')
-        if (k && v) kv[k] = v
-      })
-    }
-    if (type === 'emoji') continue
-    if (type === 'face') continue
-    const url = kv.url || kv.file
-    if (url) {
-      const kind = type === 'record' ? 'audio' : type
-      out.push({ kind, url, file: kv.file || '' })
-    }
-  }
-  return out
-}
-
 async function resolveMediaSources(ws, media) {
   if (!Array.isArray(media) || media.length === 0) return []
   const out = []
@@ -2162,60 +2127,28 @@ async function persistPokeImageSource(source) {
     } catch {}
   }
 
-  const downloaded = await sourceToBuffer(value).catch(() => null)
-  if (!downloaded || !downloaded.buf || !isImageMime(downloaded.mime)) return value
-
-  fs.mkdirSync(ownedDir, { recursive: true })
-  const hash = crypto.createHash('sha1').update(downloaded.buf).digest('hex')
-  const ext = detectImageExtFromMime(downloaded.mime)
-  const filePath = path.join(ownedDir, `${hash}${ext}`)
-  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, downloaded.buf)
-  return filePath
+  try {
+    const downloaded = await readSourceBuffer(value, {
+      maxBytes: POKE_IMAGE_MAX_BYTES,
+      timeoutMs: 15000,
+      httpsAgent: HTTPS_AGENT,
+      referer: MEDIA_REFERER
+    })
+    if (!downloaded || !downloaded.buf) return value
+    const written = writeContentAddressedImage(ownedDir, downloaded.buf, { maxBytes: POKE_IMAGE_MAX_BYTES })
+    return written.path
+  } catch (error) {
+    console.log(`拍一拍图片转存失败：${error && error.message ? error.message : error}`)
+    return value
+  }
 }
 
 async function sourceToBuffer(src) {
-  if (!src) return null
-  let buf = null
-  let mime = 'application/octet-stream'
-  if (/^base64:\/\//i.test(src)) {
-    buf = Buffer.from(src.replace(/^base64:\/\//i, ''), 'base64')
-    mime = detectMimeFromBuffer(buf, mime)
-  } else if (/^data:/i.test(src)) {
-    const i = src.indexOf(',')
-    if (i <= 0) return null
-    const head = src.slice(0, i)
-    const data = src.slice(i + 1)
-    const mimeMatch = head.match(/^data:([^;]+)/i)
-    mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream'
-    buf = Buffer.from(data, 'base64')
-  } else if (/^file:\/\//i.test(src)) {
-    const p = decodeURIComponent(src.replace(/^file:\/\//i, ''))
-    buf = fs.readFileSync(p)
-    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-  } else if (/^[\\/].+/.test(src) || /^[a-zA-Z]:[\\/]/.test(src)) {
-    const p = decodeURIComponent(src)
-    buf = fs.readFileSync(p)
-    mime = detectMimeFromBuffer(buf, detectMimeFromExt(p))
-  } else if (/^https?:\/\//i.test(src)) {
-    const headers = { 'User-Agent': 'Mozilla/5.0' }
-    if (MEDIA_REFERER) {
-      headers.Referer = MEDIA_REFERER
-    } else {
-      try {
-        const u = new URL(src)
-        const host = u.hostname || ''
-        if (/qpic\.cn$/i.test(host) || /gchat\.qpic\.cn$/i.test(host)) headers.Referer = 'https://gchat.qpic.cn'
-        else if (/qun\.qq\.com$/i.test(host)) headers.Referer = 'https://qun.qq.com'
-      } catch {}
-    }
-    const res = await axios.get(src, { responseType: 'arraybuffer', httpsAgent: HTTPS_AGENT, proxy: false, timeout: 15000, headers })
-    buf = Buffer.from(res.data)
-    const ct = (res.headers && res.headers['content-type']) || ''
-    mime = detectMimeFromBuffer(buf, ct.split(';')[0] || 'application/octet-stream')
-  } else {
-    return null
-  }
-  return { buf, mime }
+  return readSourceBuffer(src, {
+    httpsAgent: HTTPS_AGENT,
+    referer: MEDIA_REFERER,
+    timeoutMs: 15000
+  })
 }
 
 async function toOpenAIImageUrl(media) {

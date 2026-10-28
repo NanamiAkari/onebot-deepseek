@@ -260,10 +260,10 @@ test('web fetch tool returns readable page data through the safe fetch service',
   assert.equal(executor.isAllowed('web_fetch', trustedRuntime), true)
 })
 
-test('send sticker only targets the current conversation and defaults to no quote', async (t) => {
+test('send sticker only targets the current conversation and prefers a local file', async (t) => {
   const stickers = {
     list: () => ({ stickers: [] }),
-    readForSend: () => ({ buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' }),
+    readForSend: () => ({ buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png', localPath: '/tmp/st_test.png' }),
     markUsed: () => ({})
   }
   const { executor, actions } = fixture(t, { stickers })
@@ -274,8 +274,55 @@ test('send sticker only targets the current conversation and defaults to no quot
   assert.equal(actions[0].params.group_id, 10)
   assert.equal(actions[0].params.message.length, 1)
   assert.equal(actions[0].params.message[0].type, 'image')
-  assert.match(actions[0].params.message[0].data.file, /^base64:\/\//)
+  assert.equal(actions[0].params.message[0].data.file, 'file:///tmp/st_test.png')
 })
+
+test('sticker send falls back to base64 when the protocol side cannot read the file', async (t) => {
+  const stickers = {
+    list: () => ({ stickers: [] }),
+    readForSend: () => ({ buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png', localPath: '/tmp/st_test.png' }),
+    markUsed: () => ({})
+  }
+  let attempts = 0
+  const sent = []
+  const { executor } = fixture(t, {
+    stickers,
+    sendAction: async (_ws, _action, params) => {
+      attempts += 1
+      sent.push(params)
+      if (attempts === 1) return { status: 'failed', retcode: 100 }
+      return { status: 'ok', retcode: 0, data: { message_id: 7 } }
+    }
+  })
+  const result = await executor.execute('send_sticker', { sticker_id: 'st_test' }, trustedRuntime)
+  assert.equal(result.ok, true)
+  assert.equal(attempts, 2)
+  assert.equal(sent[0].message[0].data.file, 'file:///tmp/st_test.png')
+  assert.match(sent[1].message[0].data.file, /^base64:\/\//)
+})
+
+test('a timed-out sticker send is not retried with another form', async (t) => {
+  const stickers = {
+    list: () => ({ stickers: [] }),
+    readForSend: () => ({ buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png', localPath: '/tmp/st_test.png' }),
+    markUsed: () => ({})
+  }
+  let attempts = 0
+  const { executor } = fixture(t, {
+    stickers,
+    sendAction: async () => {
+      attempts += 1
+      const error = new Error('timeout')
+      error.code = 'TIMEOUT'
+      throw error
+    }
+  })
+  const result = await executor.execute('send_sticker', { sticker_id: 'st_test' }, trustedRuntime)
+  assert.equal(result.ok, false)
+  assert.equal(result.kind, 'uncertain')
+  assert.equal(attempts, 1)
+})
+
 
 test('bot feature tools are exposed and stay within the active group', async (t) => {
   const calls = []
@@ -464,3 +511,38 @@ test('failed sends stay retryable and are not remembered as duplicates', async (
   assert.equal((await executor.execute('send_group_msg', { group_id: 10, message }, trustedRuntime)).ok, true)
   assert.equal(attempts, 2)
 })
+
+test('market-face stickers can be collected like ordinary images', async (t) => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
+  let collected = null
+  const stickers = {
+    list: () => ({ stickers: [] }),
+    collect: async (input) => {
+      collected = { ...input, bytes: await input.getBytes() }
+      return { id: 'st_mface', note: input.note }
+    }
+  }
+  const webFetch = {
+    fetchBinary: async (url) => {
+      assert.equal(url, 'https://gchat.qpic.cn/a.gif')
+      return { buffer: png, contentType: 'image/png' }
+    }
+  }
+  const { executor } = fixture(t, { stickers, webFetch })
+  const runtime = {
+    ws: {},
+    payload: {
+      message_type: 'group',
+      group_id: 10,
+      user_id: 20,
+      message_id: 30,
+      message: [{ type: 'mface', data: { url: 'https://gchat.qpic.cn/a.gif' } }]
+    }
+  }
+  const result = await executor.execute('collect_sticker', { note: '笑死', tags: ['好笑'] }, runtime)
+  assert.equal(result.ok, true)
+  assert.equal(collected.note, '笑死')
+  assert.deepEqual(collected.bytes, png)
+  assert.match(collected.key, /30/)
+})
+

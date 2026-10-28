@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const { createToolPolicy } = require('./tool-policy')
 const { chatKeyFromPayload, isReadOnlyTool, toolLockKey } = require('./tool-metadata')
 const { sanitizeOutboundSegments } = require('../outbound/segments')
@@ -385,7 +386,8 @@ function createToolExecutor(deps) {
     const candidates = []
     if (Array.isArray(message)) {
       for (const segment of message) {
-        if (!segment || segment.type !== 'image' || !segment.data) continue
+        // 表情包（mface）和普通图片一样可以收藏。
+        if (!segment || !segment.data || (segment.type !== 'image' && segment.type !== 'mface')) continue
         const file = String(segment.data.file || segment.data.file_id || '').trim()
         const url = String(segment.data.url || segment.data.path || '').trim()
         if (file || url) candidates.push({ file, url })
@@ -393,7 +395,7 @@ function createToolExecutor(deps) {
       return candidates
     }
     const text = String(message || '')
-    for (const match of text.matchAll(/\[CQ:image,([^\]]+)\]/g)) {
+    for (const match of text.matchAll(/\[CQ:(?:image|mface),([^\]]+)\]/g)) {
       const values = {}
       for (const part of match[1].split(',')) {
         const index = part.indexOf('=')
@@ -520,16 +522,8 @@ function createToolExecutor(deps) {
       throw new ToolError('只能引用当前消息或当前消息引用的消息')
     }
     const image = stickers.readForSend(args.sticker_id)
-    const message = [
-      ...(replyId ? [{ type: 'reply', data: { id: replyId } }] : []),
-      { type: 'image', data: { file: `base64://${image.buffer.toString('base64')}` } }
-    ]
-    const action = payload.message_type === 'group' ? 'send_group_msg' : 'send_private_msg'
-    const params = payload.message_type === 'group'
-      ? { group_id: payload.group_id, message }
-      : { user_id: payload.user_id, message }
-    const result = await sendOnce(runtime.ws, action, params, payload, { sticker: args.sticker_id })
-    if (result && result.deduplicated) {
+    const print = sendFingerprint(payload, { sticker: args.sticker_id })
+    if (print && typeof sendRegistry.isDuplicate === 'function' && sendRegistry.isDuplicate(print)) {
       return {
         sent: false,
         deduplicated: true,
@@ -537,13 +531,41 @@ function createToolExecutor(deps) {
         note: '这张表情刚刚发送过，已跳过重复发送。不要向用户汇报工具调用过程。'
       }
     }
-    stickers.markUsed(args.sticker_id, String(payload.message || '').slice(0, 200))
-    return {
-      sent: true,
-      sticker_id: args.sticker_id,
-      message_id: result.data && (result.data.message_id || result.data.messageId) || null,
-      note: '表情已发送。不要向用户汇报工具调用过程。'
+    const replySegments = replyId ? [{ type: 'reply', data: { id: replyId } }] : []
+    // 和拍一拍一致：优先让协议端直接读本地文件（同机时最省流量），失败再退 base64。
+    const variants = []
+    if (image.localPath) {
+      try {
+        variants.push([...replySegments, { type: 'image', data: { file: pathToFileURL(image.localPath).href } }])
+      } catch {}
     }
+    variants.push([...replySegments, { type: 'image', data: { file: `base64://${image.buffer.toString('base64')}` } }])
+
+    const action = payload.message_type === 'group' ? 'send_group_msg' : 'send_private_msg'
+    let lastError = null
+    for (let index = 0; index < variants.length; index += 1) {
+      const message = variants[index]
+      const params = payload.message_type === 'group'
+        ? { group_id: payload.group_id, message }
+        : { user_id: payload.user_id, message }
+      try {
+        const result = await oneBotAction(runtime.ws, action, params)
+        if (print && typeof sendRegistry.markSent === 'function') sendRegistry.markSent(print)
+        stickers.markUsed(args.sticker_id, String(payload.message || '').slice(0, 200))
+        return {
+          sent: true,
+          sticker_id: args.sticker_id,
+          message_id: result.data && (result.data.message_id || result.data.messageId) || null,
+          note: '表情已发送。不要向用户汇报工具调用过程。'
+        }
+      } catch (error) {
+        // 超时意味着可能已经发出去了，换形态重发会造成重复表情。
+        if (error instanceof ToolError && error.kind === 'uncertain') throw error
+        lastError = error
+        console.log(`表情发送失败（${index === 0 ? '本地文件' : 'base64'}）：${error && error.message ? error.message : error}`)
+      }
+    }
+    throw lastError || new ToolError('表情发送失败')
   }
 
   function requireGroupRuntime(runtime) {

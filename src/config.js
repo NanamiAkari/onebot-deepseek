@@ -81,6 +81,7 @@ module.exports = {
   AI_STICKER_MAX_BYTES: Math.max(65536, Math.min(20971520, parseInt(process.env.AI_STICKER_MAX_BYTES || '10485760', 10) || 10485760)),
   AI_STICKER_MAX_COUNT: Math.max(1, Math.min(10000, parseInt(process.env.AI_STICKER_MAX_COUNT || '1000', 10) || 1000)),
   AI_STICKER_MAX_COLLECT_PER_HOUR: Math.max(1, Math.min(100, parseInt(process.env.AI_STICKER_MAX_COLLECT_PER_HOUR || '10', 10) || 10)),
+  AI_POKE_IMAGE_MAX_BYTES: Math.max(65536, Math.min(20971520, parseInt(process.env.AI_POKE_IMAGE_MAX_BYTES || '10485760', 10) || 10485760)),
   TAVILY_API_KEY: process.env.TAVILY_API_KEY || '',
   BOCHA_API_KEY: process.env.BOCHA_API_KEY || '',
   SEARXNG_BASE_URL: process.env.SEARXNG_BASE_URL || '',

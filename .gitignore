@@ -49,3 +49,6 @@ coverage/
 !test/usage-tracker.test.js
 !test/inline-tools.test.js
 !test/scheduled-retry.test.js
+!test/inbound-content.test.js
+!test/poke-media.test.js
+!test/media-image-store.test.js

@@ -126,9 +126,11 @@
 
 ## 本地表情库
 - `collect_sticker` 只能读取当前消息或当前消息明确引用的消息，不能由模型指定任意历史消息或本地文件
+- 支持 QQ 商城表情（`mface` 段）：表情包会作为图片参与视觉理解，也能被 `collect_sticker` 收藏；正文里会留下 `[表情包]` 占位
 - 图片优先通过 OneBot 缓存读取，必要时再走安全公网下载；只接受 JPEG、PNG、GIF、WebP、AVIF，并转存到独立 `sticker_data/images`
+- 收藏时按图片字节的 sha256 去重：同一张图从两条消息收藏只会保留一个条目
 - `list_stickers` 返回备注、标签、适用场景和使用次数；模型按当前语气自行决定是否发送，普通回复可以不使用表情
-- `send_sticker` 只能读取受控表情目录中的文件，并只能发送到当前群或当前私聊；默认不引用消息
+- `send_sticker` 只能读取受控表情目录中的文件，并只能发送到当前群或当前私聊；优先让协议端直接读本地文件，失败再退 base64
 - `AI_STICKER_MAX_BYTES`、`AI_STICKER_MAX_COUNT`、`AI_STICKER_MAX_COLLECT_PER_HOUR` 控制单图大小、库存上限和收藏频率
 
 ## 服务器部署（systemd）
@@ -369,6 +371,8 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
 - 支持配置独立回复文件，推荐使用 JSON 数组格式维护“文本回复 + 图片回复”混合池，并随机命中其中一条；图片条目越多，被随机到图片回复的概率越高
 - 默认优先读取 `AI_POKE_REPLY_FILE` 指向的 JSON 文件；如果文件不存在、为空，或仍是旧的按行文本格式，则回退兼容旧格式，再回退到 `AI_POKE_REPLY_TEXTS` / `AI_POKE_REPLY_TEXT`
 - JSON 数组中的每一项代表一条完整回复；文本项可包含换行，图片项使用 `type=image`
+- 图片回复在添加时就下载转存到 `poke_media/`，按内容哈希命名；文件里只存相对路径 `poke_media/<文件名>`，换部署目录后启动时会按文件名自动找回
+- 单张图片大小上限由 `AI_POKE_IMAGE_MAX_BYTES` 控制（默认 10MB），下载与落盘都会校验魔数
 - 支持群友动态查看和新增文案，写回文件后立即生效
 - 若 `文案列表` 正常但 `文案添加/删除/清空/去重` 返回“命令处理失败，请稍后重试”，通常是 `AI_POKE_REPLY_FILE` 对服务运行用户只有读权限没有写权限；systemd 部署时请确认该文件归属与 `User=` 一致
 - 配置项：
@@ -378,6 +382,7 @@ AI_IGNORE_REGEX=^(pjsk|b30)\b
   - `AI_POKE_REPLY_TEXT`
   - `AI_POKE_REPLY_TEXTS`
   - `AI_POKE_ONLY_SELF`
+  - `AI_POKE_IMAGE_MAX_BYTES`
 - JSON 文件示例：
 ```json
 [
