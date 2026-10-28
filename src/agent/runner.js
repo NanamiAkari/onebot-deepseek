@@ -70,6 +70,18 @@ function createAgentRunner(deps) {
     }
   }
 
+  function stableSerialize(value) {
+    if (value === null || typeof value !== 'object') {
+      try { return JSON.stringify(value) } catch { return String(value) }
+    }
+    if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(',')}]`
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize(value[key])}`).join(',')}}`
+  }
+
+  function toolCallKey(toolCall) {
+    return `${String(toolCall && toolCall.name || '')}:${stableSerialize(toolCall && toolCall.arguments || {})}`
+  }
+
   function buildToolBudgets(tools) {
     const budgets = new Map()
     const limits = {
@@ -109,6 +121,77 @@ function createAgentRunner(deps) {
     const executedToolCalls = []
     let finalText = ''
     const toolBudgets = buildToolBudgets(agentInput.tools)
+    const executionCounts = new Map()
+    const completedCalls = new Map()
+    const inFlightCalls = new Map()
+
+    function copyToolEntry(entry, call, batchId, deduplicated = false) {
+      return {
+        ...entry,
+        id: call.id || call.name,
+        name: call.name,
+        arguments: call.arguments || {},
+        batchId,
+        ...(deduplicated ? { deduplicated: true } : {})
+      }
+    }
+
+    function skippedToolEntry(call, error, batchId) {
+      return {
+        id: call.id || call.name,
+        name: call.name,
+        arguments: call.arguments || {},
+        batchId,
+        ok: false,
+        data: null,
+        error
+      }
+    }
+
+    async function executeToolCall(call, batchId) {
+      const key = toolCallKey(call)
+      const completed = completedCalls.get(key)
+      if (completed) return copyToolEntry(completed, call, batchId, true)
+      const inFlight = inFlightCalls.get(key)
+      if (inFlight) return copyToolEntry(await inFlight, call, batchId, true)
+
+      const usedCount = executionCounts.get(call.name) || 0
+      const toolBudget = toolBudgets.get(call.name)
+      if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
+        return skippedToolEntry(call, `${call.name} 工具已超限，请直接基于现有上下文回答，不要继续调用该工具`, batchId)
+      }
+      executionCounts.set(call.name, usedCount + 1)
+
+      const promise = (async () => {
+        console.log(`Agent step ${batchId}: 调用工具 ${call.name} args=${summarizeArguments(call.arguments || {})}`)
+        const toolResult = await toolExecutor.execute(call.name, call.arguments || {}, agentInput.runtime || {})
+        const toolEntry = {
+          id: call.id || call.name,
+          name: call.name,
+          arguments: call.arguments || {},
+          batchId,
+          ok: Boolean(toolResult && toolResult.ok),
+          data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? compactToolData(toolResult.data) : null,
+          error: toolResult && toolResult.error ? String(toolResult.error) : ''
+        }
+        console.log(`Agent step ${batchId}: 工具 ${call.name} ${toolEntry.ok ? '成功' : '失败'}`)
+        completedCalls.set(key, toolEntry)
+        return toolEntry
+      })()
+      inFlightCalls.set(key, promise)
+      try {
+        return await promise
+      } finally {
+        if (inFlightCalls.get(key) === promise) inFlightCalls.delete(key)
+      }
+    }
+
+    function removeExhaustedTools() {
+      agentInput.tools = agentInput.tools.filter((tool) => {
+        const budget = toolBudgets.get(tool.name)
+        return typeof budget !== 'number' || (executionCounts.get(tool.name) || 0) < budget
+      })
+    }
 
     for (let step = 0; step < maxSteps; step += 1) {
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
@@ -132,38 +215,23 @@ function createAgentRunner(deps) {
 
       if (output.text) finalText = output.text
 
-      const currentCall = output.toolCalls[0]
-      const usedCount = executedToolCalls.filter((x) => x.name === currentCall.name).length
-      const toolBudget = toolBudgets.get(currentCall.name)
-      if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
-        console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} 已达到调用上限，跳过该工具并继续让模型回答`)
-        const toolEntry = {
-          id: currentCall.id || currentCall.name,
-          name: currentCall.name,
-          arguments: currentCall.arguments || {},
-          ok: false,
-          data: null,
-          error: `${currentCall.name} 工具已超限，请直接基于现有上下文回答，不要继续调用该工具`
-        }
-        executedToolCalls.push(toolEntry)
-        agentInput.toolResults = executedToolCalls.slice()
-        agentInput.tools = agentInput.tools.filter((tool) => tool.name !== currentCall.name)
-        continue
-      }
-      console.log(`Agent step ${step + 1}/${maxSteps}: 调用工具 ${currentCall.name} args=${summarizeArguments(currentCall.arguments || {})}`)
-      const toolResult = await toolExecutor.execute(currentCall.name, currentCall.arguments || {}, agentInput.runtime || {})
-      const toolEntry = {
-        id: currentCall.id || currentCall.name,
-        name: currentCall.name,
-        arguments: currentCall.arguments || {},
-        ok: Boolean(toolResult && toolResult.ok),
-        data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? compactToolData(toolResult.data) : null,
-        error: toolResult && toolResult.error ? String(toolResult.error) : ''
-      }
-      console.log(`Agent step ${step + 1}/${maxSteps}: 工具 ${currentCall.name} ${toolEntry.ok ? '成功' : '失败'}`)
+      const calls = output.toolCalls.filter((call) => call && call.name)
+      const batchId = `${step + 1}/${maxSteps}`
+      const canParallelize = calls.length > 1
+        && typeof toolExecutor.isReadOnly === 'function'
+        && calls.every((call) => toolExecutor.isReadOnly(call.name, call.arguments || {}))
+      console.log(`Agent ${batchId}: ${canParallelize ? '并行执行' : '顺序执行'} ${calls.length} 个工具调用`)
+      const toolEntries = canParallelize
+        ? await Promise.all(calls.map((call) => executeToolCall(call, batchId)))
+        : await calls.reduce(async (promise, call) => {
+            const entries = await promise
+            entries.push(await executeToolCall(call, batchId))
+            return entries
+          }, Promise.resolve([]))
 
-      executedToolCalls.push(toolEntry)
+      executedToolCalls.push(...toolEntries)
       agentInput.toolResults = executedToolCalls.slice()
+      removeExhaustedTools()
     }
 
     return {

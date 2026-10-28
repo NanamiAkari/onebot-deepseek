@@ -4,12 +4,22 @@ const { createToolPolicy } = require('./tool-policy')
 
 const MAX_FILE_BYTES = 256 * 1024
 const MAX_DIRECTORY_ENTRIES = 500
+const READ_ONLY_TOOLS = new Set([
+  'get_msg', 'get_image', 'history', 'web_search', 'web_fetch', 'list_stickers',
+  'member_memory', 'resolve_group_member', 'group_memory', 'memory_query',
+  'get_recent_messages', 'read_file', 'list_dir', 'list_poke_replies',
+  'list_custom_replies', 'get_custom_reply', 'list_scheduled_tasks'
+])
+const READ_ONLY_BOT_FEATURE_ACTIONS = new Set([
+  'list_poke_replies', 'list_custom_replies', 'get_custom_reply', 'list_scheduled_tasks'
+])
 
 class ToolError extends Error {}
 
 function createToolExecutor(deps) {
   const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes, featureTools } = deps
   const policy = createToolPolicy(deps)
+  let mutationTail = Promise.resolve()
 
   function ensureWorkspace() {
     if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) throw new ToolError('File workspace is unavailable')
@@ -577,12 +587,27 @@ function createToolExecutor(deps) {
     const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {}
     if (!Object.prototype.hasOwnProperty.call(handlers, name)) return { ok: false, error: 'Unknown tool' }
     if (!isAllowed(name, runtime)) return { ok: false, error: 'Tool is not allowed for this user or conversation' }
+    const run = async () => {
+      try {
+        const data = await handlers[name](safeArgs, runtime)
+        if (data && data.ok === false) return { ok: false, error: 'Tool operation was not completed' }
+        return { ok: true, data }
+      } catch (error) {
+        return { ok: false, error: error instanceof ToolError ? error.message : 'Tool operation failed' }
+      }
+    }
+    if (isReadOnly(name, safeArgs)) {
+      await mutationTail
+      return run()
+    }
+    const previousMutation = mutationTail
+    let releaseMutation
+    mutationTail = new Promise((resolve) => { releaseMutation = resolve })
+    await previousMutation
     try {
-      const data = await handlers[name](safeArgs, runtime)
-      if (data && data.ok === false) return { ok: false, error: 'Tool operation was not completed' }
-      return { ok: true, data }
-    } catch (error) {
-      return { ok: false, error: error instanceof ToolError ? error.message : 'Tool operation failed' }
+      return await run()
+    } finally {
+      releaseMutation()
     }
   }
 
@@ -590,7 +615,13 @@ function createToolExecutor(deps) {
     return Object.prototype.hasOwnProperty.call(handlers, name) && policy.isAllowed(name, runtime)
   }
 
-  return { execute, isAllowed }
+  function isReadOnly(name, args = {}) {
+    if (name === 'bot_feature') return READ_ONLY_BOT_FEATURE_ACTIONS.has(String(args.action || '').trim())
+    if (name === 'group_member_directory') return false
+    return READ_ONLY_TOOLS.has(name)
+  }
+
+  return { execute, isAllowed, isReadOnly }
 }
 
 module.exports = { createToolExecutor }

@@ -86,6 +86,8 @@
   - `list_stickers` / `collect_sticker` / `annotate_sticker` / `send_sticker`：本地表情知识库与按语境发送
   - `bot_feature`：通过 `action` 按需管理拍一拍回复池、自定义回复、定时任务，或在当前群拍指定成员；模型只在判断确有对应意图时调用
   - `read_file` / `write_file` / `edit_file` / `list_dir`（默认关闭）
+- 同一轮模型返回多个工具调用时，只读查询会并行执行；发送消息、拍一拍、写入、删除和配置修改会严格串行执行
+- 同一轮 agent run 中完全相同的工具调用会复用第一次结果，避免重复发送或重复修改；同一会话的多条消息仍按队列串行处理
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
 - AI 回复默认不引用触发消息；只有用户主动引用某条消息时，首段回复才附带该引用

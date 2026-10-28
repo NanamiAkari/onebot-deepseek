@@ -1753,24 +1753,35 @@ async function callOpenAI(text, media, hist, opts) {
         }
       }
       msg.push({ role: 'user', content })
-      for (const toolCall of Array.isArray(opts && opts.toolResults) ? opts.toolResults : []) {
+      const toolResults = Array.isArray(opts && opts.toolResults) ? opts.toolResults : []
+      const toolBatches = []
+      for (let index = 0; index < toolResults.length; index += 1) {
+        const toolCall = toolResults[index]
+        const batchKey = toolCall && toolCall.batchId ? String(toolCall.batchId) : `legacy-${index}`
+        const previous = toolBatches[toolBatches.length - 1]
+        if (previous && previous.key === batchKey) previous.calls.push(toolCall)
+        else toolBatches.push({ key: batchKey, calls: [toolCall] })
+      }
+      for (const batch of toolBatches) {
         msg.push({
           role: 'assistant',
           content: null,
-          tool_calls: [{
+          tool_calls: batch.calls.map((toolCall) => ({
             id: String(toolCall.id || toolCall.name || 'tool_call'),
             type: 'function',
             function: {
               name: String(toolCall.name || 'tool'),
               arguments: JSON.stringify(toolCall.arguments || {})
             }
-          }]
+          }))
         })
-        msg.push({
-          role: 'tool',
-          tool_call_id: String(toolCall.id || toolCall.name || 'tool_call'),
-          content: serializeToolResult(toolCall)
-        })
+        for (const toolCall of batch.calls) {
+          msg.push({
+            role: 'tool',
+            tool_call_id: String(toolCall.id || toolCall.name || 'tool_call'),
+            content: serializeToolResult(toolCall)
+          })
+        }
       }
     }
     const tools = formatOpenAITools(opts && opts.tools, useResponses)

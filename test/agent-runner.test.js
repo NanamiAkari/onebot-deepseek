@@ -39,3 +39,88 @@ test('filters unavailable tools and passes bounded structured results to the nex
   assert.equal(result.toolCalls.length, 1)
   assert.equal(seen.length, 2)
 })
+
+test('runs independent read-only tool calls in parallel', async () => {
+  let active = 0
+  let maxActive = 0
+  let calls = 0
+  const runner = createAgentRunner({
+    toolRegistry: {
+      list: () => [
+        { name: 'read_a', description: 'read', inputSchema: { type: 'object' } },
+        { name: 'read_b', description: 'read', inputSchema: { type: 'object' } }
+      ]
+    },
+    toolExecutor: {
+      isAllowed: () => true,
+      isReadOnly: () => true,
+      execute: async (name) => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 15))
+        active -= 1
+        return { ok: true, data: { name } }
+      }
+    },
+    invokeModel: async () => {
+      calls += 1
+      return calls === 1
+        ? { toolCalls: [{ id: 'a', name: 'read_a', arguments: {} }, { id: 'b', name: 'read_b', arguments: {} }] }
+        : { text: '完成', toolCalls: [] }
+    },
+    invokeModelWithToolResult: async (input) => {
+      assert.equal(input.toolResults.length, 2)
+      return { text: '完成', toolCalls: [] }
+    },
+    maxSteps: 3
+  })
+  const result = await runner.run({ message: '查询', runtime: {} })
+  assert.equal(result.text, '完成')
+  assert.equal(result.toolCalls.length, 2)
+  assert.equal(maxActive, 2)
+})
+
+test('serializes side-effect calls and skips exact duplicate calls', async () => {
+  const calls = []
+  let active = 0
+  let maxActive = 0
+  let modelCalls = 0
+  const runner = createAgentRunner({
+    toolRegistry: {
+      list: () => [
+        { name: 'mutate', description: 'mutate', inputSchema: { type: 'object' } },
+        { name: 'read', description: 'read', inputSchema: { type: 'object' } }
+      ]
+    },
+    toolExecutor: {
+      isAllowed: () => true,
+      isReadOnly: (name) => name === 'read',
+      execute: async (name) => {
+        calls.push(name)
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await new Promise((resolve) => setTimeout(resolve, 8))
+        active -= 1
+        return { ok: true, data: { name } }
+      }
+    },
+    invokeModel: async () => {
+      modelCalls += 1
+      return modelCalls === 1
+        ? { toolCalls: [
+            { id: 'm1', name: 'mutate', arguments: { value: 1 } },
+            { id: 'm2', name: 'mutate', arguments: { value: 1 } },
+            { id: 'r1', name: 'read', arguments: {} }
+          ] }
+        : { text: '完成', toolCalls: [] }
+    },
+    invokeModelWithToolResult: async () => ({ text: '完成', toolCalls: [] }),
+    maxSteps: 3
+  })
+  const result = await runner.run({ message: '修改', runtime: {} })
+  assert.equal(result.text, '完成')
+  assert.deepEqual(calls, ['mutate', 'read'])
+  assert.equal(maxActive, 1)
+  assert.equal(result.toolCalls.length, 3)
+  assert.equal(result.toolCalls[1].deduplicated, true)
+})

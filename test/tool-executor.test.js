@@ -248,6 +248,42 @@ test('bot feature tools are exposed and stay within the active group', async (t)
   assert.equal(denied.ok, false)
 })
 
+test('tool executor identifies read-only calls without treating mutations as safe', async (t) => {
+  const { executor } = fixture(t, { featureTools: { isAdmin: async () => true } })
+  assert.equal(executor.isReadOnly('web_search'), true)
+  assert.equal(executor.isReadOnly('get_msg'), true)
+  assert.equal(executor.isReadOnly('send_group_msg'), false)
+  assert.equal(executor.isReadOnly('memory_append'), false)
+  assert.equal(executor.isReadOnly('bot_feature', { action: 'list_custom_replies' }), true)
+  assert.equal(executor.isReadOnly('bot_feature', { action: 'add_custom_reply' }), false)
+  assert.equal(executor.isReadOnly('group_member_directory'), false)
+})
+
+test('tool executor serializes side-effect operations across concurrent sessions', async (t) => {
+  let active = 0
+  let maxActive = 0
+  const order = []
+  const featureTools = {
+    isAdmin: async () => true,
+    addCustomReply: async (args) => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      order.push(`start:${args.trigger}`)
+      await new Promise((resolve) => setTimeout(resolve, 8))
+      order.push(`end:${args.trigger}`)
+      active -= 1
+      return { added: true }
+    }
+  }
+  const { executor } = fixture(t, { featureTools })
+  const first = executor.execute('bot_feature', { action: 'add_custom_reply', trigger: '一', content: '甲' }, trustedRuntime)
+  const second = executor.execute('bot_feature', { action: 'add_custom_reply', trigger: '二', content: '乙' }, trustedRuntime)
+  const results = await Promise.all([first, second])
+  assert.equal(results.every((result) => result.ok), true)
+  assert.equal(maxActive, 1)
+  assert.deepEqual(order, ['start:一', 'end:一', 'start:二', 'end:二'])
+})
+
 test('collect sticker reads only the current message image through safe download', async (t) => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64')
   let collected = null
