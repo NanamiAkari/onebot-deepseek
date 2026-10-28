@@ -317,6 +317,16 @@ function createMessageHandler(deps) {
           const q = extractContent(resp.data.message)
           const quotedText = String(q.text || '').trim()
           q.media = await resolveMediaSources(ws, q.media)
+          if (q.media && q.media.length > 0) {
+            const quotedImages = q.media.filter((item) => item && item.kind === 'image')
+            if (quotedImages.length > 0) {
+              const usable = quotedImages.filter((item) => item.localPath || item.url || item.inlineBase64).length
+              const types = Array.isArray(resp.data.message)
+                ? resp.data.message.map((seg) => (seg && seg.type) || 'unknown').join(',')
+                : 'cq-string'
+              console.log(`引用图片=${quotedImages.length} 可用=${usable} 段=${types}`)
+            }
+          }
           const merged = content.media ? content.media.slice() : []
           if (q.media && q.media.length) {
             for (const m of q.media) {
@@ -326,7 +336,11 @@ function createMessageHandler(deps) {
             content.media = merged
           }
           if (quotedText) content.quotedText = quotedText
+          // 引用的是纯图片/表情包时补一个占位，至少让模型知道引用的东西里有图。
+          else if ((q.media || []).some((item) => item && item.kind === 'image')) content.quotedText = '[图片]'
           memoryRelations.replyToUserId = String(resp.data.user_id || (resp.data.sender && resp.data.sender.user_id) || '')
+        } else {
+          console.log(`引用消息读取失败 id=${content.replyId}`)
         }
       }
       if (memberMemory && typeof memberMemory.recordMessage === 'function') {

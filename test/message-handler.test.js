@@ -218,6 +218,21 @@ test('quotes the original message only when the user explicitly replied to it', 
   assert.equal(harness.calls.replyBuildOptions[0].includeReply, true)
 })
 
+test('a quoted image without text still tells the model something was quoted', async () => {
+  const harness = createHarness([
+    { type: 'reply', data: { id: '88' } },
+    { type: 'text', data: { text: '阿卡林你看看这个' } }
+  ], {
+    quotedMessage: {
+      user_id: 20,
+      message: [{ type: 'image', data: { file: 'a.image', url: 'https://gchat.qpic.cn/a.gif' } }]
+    }
+  })
+  await harness.run()
+  assert.equal(harness.calls.ai, 1)
+  assert.match(harness.calls.modelMessages[0], /【引用消息】\n\[图片\]/)
+})
+
 test('does not reply when the model classifies the name as a character discussion', async () => {
   const harness = createHarness([{ type: 'text', data: { text: '我喜欢阿卡林这个角色' } }], {
     classifyAddressing: async () => ({ addressed: false, confidence: 0.98 })
