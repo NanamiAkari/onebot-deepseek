@@ -173,7 +173,7 @@ module.exports = {
   AI_IMAGE_CONTEXT_MODE: (process.env.AI_IMAGE_CONTEXT_MODE || 'rule').toLowerCase(),
   AI_IMAGE_CONTEXT_REQUIRE_HINTS: String(process.env.AI_IMAGE_CONTEXT_REQUIRE_HINTS || 'true').toLowerCase() === 'true',
   AI_IMAGE_CONTEXT_REQUIRE_SAME_USER: String(process.env.AI_IMAGE_CONTEXT_REQUIRE_SAME_USER || 'true').toLowerCase() === 'true',
-  AI_IMAGE_HINT_REGEX: process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这个图|这图|这张图|这个图片|这张图片|图中|这幅图|图片里)/i,
+  AI_IMAGE_HINT_REGEX: process.env.AI_IMAGE_HINT_REGEX ? new RegExp(process.env.AI_IMAGE_HINT_REGEX, 'i') : /(上图|这个图|这图|这张图|这个图片|这张图片|图中|这幅图|图片里|表情包|这个表情|那张图|刚才的图|刚发的图|刚发的表情|上一条)/i,
   AI_IMAGE_CONTEXT_MAX: parseInt(process.env.AI_IMAGE_CONTEXT_MAX || '3', 10),
   AI_IMAGE_ONLY_NO_CALL: String(process.env.AI_IMAGE_ONLY_NO_CALL || 'true').toLowerCase() === 'true',
   AI_IMAGE_PREPROCESS_ENABLE: String(process.env.AI_IMAGE_PREPROCESS_ENABLE || 'true').toLowerCase() === 'true',

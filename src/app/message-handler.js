@@ -304,10 +304,13 @@ function createMessageHandler(deps) {
           let hintsOk = !AI_IMAGE_CONTEXT_REQUIRE_HINTS || AI_IMAGE_HINT_REGEX.test(textNow)
           if (AI_IMAGE_CONTEXT_MODE === 'ai') hintsOk = true
           const userOk = !AI_IMAGE_CONTEXT_REQUIRE_SAME_USER || String(payload.user_id) === String(cached.userId)
+          console.log(`上下文图片：age=${Math.round((Date.now() - cached.ts) / 1000)}s hints=${hintsOk} sameUser=${userOk} 采用=${hintsOk && userOk}`)
           if (hintsOk && userOk) {
             raw.media = (raw.media || []).concat(cached.media).slice(0, AI_IMAGE_CONTEXT_MAX)
             ctxImgUsed = true
           }
+        } else if (cached) {
+          console.log(`上下文图片：已过期 age=${Math.round((Date.now() - cached.ts) / 1000)}s ttl=${AI_IMAGE_CONTEXT_TTL}s`)
         }
       }
       const content = raw

@@ -4,12 +4,13 @@ const { createMessageHandler } = require('../src/app/message-handler')
 const { createSendRegistry } = require('../src/app/send-registry')
 
 function createHarness(message, options = {}) {
-  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [], replyBuildOptions: [], actions: [], history: [] }
+  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [], media: [], replyBuildOptions: [], actions: [], history: [] }
   const prefix = '阿卡林'
+  const mediaCache = options.mediaCache || new Map()
   const handler = createMessageHandler({
     pending: new Map(),
     pokeCooldown: new Map(),
-    mediaCache: new Map(),
+    mediaCache,
     sendRegistry: options.sendRegistry,
     getKey: () => 'g:1',
     pushHistory: (_payload, userText, botText) => calls.history.push({ userText, botText }),
@@ -64,6 +65,7 @@ function createHarness(message, options = {}) {
       run: async (input) => {
         calls.ai += 1
         calls.modelMessages.push(input.message)
+        calls.media.push(Array.isArray(input.media) ? input.media.slice() : [])
         return { text: 'AI回复' }
       }
     },
@@ -77,11 +79,11 @@ function createHarness(message, options = {}) {
     AI_POKE_REPLY_TEXTS: [],
     AI_POKE_ONLY_SELF: true,
     AI_REPLY_CHUNK_CHARS: 750,
-    AI_IMAGE_CONTEXT_TTL: 0,
-    AI_IMAGE_CONTEXT_REQUIRE_HINTS: false,
-    AI_IMAGE_HINT_REGEX: /图片/,
-    AI_IMAGE_CONTEXT_MODE: 'keyword',
-    AI_IMAGE_CONTEXT_REQUIRE_SAME_USER: false,
+    AI_IMAGE_CONTEXT_TTL: options.imageContextTtl ?? 0,
+    AI_IMAGE_CONTEXT_REQUIRE_HINTS: options.requireHints ?? false,
+    AI_IMAGE_HINT_REGEX: options.imageHintRegex || /图片/,
+    AI_IMAGE_CONTEXT_MODE: options.imageContextMode || 'keyword',
+    AI_IMAGE_CONTEXT_REQUIRE_SAME_USER: options.requireSameUser ?? false,
     AI_IMAGE_CONTEXT_MAX: 1,
     AI_IMAGE_ONLY_NO_CALL: false
   })
@@ -231,6 +233,39 @@ test('a quoted image without text still tells the model something was quoted', a
   await harness.run()
   assert.equal(harness.calls.ai, 1)
   assert.match(harness.calls.modelMessages[0], /【引用消息】\n\[图片\]/)
+})
+
+test('a recent image is attached when the follow-up mentions it', async () => {
+  const mediaCache = new Map()
+  const sticker = createHarness([{ type: 'image', data: { file: 'a.image', url: 'https://gchat.qpic.cn/a.gif' } }], { mediaCache })
+  await sticker.run()
+  // 纯图片没被 @，不触发回复，但要进缓存。
+  assert.equal(sticker.calls.ai, 0)
+  assert.equal(mediaCache.size, 1)
+
+  const followUp = createHarness([{ type: 'text', data: { text: '阿卡林你看看这个表情包' } }], {
+    mediaCache,
+    imageContextTtl: 60,
+    requireHints: true,
+    imageHintRegex: /表情包/
+  })
+  await followUp.run()
+  assert.equal(followUp.calls.ai, 1)
+  assert.equal(followUp.calls.media[0].length, 1)
+})
+
+test('an unrelated follow-up does not attach a stale image', async () => {
+  const mediaCache = new Map()
+  await createHarness([{ type: 'image', data: { file: 'a.image', url: 'https://gchat.qpic.cn/a.gif' } }], { mediaCache }).run()
+  const followUp = createHarness([{ type: 'text', data: { text: '阿卡林今天天气怎么样' } }], {
+    mediaCache,
+    imageContextTtl: 60,
+    requireHints: true,
+    imageHintRegex: /表情包/
+  })
+  await followUp.run()
+  assert.equal(followUp.calls.ai, 1)
+  assert.equal(followUp.calls.media[0].length, 0)
 })
 
 test('does not reply when the model classifies the name as a character discussion', async () => {
