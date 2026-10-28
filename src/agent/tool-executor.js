@@ -2,6 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const { createToolPolicy } = require('./tool-policy')
 const { chatKeyFromPayload, isReadOnlyTool, toolLockKey } = require('./tool-metadata')
+const { sanitizeOutboundSegments } = require('../outbound/segments')
 
 const MAX_FILE_BYTES = 256 * 1024
 const MAX_DIRECTORY_ENTRIES = 500
@@ -230,7 +231,9 @@ function createToolExecutor(deps) {
     const payload = runtime && runtime.payload
     if (!ws || !Array.isArray(args.message) || !args.message.length) throw new ToolError('send_group_msg requires a connection and message segments')
     if (String(args.group_id || '') !== String(payload.group_id)) throw new ToolError('Messages can only be sent to the current conversation')
-    return sendOnce(ws, 'send_group_msg', { group_id: payload.group_id, message: args.message }, payload, args.message)
+    const message = sanitizeOutboundSegments(args.message, { allowedReplyIds: allowedStickerMessageIds(payload) })
+    if (!message.length) throw new ToolError('消息里没有允许发送的内容（@全体、外部文件路径等会被拒绝）')
+    return sendOnce(ws, 'send_group_msg', { group_id: payload.group_id, message }, payload, message)
   }
 
   async function runSendPrivateMsg(args, runtime) {
@@ -238,7 +241,9 @@ function createToolExecutor(deps) {
     const payload = runtime && runtime.payload
     if (!ws || !Array.isArray(args.message) || !args.message.length) throw new ToolError('send_private_msg requires a connection and message segments')
     if (String(args.user_id || '') !== String(payload.user_id)) throw new ToolError('Messages can only be sent to the current conversation')
-    return sendOnce(ws, 'send_private_msg', { user_id: payload.user_id, message: args.message }, payload, args.message)
+    const message = sanitizeOutboundSegments(args.message, { allowedReplyIds: allowedStickerMessageIds(payload) })
+    if (!message.length) throw new ToolError('消息里没有允许发送的内容（外部文件路径等会被拒绝）')
+    return sendOnce(ws, 'send_private_msg', { user_id: payload.user_id, message }, payload, message)
   }
 
   async function runHistory(args, runtime) {

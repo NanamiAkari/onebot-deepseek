@@ -25,7 +25,7 @@ tests/
 *.spec.js
 coverage/
 
-# Keep message routing regressions under version control.
+# Keep message routing and scheduling regressions under version control.
 !test/
 !test/message-handler.test.js
 !test/member-memory.test.js
@@ -37,3 +37,11 @@ coverage/
 !test/web-search.test.js
 !test/web-fetch.test.js
 !test/stickers.test.js
+!test/tool-metadata.test.js
+!test/tool-scheduler.test.js
+!test/send-registry.test.js
+!test/tool-scheduling-integration.test.js
+!test/outbound-text.test.js
+!test/outbound-segments.test.js
+!test/model-retry.test.js
+!test/openai-provider.test.js

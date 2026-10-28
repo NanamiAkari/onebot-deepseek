@@ -156,6 +156,37 @@ test('send tools only target the active conversation, including for trusted admi
   assert.deepEqual(actions.map((entry) => entry.params), [{ group_id: 10, message }, { user_id: 20, message }])
 })
 
+test('tool sends drop @all, host paths and unknown segments before reaching OneBot', async (t) => {
+  const { executor, actions } = fixture(t)
+  const result = await executor.execute('send_group_msg', {
+    group_id: 10,
+    message: [
+      { type: 'at', data: { qq: 'all' } },
+      { type: 'at', data: { qq: '20' } },
+      { type: 'text', data: { text: '[CQ:at,qq=all] 集合' } },
+      { type: 'image', data: { file: '/etc/passwd' } },
+      { type: 'music', data: { id: '1' } }
+    ]
+  }, trustedRuntime)
+  assert.equal(result.ok, true)
+  assert.equal(actions.length, 1)
+  assert.deepEqual(actions[0].params.message, [
+    { type: 'at', data: { qq: '20' } },
+    { type: 'text', data: { text: '[CQ：at,qq=all] 集合' } }
+  ])
+})
+
+test('a send with only forbidden segments is rejected and never reaches OneBot', async (t) => {
+  const { executor, actions } = fixture(t)
+  const result = await executor.execute('send_group_msg', {
+    group_id: 10,
+    message: [{ type: 'at', data: { qq: 'all' } }]
+  }, trustedRuntime)
+  assert.equal(result.ok, false)
+  assert.match(result.error, /允许发送/)
+  assert.equal(actions.length, 0)
+})
+
 test('OneBot failures and internal errors are not reported as successful or exposed', async (t) => {
   for (const response of [{ status: 'failed', retcode: 100 }, { status: 'ok', retcode: 100 }, null]) {
     const { executor } = fixture(t, { sendAction: async () => response })

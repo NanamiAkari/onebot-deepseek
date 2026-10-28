@@ -39,10 +39,21 @@ function parseOpenAIStringPayload(value) {
   return { json: null, events }
 }
 
+// Responses API 的正文 part 是 output_text；reasoning / summary 等 part 必须排除，
+// 否则思考内容会被拼进正文、直接发到群里。
+const TEXT_PART_TYPES = new Set(['output_text', 'text'])
+const REASONING_ITEM_TYPES = new Set(['reasoning', 'reasoning_summary'])
+
+function isReasoningItem(item) {
+  return Boolean(item && typeof item === 'object' && REASONING_ITEM_TYPES.has(String(item.type || '')))
+}
+
 function collectTextFromContent(content, out) {
   if (!Array.isArray(content)) return
   for (const part of content) {
     if (!part || typeof part !== 'object') continue
+    const type = typeof part.type === 'string' ? part.type : ''
+    if (type && !TEXT_PART_TYPES.has(type)) continue
     if (typeof part.text === 'string' && part.text.trim()) out.push(part.text.trim())
   }
 }
@@ -51,15 +62,20 @@ function extractTextFromObject(data) {
   if (!data || typeof data !== 'object') return ''
   if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim()
   if (data.type === 'response.output_text.done' && typeof data.text === 'string' && data.text.trim()) return data.text.trim()
-  if (data.type === 'response.content_part.done' && data.part && typeof data.part.text === 'string' && data.part.text.trim()) return data.part.text.trim()
+  if (data.type === 'response.content_part.done' && data.part && typeof data.part.text === 'string' && data.part.text.trim()) {
+    if (data.part.type && !TEXT_PART_TYPES.has(String(data.part.type))) return ''
+    return data.part.text.trim()
+  }
   const parts = []
-  if (data.type === 'response.output_item.done' && data.item) collectTextFromContent(data.item.content, parts)
+  if (data.type === 'response.output_item.done' && data.item && !isReasoningItem(data.item)) {
+    collectTextFromContent(data.item.content, parts)
+  }
   const chatContent = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
   if (typeof chatContent === 'string' && chatContent.trim()) return chatContent.trim()
   collectTextFromContent(chatContent, parts)
   if (Array.isArray(data.output)) {
     for (const item of data.output) {
-      if (!item || !Array.isArray(item.content)) continue
+      if (!item || isReasoningItem(item) || !Array.isArray(item.content)) continue
       collectTextFromContent(item.content, parts)
     }
   }

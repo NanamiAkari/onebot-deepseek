@@ -14,6 +14,8 @@ const { createMemberMemory, previousLocalDate } = require('./src/memory/member-m
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
 const { createSendRegistry } = require('./src/app/send-registry')
+const { escapeCqText, sanitizeModelText, splitForQQ } = require('./src/outbound/text')
+const { withModelRetry } = require('./src/providers/retry')
 const { createWebSearch } = require('./src/web-search')
 const { createWebFetch } = require('./src/web-fetch')
 const { createStickerStore } = require('./src/stickers')
@@ -1610,39 +1612,14 @@ async function callLLM(text, media, hist, opts) {
   const b = await callOpenAI(text, media, hist, opts)
   if (b && typeof b === 'object' && !Array.isArray(b)) {
     const out = {
-      text: b.text ? sanitizeText(b.text) : '',
+      text: b.text ? sanitizeModelText(b.text) : '',
       toolCalls: Array.isArray(b.toolCalls) ? b.toolCalls : []
     }
     if (out.text || out.toolCalls.length > 0) return out
   }
-  if (b) return sanitizeText(b)
+  if (b) return sanitizeModelText(b)
   if (opts && opts.structured) return { text: '上游模型暂时不可用，请稍后再试', toolCalls: [] }
   return '上游模型暂时不可用，请稍后再试'
-}
-
-function sanitizeText(s) {
-  let t = String(s || '')
-  t = t.replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, '')
-  t = t.replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, '')
-  t = t.replace(/<reasoning\b[^>]*>[\s\S]*?<\/reasoning>/gi, '')
-  t = t.replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/gi, '')
-  t = t.replace(/<analysis\b[^>]*>[\s\S]*$/gi, '')
-  t = t.replace(/<reasoning\b[^>]*>[\s\S]*$/gi, '')
-  t = t.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, _lang, body) => `${body}\n`)
-  t = t.replace(/`([^`]*)`/g, '$1')
-  t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '')
-  t = t.replace(/^\s*([-*+]|(\d+[\.\)]))\s+/gm, '')
-  t = t.replace(/\*\*([\s\S]*?)\*\*/g, '$1')
-  t = t.replace(/\*([\s\S]*?)\*/g, '$1')
-  t = t.replace(/\$\$([\s\S]*?)\$\$/g, '\n$1\n')
-  t = t.replace(/\\\[([\s\S]*?)\\\]/g, '\n$1\n')
-  t = t.replace(/\\\(([\s\S]*?)\\\)/g, '$1')
-  t = t.replace(/\\begin\{([^}]+)\}([\s\S]*?)\\end\{\1\}/g, '\n$2\n')
-  t = t.replace(/<[^>]+>/g, ' ')
-  t = t.replace(/[ \t]{2,}/g, ' ')
-  t = t.replace(/[ \t]+\n/g, '\n')
-  t = t.replace(/\n{3,}/g, '\n\n')
-  return t.trim()
 }
 
 function requestSystemPrompt(opts) {
@@ -1833,19 +1810,24 @@ async function callOpenAI(text, media, hist, opts) {
           ...(includeTools && tools.length > 0 ? { tools, tool_choice: 'auto' } : {})
         }
     let res
+    const requestConfig = {
+      headers: {
+        Authorization: `Bearer ${OPENAI_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: requestTimeout,
+      httpsAgent: HTTPS_AGENT,
+      proxy: false
+    }
+    const retryNote = (error, tried) => {
+      const status = error && error.response && error.response.status
+      console.log(`OpenAI请求失败，退避后重试 ${tried}/2 status=${status || 'network'} ${error && error.message ? error.message : ''}`)
+    }
     try {
-      res = await axios.post(
-        url,
-        buildPayload(true),
-        {
-          headers: {
-            Authorization: `Bearer ${OPENAI_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: requestTimeout,
-          httpsAgent: HTTPS_AGENT,
-          proxy: false
-        }
+      // 429/5xx/连接失败退避重试一次到两次；400 参数错误不重试，直接走下面的降级路径。
+      res = await withModelRetry(
+        () => axios.post(url, buildPayload(true), requestConfig),
+        { retries: 2, baseDelayMs: 1000, onRetry: retryNote }
       )
     } catch (e) {
       const status = e && e.response && e.response.status
@@ -1854,18 +1836,9 @@ async function callOpenAI(text, media, hist, opts) {
       const canFallback = tools.length > 0 && (status === 400 || status === 404 || /tool|parameter|unsupported|schema|function/i.test(errorText))
       if (!canFallback) throw e
       console.log('OpenAI工具调用参数不兼容，回退纯文本模式')
-      res = await axios.post(
-        url,
-        buildPayload(false),
-        {
-          headers: {
-            Authorization: `Bearer ${OPENAI_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: requestTimeout,
-          httpsAgent: HTTPS_AGENT,
-          proxy: false
-        }
+      res = await withModelRetry(
+        () => axios.post(url, buildPayload(false), requestConfig),
+        { retries: 1, baseDelayMs: 800, onRetry: retryNote }
       )
     }
     const contentText = extractOpenAIText(res.data)
@@ -1901,10 +1874,10 @@ async function callOpenAI(text, media, hist, opts) {
       if (fallback) return opts && opts.structured ? { text: fallback, toolCalls: [], images: [] } : fallback
       return opts && opts.structured ? { text: '上游账号被限制：当前 API Key 仅允许 Codex 官方客户端，请更换上游 Key 或模型', toolCalls: [], images: [] } : '上游账号被限制：当前 API Key 仅允许 Codex 官方客户端，请更换上游 Key 或模型'
     }
-    if (status === 429) return opts && opts.structured ? { text: '上游限流，请稍后再试', toolCalls: [], images: [] } : '上游限流，请稍后再试'
+    if (status === 429) return opts && opts.structured ? { text: '现在消息有点多，等一小会儿再叫我吧', toolCalls: [], images: [] } : '现在消息有点多，等一小会儿再叫我吧'
     if (status === 401) return opts && opts.structured ? { text: '上游鉴权失败，请检查 API Key', toolCalls: [], images: [] } : '上游鉴权失败，请检查 API Key'
-    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '上游网关异常（5xx），请稍后再试', toolCalls: [], images: [] } : '上游网关异常（5xx），请稍后再试'
-    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '图片分析超时，请稍后重试或发送更小的图片', toolCalls: [], images: [] } : '图片分析超时，请稍后重试或发送更小的图片'
+    if (status === 502 || status === 503 || status === 504) return opts && opts.structured ? { text: '刚才卡了一下，再试一次吧', toolCalls: [], images: [] } : '刚才卡了一下，再试一次吧'
+    if (errorMessage && /timeout/i.test(errorMessage)) return opts && opts.structured ? { text: '处理超时了，稍后重试或换张小一点的图片吧', toolCalls: [], images: [] } : '处理超时了，稍后重试或换张小一点的图片吧'
     return opts && opts.structured ? { text: '上游调用失败', toolCalls: [], images: [] } : '上游调用失败'
   }
 }
@@ -1913,24 +1886,27 @@ async function callDeepseek(text, opts) {
   if (!DEEPSEEK_KEY) return null
   try {
     console.log('调用DeepSeek')
-    const res = await axios.post(
-      'https://api.deepseek.com/v1/chat/completions',
-      {
-        model: DEEPSEEK_MODEL,
-        messages: [
-          { role: 'system', content: requestSystemPrompt(opts) },
-          { role: 'user', content: text || '你好' }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${DEEPSEEK_KEY}`,
-          'Content-Type': 'application/json'
+    const res = await withModelRetry(
+      () => axios.post(
+        'https://api.deepseek.com/v1/chat/completions',
+        {
+          model: DEEPSEEK_MODEL,
+          messages: [
+            { role: 'system', content: requestSystemPrompt(opts) },
+            { role: 'user', content: text || '你好' }
+          ]
         },
-        timeout: 30000,
-        httpsAgent: HTTPS_AGENT,
-        proxy: false
-      }
+        {
+          headers: {
+            Authorization: `Bearer ${DEEPSEEK_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 30000,
+          httpsAgent: HTTPS_AGENT,
+          proxy: false
+        }
+      ),
+      { retries: 1, baseDelayMs: 1000 }
     )
     const content = res.data && res.data.choices && res.data.choices[0] && res.data.choices[0].message && res.data.choices[0].message.content
     if (!content) return null
@@ -1943,30 +1919,7 @@ async function callDeepseek(text, opts) {
 }
 
 function splitLongText(text, chunkSize = AI_REPLY_CHUNK_CHARS) {
-  const normalized = String(text || '').replace(/\r/g, '').trim()
-  if (!normalized) return []
-  const chunks = []
-  const paragraphs = normalized.split('\n')
-  let current = ''
-  for (const rawPart of paragraphs) {
-    const part = String(rawPart || '')
-    const candidate = current ? `${current}\n${part}` : part
-    if (candidate.length <= chunkSize) {
-      current = candidate
-      continue
-    }
-    if (current) chunks.push(current)
-    if (part.length <= chunkSize) {
-      current = part
-      continue
-    }
-    for (let i = 0; i < part.length; i += chunkSize) {
-      chunks.push(part.slice(i, i + chunkSize))
-    }
-    current = ''
-  }
-  if (current) chunks.push(current)
-  return chunks.filter(Boolean)
+  return splitForQQ(text, chunkSize)
 }
 
 function truncateReplyText(text, maxChars = AI_REPLY_MAX_CHARS) {
@@ -1991,13 +1944,14 @@ function buildReplySegments(messageId, content, options = {}) {
     ]]
   }
   return chunks.map((chunk, index) => {
+    const text = escapeCqText(chunk)
     if (includeReply && index === 0) {
       return [
         { type: 'reply', data: { id: messageId } },
-        { type: 'text', data: { text: chunk } }
+        { type: 'text', data: { text } }
       ]
     }
-    return [{ type: 'text', data: { text: chunk } }]
+    return [{ type: 'text', data: { text } }]
   })
 }
 
@@ -2710,7 +2664,7 @@ async function handleImageGenerationRequest(ws, payload, promptText, hist, inten
     })
     if (!result || typeof result !== 'object') return { handled: false }
     const images = Array.isArray(result.images) ? result.images : []
-    const text = sanitizeText(result.text || '')
+    const text = sanitizeModelText(result.text || '')
     console.log(`生图返回 images=${images.length} elapsed=${Date.now() - startedAt}ms text=${text ? text.slice(0, 80) : ''}`)
     if (images.length === 0) {
       await replyCommandMessage(ws, payload, text || '当前上游暂不支持文生图，或本次生图失败，请稍后再试')
