@@ -97,6 +97,7 @@
 - 超过调用上限只是跳过这次调用并继续回答，不会向用户发送「工具超限」「步数已达上限」「处理超时」之类的兜底话术；步数用尽或超时时如果模型没有产出文本，就保持沉默
 - 出站文本统一清洗：Markdown（标题、列表、粗体、代码块、链接）降级为纯文本，`[CQ:` 转义成全角冒号避免被当成协议段，长消息按换行分条且不会切断 emoji
 - 工具发送的消息段有白名单：只允许文本、图片、@、引用和表情；`@全体成员`、外部文件路径和未知段会被丢弃，整条消息都不合法时返回错误而不是发出去
+- 少数模型会把工具调用写进正文（`<tool_call>{...}</tool_call>`）：会被解析成真正的调用继续执行，解析不了的协议残片直接从正文删除，不会发到群里
 - 只读并行上限由 `AI_TOOL_PARALLEL_MAX` 控制（默认 4）；互斥粒度可用 `AI_TOOL_WRITE_LOCK` 切换（`keyed` 默认 / `global` / `none`），发送指纹窗口由 `AI_SEND_DEDUPE_MS` 控制（`0` 关闭）
 - 文件工具开启后只对 `AI_ADMIN_USER_IDS` 中的账号可见，且只能操作独立 `tool_workspace`；默认关闭
 - `send_group_msg` 和 `send_private_msg` 只能发送回当前会话，不能由模型指定其他群或用户
@@ -232,6 +233,16 @@ sudo systemctl restart onebot-deepseek
   - `媒体下载失败`
 - 图片超时：
   - `图片分析超时，请稍后重试或发送更小的图片`
+
+## 用量统计
+- 每次模型调用都会记录 prompt / completion token 数量，按天写入 `AI_USAGE_DIR`（默认 `usage_data/usage-YYYY-MM-DD.json`）
+- 只记录 token 数量、模型名和调用次数，不记录消息内容、群号或用户身份
+- 每次 agent run 的摘要日志会带上本次 run 的 token：`Agent 结束：final steps=2/10 模型=2 ... tokens=1200+300 耗时=...`
+- 配置项：
+  - `AI_USAGE_STATS_ENABLE`：默认 `true`
+  - `AI_USAGE_DIR`：默认 `usage_data`
+  - `AI_PRICE_INPUT_PER_1M` / `AI_PRICE_OUTPUT_PER_1M`：每百万 token 的输入/输出单价，默认 `0` 表示只统计 token、不估算成本
+- 成本估算在读取时计算，不会写进历史文件；改单价不会改动已有数据
 
 ## 验证
 - Napcat url（同机）：`ws://127.0.0.1:5000/onebot/v11/ws`
@@ -422,11 +433,17 @@ AI_ADMIN_USER_IDS=123456789,987654321
 - `每天 HH:mm` 为每日循环任务
 - `每周一 HH:mm` 为每周循环任务
 - `每月 1号 HH:mm` / `每月 1日 HH:mm` 为每月循环任务
-- `YYYY-MM-DD HH:mm` 为一次性任务，执行后自动移除
+- `YYYY-MM-DD HH:mm` 为一次性任务，执行成功后自动移除
+- 发送失败会保留任务并按 `AI_SCHEDULE_RETRY_DELAY_MS`（默认 60 秒）重试，最多 `AI_SCHEDULE_MAX_ATTEMPTS`（默认 3）次：
+  - 一次性任务 3 次都失败才移除
+  - 循环任务 3 次都失败则跳过本次、推进到下一个周期
+  - 只有确认发送成功后才推进或删除，OneBot 抖动不会把任务永久吞掉
 - 定时发送内容复用现有回复段落结构，可发送文本、图片、表情；图片和 GIF 会走现有图片发送兜底
 - 支持交互式创建；流程中发送 `取消` 可退出；任一步骤 10 分钟未继续会自动取消
 - 配置项：
   - `AI_SCHEDULE_FILE`
+  - `AI_SCHEDULE_RETRY_DELAY_MS`
+  - `AI_SCHEDULE_MAX_ATTEMPTS`
 - 常用命令：
   - `阿卡林 定时任务 列表`
   - `阿卡林 定时任务 查看 1`

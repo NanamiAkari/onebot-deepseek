@@ -5,7 +5,7 @@ const fs = require('fs')
 const path = require('path')
 const config = require('./src/config')
 const { createSessionStore } = require('./src/session/store')
-const { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, formatOpenAITools } = require('./src/providers/openai')
+const { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, extractOpenAIUsage, formatOpenAITools } = require('./src/providers/openai')
 const { createDefaultToolRegistry } = require('./src/agent/tools')
 const { createAgentRunner } = require('./src/agent/runner')
 const { createToolExecutor } = require('./src/agent/tool-executor')
@@ -14,6 +14,8 @@ const { createMemberMemory, previousLocalDate } = require('./src/memory/member-m
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
 const { createSendRegistry } = require('./src/app/send-registry')
+const { isScheduledRetryDue, planScheduledFailure } = require('./src/app/scheduled-retry')
+const { createUsageTracker } = require('./src/usage/tracker')
 const { escapeCqText, sanitizeModelText, splitForQQ } = require('./src/outbound/text')
 const { withModelRetry } = require('./src/providers/retry')
 const { createWebSearch } = require('./src/web-search')
@@ -218,6 +220,15 @@ const pokeReplyViewMessageCache = new Map()
 function resolveProjectFile(filePath) {
   return path.isAbsolute(filePath) ? filePath : path.join(PROJECT_ROOT, filePath)
 }
+
+// 只记 token 数量和模型名，不记消息内容、群号或用户身份；价格未配置时 cost 为 0。
+const usageTracker = createUsageTracker({
+  enabled: config.AI_USAGE_STATS_ENABLE !== false,
+  dir: resolveProjectFile(config.AI_USAGE_DIR || 'usage_data'),
+  priceInputPer1M: config.AI_PRICE_INPUT_PER_1M,
+  priceOutputPer1M: config.AI_PRICE_OUTPUT_PER_1M,
+  log: (message) => console.log(message)
+})
 
 function getPokeReplyFilePath() {
   return resolveProjectFile(AI_POKE_REPLY_FILE || 'poke_replies.json')
@@ -751,7 +762,19 @@ function formatScheduleTime(ts) {
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
+const SCHEDULE_RETRY_DELAY_MS = Math.max(15000, Math.min(600000, parseInt(config.AI_SCHEDULE_RETRY_DELAY_MS, 10) || 60000))
+const SCHEDULE_MAX_ATTEMPTS = Math.max(1, Math.min(10, parseInt(config.AI_SCHEDULE_MAX_ATTEMPTS, 10) || 3))
+const SCHEDULE_RETRY_WINDOW_MS = Math.max(SCHEDULE_RETRY_DELAY_MS * (SCHEDULE_MAX_ATTEMPTS + 1), 10 * 60 * 1000)
+
 function normalizeScheduledTask(task) {
+  const base = normalizeScheduledTaskBase(task)
+  if (!base) return null
+  base.attempts = Math.max(0, Math.min(SCHEDULE_MAX_ATTEMPTS, parseInt(task.attempts, 10) || 0))
+  base.lastAttemptAt = Math.max(0, Number(task.lastAttemptAt) || 0)
+  return base
+}
+
+function normalizeScheduledTaskBase(task) {
   if (!task || typeof task !== 'object') return null
   const id = String(task.id || '').trim() || crypto.randomBytes(8).toString('hex')
   const groupId = String(task.groupId || '').trim()
@@ -886,7 +909,12 @@ function loadScheduledTaskStore() {
           repaired = true
           continue
         }
-        if (!(normalized.mode === 'daily' || normalized.mode === 'weekly' || normalized.mode === 'monthly' || normalized.nextRunAt > Date.now() - 60000)) {
+        if (!(normalized.mode === 'daily' || normalized.mode === 'weekly' || normalized.mode === 'monthly' || normalized.nextRunAt > Date.now() - 60000
+          // 一次性任务发送失败后要保留重试，不能按“过期任务”清掉。
+          || (normalized.mode === 'once'
+            && normalized.attempts > 0
+            && normalized.attempts < SCHEDULE_MAX_ATTEMPTS
+            && normalized.lastAttemptAt > Date.now() - SCHEDULE_RETRY_WINDOW_MS))) {
           repaired = true
           continue
         }
@@ -1019,52 +1047,72 @@ function isWsClientReady(ws) {
   return Boolean(ws && ws.readyState === 1)
 }
 
+function removeScheduledTaskById(store, groupId, taskId) {
+  const remaining = (store[groupId] || []).filter((task) => task.id !== taskId)
+  if (remaining.length > 0) store[groupId] = remaining
+  else delete store[groupId]
+}
+
 async function runScheduledTasksTick() {
   if (scheduledTaskRunnerBusy || !isWsClientReady(activeWsClient)) return
   scheduledTaskRunnerBusy = true
   try {
     const now = Date.now()
     const store = loadScheduledTaskStore()
-    let changed = false
     const dueTasks = []
     for (const [groupId, tasks] of Object.entries(store)) {
-      const nextTasks = []
       for (const task of Array.isArray(tasks) ? tasks : []) {
-        const normalized = normalizeScheduledTask(task)
-        if (!normalized) {
-          changed = true
-          continue
-        }
-        if (normalized.nextRunAt > now + 1000) {
-          nextTasks.push(normalized)
-          continue
-        }
-        if (normalized.mode === 'daily' || normalized.mode === 'weekly' || normalized.mode === 'monthly') {
-          normalized.lastRunAt = now
-          const advanced = advanceRecurringScheduledTask(normalized, now)
-          if (advanced) nextTasks.push(advanced)
-          changed = true
-          dueTasks.push({ groupId, task: normalized, recurring: true })
-          continue
-        }
-        changed = true
-        dueTasks.push({ groupId, task: normalized, recurring: false })
+        if (task.nextRunAt > now + 1000) continue
+        // 失败过的任务按固定间隔重试，避免每 15 秒对同一个坏任务狂发。
+        if (!isScheduledRetryDue(task.lastAttemptAt, now, SCHEDULE_RETRY_DELAY_MS)) continue
+        dueTasks.push({ groupId, task })
       }
-      if (nextTasks.length > 0) store[groupId] = nextTasks
-      else delete store[groupId]
     }
-    if (changed) saveScheduledTaskStore(store)
-    for (const item of dueTasks) {
-      const sent = await sendScheduledTaskMessage(activeWsClient, item.task).catch((error) => {
+    for (const { groupId, task } of dueTasks) {
+      const current = (store[groupId] || []).find((item) => item.id === task.id)
+      if (!current) continue
+      const recurring = current.mode !== 'once'
+      const sent = await sendScheduledTaskMessage(activeWsClient, current).catch((error) => {
         const message = error && error.message ? String(error.message) : String(error)
-        console.log(`定时任务发送异常 group=${item.groupId} id=${item.task.id} ${message}`)
+        console.log(`定时任务发送异常 group=${groupId} id=${current.id} ${message}`)
         return false
       })
-      if (!sent && item.recurring) {
-        console.log(`定时任务发送失败，已推进下次执行 group=${item.groupId} id=${item.task.id} nextRunAt=${formatScheduleTime(item.task.nextRunAt)}`)
-      } else if (!sent) {
-        console.log(`一次性定时任务发送失败，仍按已执行移除 group=${item.groupId} id=${item.task.id}`)
+      if (sent) {
+        // 只有确认发出后才推进/删除，这样 OneBot 抖动不会把任务永久吞掉。
+        current.attempts = 0
+        current.lastAttemptAt = 0
+        current.lastRunAt = now
+        if (recurring) {
+          const advanced = advanceRecurringScheduledTask(current, now)
+          if (!advanced) {
+            removeScheduledTaskById(store, groupId, current.id)
+            console.log(`定时任务无法计算下次执行时间，已移除 group=${groupId} id=${current.id}`)
+          }
+        } else {
+          removeScheduledTaskById(store, groupId, current.id)
+        }
+      } else {
+        const outcome = planScheduledFailure({
+          attempts: current.attempts,
+          recurring,
+          maxAttempts: SCHEDULE_MAX_ATTEMPTS
+        })
+        current.attempts = outcome.attempts
+        current.lastAttemptAt = now
+        if (outcome.action === 'drop') {
+          removeScheduledTaskById(store, groupId, current.id)
+          console.log(`一次性定时任务连续失败 ${outcome.attempts} 次，已移除 group=${groupId} id=${current.id}`)
+        } else if (outcome.action === 'advance') {
+          current.attempts = 0
+          current.lastAttemptAt = 0
+          const advanced = advanceRecurringScheduledTask(current, now)
+          if (!advanced) removeScheduledTaskById(store, groupId, current.id)
+          else console.log(`定时任务连续失败 ${outcome.attempts} 次，跳过本次并推进 group=${groupId} id=${current.id} nextRunAt=${formatScheduleTime(current.nextRunAt)}`)
+        } else {
+          console.log(`定时任务发送失败，${Math.round(SCHEDULE_RETRY_DELAY_MS / 1000)}s 后重试 group=${groupId} id=${current.id} attempts=${outcome.attempts}`)
+        }
       }
+      saveScheduledTaskStore(store)
     }
   } finally {
     scheduledTaskRunnerBusy = false
@@ -1611,9 +1659,11 @@ function stripPrefix(text) {
 async function callLLM(text, media, hist, opts) {
   const b = await callOpenAI(text, media, hist, opts)
   if (b && typeof b === 'object' && !Array.isArray(b)) {
+    if (b.usage) usageTracker.record(b.usage, { model: OPENAI_MODEL })
     const out = {
       text: b.text ? sanitizeModelText(b.text) : '',
-      toolCalls: Array.isArray(b.toolCalls) ? b.toolCalls : []
+      toolCalls: Array.isArray(b.toolCalls) ? b.toolCalls : [],
+      ...(b.usage ? { usage: b.usage } : {})
     }
     if (out.text || out.toolCalls.length > 0) return out
   }
@@ -1844,6 +1894,7 @@ async function callOpenAI(text, media, hist, opts) {
     const contentText = extractOpenAIText(res.data)
     const toolCalls = extractOpenAIToolCalls(res.data)
     const images = extractOpenAIImages(res.data)
+    const usage = extractOpenAIUsage(res.data)
     if (!contentText && toolCalls.length === 0 && images.length === 0) return null
     console.log('OpenAI成功')
     const txt = String(contentText || '').slice(0, 2000)
@@ -1851,10 +1902,10 @@ async function callOpenAI(text, media, hist, opts) {
       const ignoreHints = /(未提供(对应)?图片|无法识别到你提供的图片|暂时无法解答|请你补充相关信息)/i
       if (ignoreHints.test(txt)) {
         const again = await callGemini(text, effectiveMedia, opts)
-        if (again) return { text: String(again).slice(0, 2000), toolCalls }
+        if (again) return { text: String(again).slice(0, 2000), toolCalls, ...(usage ? { usage } : {}) }
       }
     }
-    return { text: txt, toolCalls, images }
+    return { text: txt, toolCalls, images, ...(usage ? { usage } : {}) }
   } catch (e) {
     const status = e && e.response && e.response.status
     const msg = e && e.response && e.response.data

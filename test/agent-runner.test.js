@@ -333,3 +333,87 @@ test('the run deadline stops the loop before another model request', async () =>
   assert.equal(result.text, '先说到这里')
   assert.equal(result.toolCalls[0].skipped, true)
 })
+
+test('a tool call written into the reply text is executed instead of being sent', async () => {
+  let modelCalls = 0
+  const executed = []
+  const runner = createAgentRunner({
+    toolRegistry: readOnlyRegistry(['history']),
+    toolExecutor: {
+      isAllowed: () => true,
+      isReadOnly: () => true,
+      execute: async (name) => {
+        executed.push(name)
+        return { ok: true, data: { items: [] } }
+      }
+    },
+    invokeModel: async () => {
+      modelCalls += 1
+      return modelCalls === 1
+        ? { text: '<tool_call>{"name":"history","arguments":{"session_key":"k"}}</tool_call>' }
+        : { text: '查完了', toolCalls: [] }
+    },
+    maxSteps: 3
+  })
+  const result = await runner.run({ message: '查历史', runtime: {} })
+  assert.deepEqual(executed, ['history'])
+  assert.equal(result.text, '查完了')
+  assert.equal(result.metrics.inlineCalls, 1)
+  assert.equal(result.toolCalls.length, 1)
+})
+
+test('inline protocol scraps are stripped even when the tool name is unknown', async () => {
+  let modelCalls = 0
+  const executed = []
+  const runner = createAgentRunner({
+    toolRegistry: readOnlyRegistry(['history']),
+    toolExecutor: {
+      isAllowed: () => true,
+      isReadOnly: () => true,
+      execute: async (name) => {
+        executed.push(name)
+        return { ok: true, data: {} }
+      }
+    },
+    invokeModel: async () => {
+      modelCalls += 1
+      return { text: '这里没有工具 <tool_call>{"name":"rm_rf","arguments":{}}</tool_call>', toolCalls: [] }
+    },
+    maxSteps: 2
+  })
+  const result = await runner.run({ message: '闲聊', runtime: {} })
+  assert.deepEqual(executed, [])
+  assert.equal(result.text.includes('tool_call'), false)
+  assert.equal(result.text.includes('rm_rf'), false)
+})
+
+test('token usage from each model call is summed into the run metrics', async () => {
+  let modelCalls = 0
+  const runner = createAgentRunner({
+    toolRegistry: readOnlyRegistry(['read_a']),
+    toolExecutor: {
+      isAllowed: () => true,
+      isReadOnly: () => true,
+      execute: async () => ({ ok: true, data: {} })
+    },
+    invokeModel: async () => {
+      modelCalls += 1
+      if (modelCalls === 1) {
+        return {
+          text: '',
+          toolCalls: [{ id: 'c1', name: 'read_a', arguments: {} }],
+          usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 }
+        }
+      }
+      return { text: '完成', toolCalls: [], usage: { prompt_tokens: 30, completion_tokens: 10 } }
+    },
+    maxSteps: 3
+  })
+  const result = await runner.run({ message: '用量', runtime: {} })
+  assert.equal(result.metrics.modelCalls, 2)
+  assert.equal(result.metrics.promptTokens, 130)
+  assert.equal(result.metrics.completionTokens, 30)
+  // 第二次没有 total_tokens 时按 prompt+completion 补算。
+  assert.equal(result.metrics.totalTokens, 160)
+})
+

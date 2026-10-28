@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { extractOpenAIText, extractOpenAIToolCalls } = require('../src/providers/openai')
+const { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIUsage } = require('../src/providers/openai')
 
 test('responses API: reasoning items are excluded from the reply text', () => {
   const data = {
@@ -75,4 +75,34 @@ test('chat completions content and tool calls still parse normally', () => {
   assert.deepEqual(extractOpenAIToolCalls(data), [
     { id: 'call_1', name: 'history', arguments: { session_key: 'k' } }
   ])
+})
+
+test('usage is read from both chat completions and responses payloads', () => {
+  assert.deepEqual(
+    extractOpenAIUsage({ usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 } }),
+    { promptTokens: 120, completionTokens: 30, totalTokens: 150, reasoningTokens: 0 }
+  )
+  assert.deepEqual(
+    extractOpenAIUsage({ usage: { input_tokens: 80, output_tokens: 20, output_tokens_details: { reasoning_tokens: 12 } } }),
+    { promptTokens: 80, completionTokens: 20, totalTokens: 100, reasoningTokens: 12 }
+  )
+  assert.equal(extractOpenAIUsage({}), null)
+  assert.equal(extractOpenAIUsage(null), null)
+})
+
+test('usage is read from the final streaming event', () => {
+  const sse = [
+    'data: {"type":"response.output_text.delta","delta":"你好"}',
+    '',
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":40,"output_tokens":10,"total_tokens":50}}}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join('\n')
+  assert.deepEqual(extractOpenAIUsage(sse), {
+    promptTokens: 40,
+    completionTokens: 10,
+    totalTokens: 50,
+    reasoningTokens: 0
+  })
 })

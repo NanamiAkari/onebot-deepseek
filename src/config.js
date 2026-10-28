@@ -103,6 +103,14 @@ module.exports = {
     const value = parseInt(raw, 10)
     return Number.isFinite(value) ? Math.max(0, Math.min(60000, value)) : 9000
   })(),
+  // 用量统计只记 token 数量和模型名；单价为每百万 token，0 表示不估算成本
+  AI_USAGE_STATS_ENABLE: String(process.env.AI_USAGE_STATS_ENABLE || 'true').toLowerCase() === 'true',
+  AI_USAGE_DIR: process.env.AI_USAGE_DIR || 'usage_data',
+  AI_PRICE_INPUT_PER_1M: Math.max(0, parseFloat(process.env.AI_PRICE_INPUT_PER_1M || '0') || 0),
+  AI_PRICE_OUTPUT_PER_1M: Math.max(0, parseFloat(process.env.AI_PRICE_OUTPUT_PER_1M || '0') || 0),
+  // 定时任务发送失败后的重试间隔与最大尝试次数
+  AI_SCHEDULE_RETRY_DELAY_MS: Math.max(15000, Math.min(600000, parseInt(process.env.AI_SCHEDULE_RETRY_DELAY_MS || '60000', 10) || 60000)),
+  AI_SCHEDULE_MAX_ATTEMPTS: Math.max(1, Math.min(10, parseInt(process.env.AI_SCHEDULE_MAX_ATTEMPTS || '3', 10) || 3)),
   AI_NAME_INTENT_ENABLE: String(process.env.AI_NAME_INTENT_ENABLE || 'true').toLowerCase() === 'true',
   AI_NAME_INTENT_THRESHOLD: (() => {
     const value = parseFloat(process.env.AI_NAME_INTENT_THRESHOLD || '0.65')

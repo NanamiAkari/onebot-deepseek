@@ -1,5 +1,6 @@
 const { toolBudget } = require('./tool-metadata')
 const { createToolScheduler } = require('./tool-scheduler')
+const { parseInlineToolCalls } = require('./inline-tools')
 
 function createAgentRunner(deps) {
   const {
@@ -68,11 +69,12 @@ function createAgentRunner(deps) {
   }
 
   function normalizeModelOutput(output) {
-    if (!output) return { text: '', toolCalls: [] }
-    if (typeof output === 'string') return { text: output, toolCalls: [] }
+    if (!output) return { text: '', toolCalls: [], usage: null }
+    if (typeof output === 'string') return { text: output, toolCalls: [], usage: null }
     return {
       text: output.text ? String(output.text) : '',
-      toolCalls: Array.isArray(output.toolCalls) ? output.toolCalls : []
+      toolCalls: Array.isArray(output.toolCalls) ? output.toolCalls : [],
+      usage: output.usage && typeof output.usage === 'object' ? output.usage : null
     }
   }
 
@@ -120,6 +122,8 @@ function createAgentRunner(deps) {
 
     const executedToolCalls = []
     let finalText = ''
+    // 内联解析只认已注册的工具名，避免把用户要求的 JSON 误当成调用。
+    const knownToolNames = new Set(tools.map((tool) => tool.name))
     const budgetUsed = new Map()
     // 只有成功或确定性失败会进入 completedCalls；可重试失败和状态未知单独记录。
     const completedCalls = new Map()
@@ -127,6 +131,11 @@ function createAgentRunner(deps) {
     const inFlightCalls = new Map()
     const metrics = {
       steps: 0,
+      modelCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      inlineCalls: 0,
       toolCalls: 0,
       executed: 0,
       retried: 0,
@@ -137,7 +146,8 @@ function createAgentRunner(deps) {
     }
 
     function reportStopped(reason) {
-      console.log(`Agent 结束：${reason} steps=${metrics.steps}/${maxSteps} 工具=${metrics.toolCalls} 执行=${metrics.executed} 重试=${metrics.retried} 去重=${metrics.deduplicated} 超限=${metrics.skipped} 并行波次=${metrics.parallelWaves} 耗时=${Date.now() - startedAt}ms`)
+      const tokens = metrics.totalTokens ? ` tokens=${metrics.promptTokens}+${metrics.completionTokens}` : ''
+      console.log(`Agent 结束：${reason} steps=${metrics.steps}/${maxSteps} 模型=${metrics.modelCalls} 工具=${metrics.toolCalls} 执行=${metrics.executed} 重试=${metrics.retried} 去重=${metrics.deduplicated} 超限=${metrics.skipped} 并行波次=${metrics.parallelWaves}${tokens} 耗时=${Date.now() - startedAt}ms`)
     }
 
     function dedupeEntry(entry, call, batchId, note) {
@@ -263,13 +273,29 @@ function createAgentRunner(deps) {
               all: executedToolCalls.slice()
             })
       )
-
-      const calls = output.toolCalls.filter((call) => call && call.name)
-      if (!calls.length || !toolExecutor) {
-        return finish('final', output.text || finalText, step + 1)
+      metrics.modelCalls += 1
+      if (output.usage) {
+        const prompt = Math.max(0, Number(output.usage.promptTokens ?? output.usage.prompt_tokens) || 0)
+        const completion = Math.max(0, Number(output.usage.completionTokens ?? output.usage.completion_tokens) || 0)
+        metrics.promptTokens += prompt
+        metrics.completionTokens += completion
+        metrics.totalTokens += Math.max(0, Number(output.usage.totalTokens ?? output.usage.total_tokens) || (prompt + completion))
       }
 
-      if (output.text) finalText = output.text
+      // 少数模型会把工具调用写进正文；解析成真正的调用，并删掉协议残片。
+      const inline = parseInlineToolCalls(output.text, knownToolNames)
+      const cleanText = inline.cleanedText
+      let calls = output.toolCalls.filter((call) => call && call.name)
+      if (!calls.length && inline.calls.length && toolExecutor) {
+        calls = inline.calls.map((call, index) => ({ id: `inline-${step + 1}-${index}`, name: call.name, arguments: call.arguments }))
+        metrics.inlineCalls += calls.length
+        console.log(`Agent step ${step + 1}: 从正文恢复 ${inline.calls.length} 个内联工具调用`)
+      }
+      if (!calls.length || !toolExecutor) {
+        return finish('final', cleanText || finalText, step + 1)
+      }
+
+      if (cleanText) finalText = cleanText
 
       const batchId = `${step + 1}/${maxSteps}`
       const { entries, waves } = await scheduler.run(calls, (call) => executeToolCall(call, batchId), { batchId, deadlineAt })

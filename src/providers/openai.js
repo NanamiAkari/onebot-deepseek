@@ -184,6 +184,35 @@ function extractOpenAIImages(data) {
   return out
 }
 
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const promptTokens = Math.max(0, Math.floor(Number(usage.prompt_tokens ?? usage.input_tokens) || 0))
+  const completionTokens = Math.max(0, Math.floor(Number(usage.completion_tokens ?? usage.output_tokens) || 0))
+  const totalTokens = Math.max(0, Math.floor(Number(usage.total_tokens) || (promptTokens + completionTokens)))
+  const details = usage.completion_tokens_details || usage.output_tokens_details || null
+  const reasoningTokens = Math.max(0, Math.floor(Number(details && details.reasoning_tokens) || 0))
+  if (!promptTokens && !completionTokens) return null
+  return { promptTokens, completionTokens, totalTokens, reasoningTokens }
+}
+
+// 用量兼容两种协议：chat 模式的 prompt/completion_tokens，
+// Responses 模式的 input/output_tokens；流式响应从最终事件里取。
+function extractOpenAIUsage(data) {
+  if (typeof data === 'string') {
+    const parsed = parseOpenAIStringPayload(data)
+    if (parsed.json) return extractOpenAIUsage(parsed.json)
+    let usage = null
+    for (const event of parsed.events) {
+      if (!event || typeof event !== 'object') continue
+      if (event.response && event.response.usage) usage = event.response.usage
+      else if (event.usage && (event.type === 'response.completed' || event.type === 'response.incomplete')) usage = event.usage
+    }
+    return normalizeUsage(usage)
+  }
+  if (!data || typeof data !== 'object') return null
+  return normalizeUsage(data.usage || (data.response && data.response.usage) || null)
+}
+
 function formatOpenAITools(tools, useResponses) {
   if (!Array.isArray(tools) || tools.length === 0) return []
   return tools.map((tool) => {
@@ -207,4 +236,4 @@ function formatOpenAITools(tools, useResponses) {
   })
 }
 
-module.exports = { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, formatOpenAITools }
+module.exports = { extractOpenAIText, extractOpenAIToolCalls, extractOpenAIImages, extractOpenAIUsage, formatOpenAITools }

@@ -55,6 +55,7 @@ jobs:
             --exclude='./generated_images' \
             --exclude='./sticker_data' \
             --exclude='./tool_workspace' \
+            --exclude='./usage_data' \
             --exclude='./guild1.db*' \
             --exclude='./.playwright-cli' \
             . \
