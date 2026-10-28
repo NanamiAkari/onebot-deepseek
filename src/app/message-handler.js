@@ -1,8 +1,11 @@
+const { chatKeyFromPayload } = require('../agent/tool-metadata')
+
 function createMessageHandler(deps) {
   const {
     pending,
     pokeCooldown,
     mediaCache,
+    sendRegistry,
     getKey,
     pushHistory,
     recordGroupMessage,
@@ -106,11 +109,22 @@ function createMessageHandler(deps) {
 
   async function sendReplyBatches(ws, action, payload, batches) {
     const sentTexts = []
+    const chatKey = chatKeyFromPayload(payload)
     for (let index = 0; index < batches.length; index += 1) {
       const messageSegments = batches[index]
       const params = action === 'send_group_msg'
         ? { group_id: payload.group_id, message: messageSegments }
         : { user_id: payload.user_id, message: messageSegments }
+      // 发送指纹与工具发送共用：模型已经用工具发过的同一段内容，不再由最终文本重发一遍。
+      const print = sendRegistry && typeof sendRegistry.fingerprint === 'function'
+        ? sendRegistry.fingerprint(chatKey, messageSegments)
+        : ''
+      if (print && typeof sendRegistry.isDuplicate === 'function' && sendRegistry.isDuplicate(print)) {
+        console.log(`AI回复去重：${String(print).slice(0, 120)}`)
+        const textPart = extractTextFromSegments(messageSegments)
+        if (textPart) sentTexts.push(textPart)
+        continue
+      }
       let sendResult
       try {
         sendResult = await sendAction(ws, action, params)
@@ -121,6 +135,8 @@ function createMessageHandler(deps) {
       if (!(sendResult && sendResult.status === 'ok')) {
         return { ok: false, failedIndex: index, sentTexts }
       }
+      // 只有协议端确认成功后才记账，失败和超时都保留正常重试的机会。
+      if (print && typeof sendRegistry.markSent === 'function') sendRegistry.markSent(print)
       const textPart = extractTextFromSegments(messageSegments)
       if (textPart) sentTexts.push(textPart)
     }

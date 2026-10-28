@@ -91,6 +91,18 @@ module.exports = {
   AI_QUEUE_MAX_PER_SESSION: Math.max(1, Math.min(100, parseInt(process.env.AI_QUEUE_MAX_PER_SESSION || '10', 10) || 10)),
   AI_QUEUE_MAX_TOTAL: Math.max(1, Math.min(500, parseInt(process.env.AI_QUEUE_MAX_TOTAL || '50', 10) || 50)),
   AI_QUEUE_WAIT_TIMEOUT_MS: Math.max(1000, Math.min(600000, parseInt(process.env.AI_QUEUE_WAIT_TIMEOUT_MS || '120000', 10) || 120000)),
+  AI_TOOL_PARALLEL_MAX: Math.max(1, Math.min(16, parseInt(process.env.AI_TOOL_PARALLEL_MAX || '4', 10) || 4)),
+  AI_TURN_DEADLINE_MS: Math.max(5000, Math.min(300000, parseInt(process.env.AI_TURN_DEADLINE_MS || '60000', 10) || 60000)),
+  AI_TOOL_WRITE_LOCK: ['keyed', 'global', 'none'].includes(String(process.env.AI_TOOL_WRITE_LOCK || '').toLowerCase())
+    ? String(process.env.AI_TOOL_WRITE_LOCK).toLowerCase()
+    : 'keyed',
+  // 0 是明确的关闭值，不能被 || 默认值吞掉。
+  AI_SEND_DEDUPE_MS: (() => {
+    const raw = process.env.AI_SEND_DEDUPE_MS
+    if (raw === undefined || raw === '') return 9000
+    const value = parseInt(raw, 10)
+    return Number.isFinite(value) ? Math.max(0, Math.min(60000, value)) : 9000
+  })(),
   AI_NAME_INTENT_ENABLE: String(process.env.AI_NAME_INTENT_ENABLE || 'true').toLowerCase() === 'true',
   AI_NAME_INTENT_THRESHOLD: (() => {
     const value = parseFloat(process.env.AI_NAME_INTENT_THRESHOLD || '0.65')

@@ -13,6 +13,7 @@ const { createMessageHandler } = require('./src/app/message-handler')
 const { createMemberMemory, previousLocalDate } = require('./src/memory/member-memory')
 const { shouldGenerateImage } = require('./src/image-generation/intent')
 const { createRequestQueue } = require('./src/app/request-queue')
+const { createSendRegistry } = require('./src/app/send-registry')
 const { createWebSearch } = require('./src/web-search')
 const { createWebFetch } = require('./src/web-fetch')
 const { createStickerStore } = require('./src/stickers')
@@ -165,11 +166,14 @@ const toolRegistry = createDefaultToolRegistry({
   stickers: stickers.available(),
   botFeatures: true
 })
+// 工具发送和最终文本发送共用同一份会话级指纹，避免同一段内容被发两遍。
+const sendRegistry = createSendRegistry({ ttlMs: config.AI_SEND_DEDUPE_MS })
 const toolExecutor = createToolExecutor({
-  sendAction, getHistoryRaw, memberMemory, webSearch, webFetch, stickers,
+  sendAction, getHistoryRaw, memberMemory, webSearch, webFetch, stickers, sendRegistry,
   workspaceRoot: path.join(PROJECT_ROOT, 'tool_workspace'),
   fileToolsEnabled: config.AI_FILE_TOOLS_ENABLE,
   fileToolAdminUserIds: ADMIN_USER_IDS,
+  writeLockMode: config.AI_TOOL_WRITE_LOCK,
   stickerMaxBytes: AI_STICKER_MAX_BYTES,
   featureTools: {
     isAdmin: (runtime) => isFeatureToolAdmin(runtime),
@@ -200,8 +204,9 @@ const agentRunner = createAgentRunner({
   toolRegistry,
   toolExecutor,
   invokeModel: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, toolResults: input.toolResults, structured: true }),
-  invokeModelWithToolResult: async (input) => callLLM(input.message, input.media, input.history, { contextImage: input.contextImage, memoryContext: input.memoryContext, tools: input.tools, toolResults: input.toolResults, structured: true }),
-  maxSteps: 10
+  maxSteps: 10,
+  deadlineMs: config.AI_TURN_DEADLINE_MS,
+  parallelLimit: config.AI_TOOL_PARALLEL_MAX
 })
 const AI_POKE_ONLY_SELF = String(process.env.AI_POKE_ONLY_SELF || 'true').toLowerCase() === 'true'
 let currentPokeReplyTexts = []
@@ -1381,6 +1386,7 @@ const onMessage = createMessageHandler({
   pending,
   pokeCooldown,
   mediaCache,
+  sendRegistry,
   getKey,
   pushHistory,
   recordGroupMessage,
@@ -1649,7 +1655,8 @@ function serializeToolResult(toolCall) {
   const value = {
     ok: Boolean(toolCall && toolCall.ok),
     data: toolCall && Object.prototype.hasOwnProperty.call(toolCall, 'data') ? toolCall.data : null,
-    ...(toolCall && toolCall.error ? { error: String(toolCall.error) } : {})
+    ...(toolCall && toolCall.error ? { error: String(toolCall.error) } : {}),
+    ...(toolCall && toolCall.note ? { note: String(toolCall.note) } : {})
   }
   try {
     const json = JSON.stringify(value)
@@ -2009,7 +2016,10 @@ function sendAction(ws, action, params) {
     setTimeout(() => {
       if (pending.has(echo)) {
         pending.delete(echo)
-        reject(new Error('timeout'))
+        const error = new Error('timeout')
+        // 超时表示请求可能已经到达协议端：标记成 TIMEOUT，工具层据此判定“状态未知、禁止重试”。
+        error.code = 'TIMEOUT'
+        reject(error)
       }
     }, 8000)
   })

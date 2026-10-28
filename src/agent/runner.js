@@ -1,5 +1,27 @@
+const { toolBudget } = require('./tool-metadata')
+const { createToolScheduler } = require('./tool-scheduler')
+
 function createAgentRunner(deps) {
-  const { toolRegistry, toolExecutor, invokeModel, invokeModelWithToolResult, maxSteps = 5 } = deps
+  const {
+    toolRegistry,
+    toolExecutor,
+    invokeModel,
+    invokeModelWithToolResult,
+    maxSteps = 10,
+    deadlineMs = 60000,
+    parallelLimit = 4,
+    // 同一个调用最多尝试几次：2 表示允许一次自动重试（只针对 retryable 失败）。
+    maxAttemptsPerCall = 2
+  } = deps
+
+  const scheduler = createToolScheduler({
+    maxParallel: parallelLimit,
+    isReadOnly: (call) => Boolean(
+      toolExecutor
+      && typeof toolExecutor.isReadOnly === 'function'
+      && toolExecutor.isReadOnly(call.name, call.arguments || {})
+    )
+  })
 
   function compactToolData(value, maxChars = 12000) {
     if (value == null) return value
@@ -54,13 +76,6 @@ function createAgentRunner(deps) {
     }
   }
 
-  function formatToolResultForHistory(toolCall) {
-    const payload = toolCall.ok
-      ? { ok: true, data: toolCall.data }
-      : { ok: false, error: toolCall.error }
-    return `工具 ${toolCall.name} 调用结果：${JSON.stringify(payload).slice(0, 1500)}`
-  }
-
   function summarizeArguments(args) {
     try {
       const text = JSON.stringify(args || {})
@@ -82,24 +97,9 @@ function createAgentRunner(deps) {
     return `${String(toolCall && toolCall.name || '')}:${stableSerialize(toolCall && toolCall.arguments || {})}`
   }
 
-  function buildToolBudgets(tools) {
-    const budgets = new Map()
-    const limits = {
-      web_search: 2,
-      web_fetch: 2,
-      list_stickers: 2,
-      collect_sticker: 1,
-      annotate_sticker: 1,
-      send_sticker: 1
-    }
-    for (const tool of tools || []) {
-      if (!tool || !tool.name) continue
-      budgets.set(tool.name, limits[tool.name] || 1)
-    }
-    return budgets
-  }
-
   async function run(input) {
+    const startedAt = Date.now()
+    const deadlineAt = deadlineMs > 0 ? startedAt + deadlineMs : 0
     const tools = toolRegistry ? toolRegistry.list().filter((tool) => !toolExecutor || typeof toolExecutor.isAllowed !== 'function' || toolExecutor.isAllowed(tool.name, input.runtime || {})).map((tool) => ({
       name: tool.name,
       description: tool.description,
@@ -120,23 +120,41 @@ function createAgentRunner(deps) {
 
     const executedToolCalls = []
     let finalText = ''
-    const toolBudgets = buildToolBudgets(agentInput.tools)
-    const executionCounts = new Map()
+    const budgetUsed = new Map()
+    // 只有成功或确定性失败会进入 completedCalls；可重试失败和状态未知单独记录。
     const completedCalls = new Map()
+    const failedCalls = new Map()
     const inFlightCalls = new Map()
+    const metrics = {
+      steps: 0,
+      toolCalls: 0,
+      executed: 0,
+      retried: 0,
+      deduplicated: 0,
+      skipped: 0,
+      parallelWaves: 0,
+      serialCalls: 0
+    }
 
-    function copyToolEntry(entry, call, batchId, deduplicated = false) {
+    function reportStopped(reason) {
+      console.log(`Agent 结束：${reason} steps=${metrics.steps}/${maxSteps} 工具=${metrics.toolCalls} 执行=${metrics.executed} 重试=${metrics.retried} 去重=${metrics.deduplicated} 超限=${metrics.skipped} 并行波次=${metrics.parallelWaves} 耗时=${Date.now() - startedAt}ms`)
+    }
+
+    function dedupeEntry(entry, call, batchId, note) {
       return {
         ...entry,
-        id: call.id || call.name,
+        id: call.id || entry.id || call.name,
         name: call.name,
         arguments: call.arguments || {},
         batchId,
-        ...(deduplicated ? { deduplicated: true } : {})
+        deduplicated: true,
+        ...(note ? { note } : {})
       }
     }
 
-    function skippedToolEntry(call, error, batchId) {
+    function skippedToolEntry(call, batchId) {
+      // 超限只是不再执行，不对外输出任何“已达上限”的说法：
+      // 结果照常回给模型（保证 tool_calls 协议完整），用户侧只看模型的最终文本。
       return {
         id: call.id || call.name,
         name: call.name,
@@ -144,39 +162,67 @@ function createAgentRunner(deps) {
         batchId,
         ok: false,
         data: null,
-        error
+        error: '调用未执行',
+        kind: 'fatal',
+        skipped: true,
+        note: '本轮不再执行这个调用；不要向用户提及工具次数、调用上限或跳过原因，直接基于已有信息回答'
       }
     }
 
     async function executeToolCall(call, batchId) {
       const key = toolCallKey(call)
       const completed = completedCalls.get(key)
-      if (completed) return copyToolEntry(completed, call, batchId, true)
+      if (completed) return dedupeEntry(completed, call, batchId, '该调用本轮已执行过，结果同上，不要重复调用')
+
       const inFlight = inFlightCalls.get(key)
-      if (inFlight) return copyToolEntry(await inFlight, call, batchId, true)
+      if (inFlight) return dedupeEntry(await inFlight, call, batchId, '该调用本轮已执行过，结果同上，不要重复调用')
 
-      const usedCount = executionCounts.get(call.name) || 0
-      const toolBudget = toolBudgets.get(call.name)
-      if (typeof toolBudget === 'number' && usedCount >= toolBudget) {
-        return skippedToolEntry(call, `${call.name} 工具已超限，请直接基于现有上下文回答，不要继续调用该工具`, batchId)
+      const previousFailure = failedCalls.get(key)
+      const attempts = previousFailure && previousFailure.attempts ? previousFailure.attempts : 0
+      const retrying = Boolean(previousFailure && previousFailure.kind === 'retryable' && attempts < maxAttemptsPerCall)
+      if (previousFailure && !retrying) {
+        return dedupeEntry(previousFailure, call, batchId, previousFailure.kind === 'uncertain'
+          ? '上次调用状态未知，可能已经生效，为避免重复已禁止重试'
+          : '上次调用已失败且不会自动重试')
       }
-      executionCounts.set(call.name, usedCount + 1)
 
+      const budget = toolBudget(call.name, call.arguments || {})
+      const used = budgetUsed.get(call.name) || 0
+      if (!retrying && used >= budget) {
+        return skippedToolEntry(call, batchId)
+      }
+      if (!retrying) budgetUsed.set(call.name, used + 1)
+
+      const attempt = attempts + 1
       const promise = (async () => {
-        console.log(`Agent step ${batchId}: 调用工具 ${call.name} args=${summarizeArguments(call.arguments || {})}`)
-        const toolResult = await toolExecutor.execute(call.name, call.arguments || {}, agentInput.runtime || {})
-        const toolEntry = {
+        const startedCallAt = Date.now()
+        console.log(`Agent step ${batchId}: 调用工具 ${call.name}${attempt > 1 ? `（第${attempt}次尝试）` : ''} args=${summarizeArguments(call.arguments || {})}`)
+        let toolResult
+        try {
+          toolResult = await toolExecutor.execute(call.name, call.arguments || {}, agentInput.runtime || {})
+        } catch (error) {
+          toolResult = { ok: false, error: error && error.message ? String(error.message) : '工具执行异常', kind: 'fatal' }
+        }
+        const entry = {
           id: call.id || call.name,
           name: call.name,
           arguments: call.arguments || {},
           batchId,
           ok: Boolean(toolResult && toolResult.ok),
           data: toolResult && Object.prototype.hasOwnProperty.call(toolResult, 'data') ? compactToolData(toolResult.data) : null,
-          error: toolResult && toolResult.error ? String(toolResult.error) : ''
+          error: toolResult && toolResult.error ? String(toolResult.error) : '',
+          kind: (toolResult && toolResult.kind) || (toolResult && toolResult.ok ? 'ok' : 'fatal'),
+          durationMs: Date.now() - startedCallAt,
+          attempts: attempt
         }
-        console.log(`Agent step ${batchId}: 工具 ${call.name} ${toolEntry.ok ? '成功' : '失败'}`)
-        completedCalls.set(key, toolEntry)
-        return toolEntry
+        if (entry.ok || entry.kind === 'fatal') {
+          completedCalls.set(key, entry)
+          failedCalls.delete(key)
+        } else {
+          failedCalls.set(key, entry)
+        }
+        console.log(`Agent step ${batchId}: 工具 ${call.name} ${entry.ok ? '成功' : `失败(${entry.kind})`} ${entry.durationMs}ms`)
+        return entry
       })()
       inFlightCalls.set(key, promise)
       try {
@@ -187,13 +233,27 @@ function createAgentRunner(deps) {
     }
 
     function removeExhaustedTools() {
-      agentInput.tools = agentInput.tools.filter((tool) => {
-        const budget = toolBudgets.get(tool.name)
-        return typeof budget !== 'number' || (executionCounts.get(tool.name) || 0) < budget
-      })
+      agentInput.tools = agentInput.tools.filter((tool) => (budgetUsed.get(tool.name) || 0) < toolBudget(tool.name))
     }
 
+    function finish(reason, text, steps) {
+      metrics.steps = steps
+      reportStopped(reason)
+      return {
+        text: text || '',
+        toolCalls: executedToolCalls,
+        steps,
+        stoppedReason: reason,
+        metrics: { ...metrics }
+      }
+    }
+
+    let stallCount = 0
     for (let step = 0; step < maxSteps; step += 1) {
+      if (deadlineAt && Date.now() >= deadlineAt) {
+        // 不再用兜底话术替模型发言：有最终文本就发，没有就保持沉默。
+        return finish('deadline', finalText, step)
+      }
       console.log(`Agent step ${step + 1}/${maxSteps}: 调用模型`)
       const output = normalizeModelOutput(
         step === 0 || !invokeModelWithToolResult
@@ -204,42 +264,41 @@ function createAgentRunner(deps) {
             })
       )
 
-      if (!output.toolCalls.length || !toolExecutor) {
-        return {
-          text: output.text || finalText,
-          toolCalls: executedToolCalls,
-          steps: step + 1,
-          stoppedReason: 'final'
-        }
+      const calls = output.toolCalls.filter((call) => call && call.name)
+      if (!calls.length || !toolExecutor) {
+        return finish('final', output.text || finalText, step + 1)
       }
 
       if (output.text) finalText = output.text
 
-      const calls = output.toolCalls.filter((call) => call && call.name)
       const batchId = `${step + 1}/${maxSteps}`
-      const canParallelize = calls.length > 1
-        && typeof toolExecutor.isReadOnly === 'function'
-        && calls.every((call) => toolExecutor.isReadOnly(call.name, call.arguments || {}))
-      console.log(`Agent ${batchId}: ${canParallelize ? '并行执行' : '顺序执行'} ${calls.length} 个工具调用`)
-      const toolEntries = canParallelize
-        ? await Promise.all(calls.map((call) => executeToolCall(call, batchId)))
-        : await calls.reduce(async (promise, call) => {
-            const entries = await promise
-            entries.push(await executeToolCall(call, batchId))
-            return entries
-          }, Promise.resolve([]))
-
-      executedToolCalls.push(...toolEntries)
+      const { entries, waves } = await scheduler.run(calls, (call) => executeToolCall(call, batchId), { batchId, deadlineAt })
+      for (const wave of waves) {
+        if (wave.parallel) metrics.parallelWaves += 1
+        else metrics.serialCalls += wave.size
+      }
+      let productive = 0
+      for (const entry of entries) {
+        if (entry.deduplicated) metrics.deduplicated += 1
+        else if (entry.skipped) metrics.skipped += 1
+        else if (entry.attempts > 1) metrics.retried += 1
+        else metrics.executed += 1
+        if (!entry.deduplicated && !entry.skipped) productive += 1
+      }
+      metrics.toolCalls += entries.length
+      executedToolCalls.push(...entries)
       agentInput.toolResults = executedToolCalls.slice()
       removeExhaustedTools()
+
+      // 整批调用都被去重或超限跳过，说明模型在原地打转；连续两次就收尾，
+      // 不再为重复调用多付一次模型请求。
+      stallCount = productive === 0 ? stallCount + 1 : 0
+      if (stallCount >= 2) {
+        return finish('stalled', finalText, step + 1)
+      }
     }
 
-    return {
-      text: finalText || '工具调用步数已达上限，请简化问题后重试',
-      toolCalls: executedToolCalls,
-      steps: maxSteps,
-      stoppedReason: 'max_steps'
-    }
+    return finish('max_steps', finalText, maxSteps)
   }
 
   return { run }

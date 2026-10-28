@@ -1,25 +1,42 @@
 const fs = require('fs')
 const path = require('path')
 const { createToolPolicy } = require('./tool-policy')
+const { chatKeyFromPayload, isReadOnlyTool, toolLockKey } = require('./tool-metadata')
 
 const MAX_FILE_BYTES = 256 * 1024
 const MAX_DIRECTORY_ENTRIES = 500
-const READ_ONLY_TOOLS = new Set([
-  'get_msg', 'get_image', 'history', 'web_search', 'web_fetch', 'list_stickers',
-  'member_memory', 'resolve_group_member', 'group_memory', 'memory_query',
-  'get_recent_messages', 'read_file', 'list_dir', 'list_poke_replies',
-  'list_custom_replies', 'get_custom_reply', 'list_scheduled_tasks'
-])
-const READ_ONLY_BOT_FEATURE_ACTIONS = new Set([
-  'list_poke_replies', 'list_custom_replies', 'get_custom_reply', 'list_scheduled_tasks'
-])
 
-class ToolError extends Error {}
+class ToolError extends Error {
+  constructor(message, options = {}) {
+    super(message)
+    // retryable：可以安全重试；uncertain：可能已经生效，禁止重试；fatal：确定性失败。
+    this.kind = options.kind || 'fatal'
+  }
+}
+
+// 同键串行的互斥队列。只读工具不取锁；副作用工具按资源域取锁，
+// 不同群/不同文件/不同存储之间互不阻塞。
+function createKeyedLock() {
+  const tails = new Map()
+  return function withKeyLock(key, task) {
+    if (!key) return task()
+    const previous = tails.get(key) || Promise.resolve()
+    let release
+    const current = new Promise((resolve) => { release = resolve })
+    tails.set(key, current)
+    const run = previous.then(task)
+    return run.finally(() => {
+      release()
+      if (tails.get(key) === current) tails.delete(key)
+    })
+  }
+}
 
 function createToolExecutor(deps) {
-  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes, featureTools } = deps
+  const { sendAction, getHistoryRaw, workspaceRoot, memberMemory, webSearch, webFetch, stickers, stickerMaxBytes, featureTools, sendRegistry } = deps
   const policy = createToolPolicy(deps)
-  let mutationTail = Promise.resolve()
+  const writeLockMode = ['keyed', 'global', 'none'].includes(deps.writeLockMode) ? deps.writeLockMode : 'keyed'
+  const withKeyLock = createKeyedLock()
 
   function ensureWorkspace() {
     if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) throw new ToolError('File workspace is unavailable')
@@ -162,10 +179,37 @@ function createToolExecutor(deps) {
   }
 
   async function oneBotAction(ws, action, params) {
-    const response = await sendAction(ws, action, params)
-    if (!response || response.status !== 'ok' || (response.retcode !== undefined && Number(response.retcode) !== 0)) {
-      throw new ToolError('OneBot action failed')
+    let response
+    try {
+      response = await sendAction(ws, action, params)
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : ''
+      if ((error && error.code === 'TIMEOUT') || message === 'timeout') {
+        // 超时代表请求可能已经到达协议端：状态未知，禁止重试，避免重复发送。
+        throw new ToolError('OneBot 响应超时，操作状态未知（可能已执行），不要重复发送', { kind: 'uncertain' })
+      }
+      throw new ToolError('OneBot 连接中断，操作未得到确认', { kind: 'retryable' })
     }
+    if (!response || response.status !== 'ok' || (response.retcode !== undefined && Number(response.retcode) !== 0)) {
+      throw new ToolError('OneBot action failed', { kind: 'retryable' })
+    }
+    return response
+  }
+
+  function sendFingerprint(payload, content) {
+    if (!sendRegistry || typeof sendRegistry.fingerprint !== 'function') return ''
+    return sendRegistry.fingerprint(chatKeyFromPayload(payload), content)
+  }
+
+  async function sendOnce(ws, action, params, payload, content) {
+    const print = sendFingerprint(payload, content)
+    if (print && typeof sendRegistry.isDuplicate === 'function' && sendRegistry.isDuplicate(print)) {
+      console.log(`工具发送去重：${action} ${String(print).slice(0, 120)}`)
+      return { deduplicated: true, sent: false, note: '相同内容刚刚发送过，已跳过重复发送' }
+    }
+    const response = await oneBotAction(ws, action, params)
+    // 只有协议端确认成功后才记账，失败或超时都允许上层正常重试。
+    if (print && typeof sendRegistry.markSent === 'function') sendRegistry.markSent(print)
     return response
   }
 
@@ -186,7 +230,7 @@ function createToolExecutor(deps) {
     const payload = runtime && runtime.payload
     if (!ws || !Array.isArray(args.message) || !args.message.length) throw new ToolError('send_group_msg requires a connection and message segments')
     if (String(args.group_id || '') !== String(payload.group_id)) throw new ToolError('Messages can only be sent to the current conversation')
-    return oneBotAction(ws, 'send_group_msg', { group_id: payload.group_id, message: args.message })
+    return sendOnce(ws, 'send_group_msg', { group_id: payload.group_id, message: args.message }, payload, args.message)
   }
 
   async function runSendPrivateMsg(args, runtime) {
@@ -194,7 +238,7 @@ function createToolExecutor(deps) {
     const payload = runtime && runtime.payload
     if (!ws || !Array.isArray(args.message) || !args.message.length) throw new ToolError('send_private_msg requires a connection and message segments')
     if (String(args.user_id || '') !== String(payload.user_id)) throw new ToolError('Messages can only be sent to the current conversation')
-    return oneBotAction(ws, 'send_private_msg', { user_id: payload.user_id, message: args.message })
+    return sendOnce(ws, 'send_private_msg', { user_id: payload.user_id, message: args.message }, payload, args.message)
   }
 
   async function runHistory(args, runtime) {
@@ -315,7 +359,7 @@ function createToolExecutor(deps) {
     try {
       return await webSearch.search(query, { maxResults: args.max_results })
     } catch (error) {
-      throw new ToolError(String(error && error.message ? error.message : '联网搜索失败').slice(0, 200))
+      throw new ToolError(String(error && error.message ? error.message : '联网搜索失败').slice(0, 200), { kind: 'retryable' })
     }
   }
 
@@ -328,7 +372,7 @@ function createToolExecutor(deps) {
     try {
       return await webFetch.fetch(url)
     } catch (error) {
-      throw new ToolError(String(error && error.message ? error.message : '网页正文抓取失败').slice(0, 200))
+      throw new ToolError(String(error && error.message ? error.message : '网页正文抓取失败').slice(0, 200), { kind: 'retryable' })
     }
   }
 
@@ -479,7 +523,15 @@ function createToolExecutor(deps) {
     const params = payload.message_type === 'group'
       ? { group_id: payload.group_id, message }
       : { user_id: payload.user_id, message }
-    const result = await oneBotAction(runtime.ws, action, params)
+    const result = await sendOnce(runtime.ws, action, params, payload, { sticker: args.sticker_id })
+    if (result && result.deduplicated) {
+      return {
+        sent: false,
+        deduplicated: true,
+        sticker_id: args.sticker_id,
+        note: '这张表情刚刚发送过，已跳过重复发送。不要向用户汇报工具调用过程。'
+      }
+    }
     stickers.markUsed(args.sticker_id, String(payload.message || '').slice(0, 200))
     return {
       sent: true,
@@ -585,30 +637,25 @@ function createToolExecutor(deps) {
 
   async function execute(name, args, runtime) {
     const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {}
-    if (!Object.prototype.hasOwnProperty.call(handlers, name)) return { ok: false, error: 'Unknown tool' }
-    if (!isAllowed(name, runtime)) return { ok: false, error: 'Tool is not allowed for this user or conversation' }
+    if (!Object.prototype.hasOwnProperty.call(handlers, name)) return { ok: false, error: 'Unknown tool', kind: 'fatal' }
+    if (!isAllowed(name, runtime)) return { ok: false, error: 'Tool is not allowed for this user or conversation', kind: 'fatal' }
     const run = async () => {
       try {
         const data = await handlers[name](safeArgs, runtime)
-        if (data && data.ok === false) return { ok: false, error: 'Tool operation was not completed' }
+        if (data && data.ok === false) {
+          return { ok: false, error: String(data.error || '工具操作未完成'), kind: 'fatal' }
+        }
         return { ok: true, data }
       } catch (error) {
-        return { ok: false, error: error instanceof ToolError ? error.message : 'Tool operation failed' }
+        const message = error instanceof ToolError ? error.message : 'Tool operation failed'
+        const kind = error instanceof ToolError ? error.kind : 'fatal'
+        return { ok: false, error: message, kind }
       }
     }
-    if (isReadOnly(name, safeArgs)) {
-      await mutationTail
-      return run()
-    }
-    const previousMutation = mutationTail
-    let releaseMutation
-    mutationTail = new Promise((resolve) => { releaseMutation = resolve })
-    await previousMutation
-    try {
-      return await run()
-    } finally {
-      releaseMutation()
-    }
+    // 只读查询不取锁，也不等待其他会话的写操作；混合批次里的先后顺序由调度器保证。
+    if (isReadOnly(name, safeArgs)) return run()
+    const key = writeLockMode === 'none' ? '' : writeLockMode === 'global' ? '__global__' : toolLockKey(name, safeArgs, runtime)
+    return withKeyLock(key, run)
   }
 
   function isAllowed(name, runtime) {
@@ -616,9 +663,7 @@ function createToolExecutor(deps) {
   }
 
   function isReadOnly(name, args = {}) {
-    if (name === 'bot_feature') return READ_ONLY_BOT_FEATURE_ACTIONS.has(String(args.action || '').trim())
-    if (name === 'group_member_directory') return false
-    return READ_ONLY_TOOLS.has(name)
+    return isReadOnlyTool(name, args)
   }
 
   return { execute, isAllowed, isReadOnly }

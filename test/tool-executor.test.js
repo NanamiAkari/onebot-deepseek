@@ -6,6 +6,7 @@ const path = require('path')
 const { spawnSync } = require('child_process')
 const { createToolExecutor } = require('../src/agent/tool-executor')
 const { createDefaultToolRegistry } = require('../src/agent/tools')
+const { createSendRegistry } = require('../src/app/send-registry')
 
 const fileTools = ['read_file', 'write_file', 'edit_file', 'list_dir']
 const trustedRuntime = { ws: {}, payload: { message_type: 'group', group_id: 10, user_id: 20 } }
@@ -159,14 +160,33 @@ test('OneBot failures and internal errors are not reported as successful or expo
   for (const response of [{ status: 'failed', retcode: 100 }, { status: 'ok', retcode: 100 }, null]) {
     const { executor } = fixture(t, { sendAction: async () => response })
     const result = await executor.execute('get_msg', { message_id: 1 }, trustedRuntime)
-    assert.deepEqual(result, { ok: false, error: 'OneBot action failed' })
+    assert.deepEqual(result, { ok: false, error: 'OneBot action failed', kind: 'retryable' })
   }
   const { executor, root } = enabledFixture(t, { sendAction: async () => { throw new Error('/private/server/secret-value') } })
-  assert.deepEqual(await executor.execute('get_image', { file: 'image' }, trustedRuntime), { ok: false, error: 'Tool operation failed' })
+  assert.deepEqual(await executor.execute('get_image', { file: 'image' }, trustedRuntime), { ok: false, error: 'OneBot 连接中断，操作未得到确认', kind: 'retryable' })
+  // 内部错误文本不能泄漏给模型。
+  assert.equal((await executor.execute('get_image', { file: 'image' }, trustedRuntime)).error.includes('secret-value'), false)
   const missing = await executor.execute('read_file', { path: 'missing.txt' }, trustedRuntime)
   assert.equal(missing.ok, false)
   assert.equal(missing.error.includes(root), false)
   assert.equal((await executor.execute('toString', {}, trustedRuntime)).ok, false)
+})
+
+test('OneBot timeout is reported as an uncertain side effect that must not be retried', async (t) => {
+  const { executor } = fixture(t, {
+    sendAction: async () => {
+      const error = new Error('timeout')
+      error.code = 'TIMEOUT'
+      throw error
+    }
+  })
+  const result = await executor.execute('send_group_msg', {
+    group_id: 10,
+    message: [{ type: 'text', data: { text: '你好' } }]
+  }, trustedRuntime)
+  assert.equal(result.ok, false)
+  assert.equal(result.kind, 'uncertain')
+  assert.match(result.error, /状态未知/)
 })
 
 test('recent-message tool awaits storage and reports incomplete scan coverage', async (t) => {
@@ -252,11 +272,18 @@ test('tool executor identifies read-only calls without treating mutations as saf
   const { executor } = fixture(t, { featureTools: { isAdmin: async () => true } })
   assert.equal(executor.isReadOnly('web_search'), true)
   assert.equal(executor.isReadOnly('get_msg'), true)
+  assert.equal(executor.isReadOnly('get_recent_messages'), true)
+  assert.equal(executor.isReadOnly('memory_query'), true)
   assert.equal(executor.isReadOnly('send_group_msg'), false)
   assert.equal(executor.isReadOnly('memory_append'), false)
+  assert.equal(executor.isReadOnly('collect_sticker'), false)
+  assert.equal(executor.isReadOnly('send_sticker'), false)
+  assert.equal(executor.isReadOnly('write_file'), false)
   assert.equal(executor.isReadOnly('bot_feature', { action: 'list_custom_replies' }), true)
   assert.equal(executor.isReadOnly('bot_feature', { action: 'add_custom_reply' }), false)
-  assert.equal(executor.isReadOnly('group_member_directory'), false)
+  assert.equal(executor.isReadOnly('bot_feature', { action: 'send_poke' }), false)
+  // 成员目录会写缓存，但对用户是只读查询，允许和同批其他查询并行。
+  assert.equal(executor.isReadOnly('group_member_directory'), true)
 })
 
 test('tool executor serializes side-effect operations across concurrent sessions', async (t) => {
@@ -318,4 +345,91 @@ test('collect sticker reads only the current message image through safe download
   assert.equal(collected.note, '开心点赞')
   assert.deepEqual(collected.bytes, png)
   assert.match(collected.key, /30/)
+})
+
+test('side-effect locks are scoped per conversation, so different groups run concurrently', async (t) => {
+  let active = 0
+  let maxActive = 0
+  const featureTools = {
+    isAdmin: async () => true,
+    addCustomReply: async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise((resolve) => setTimeout(resolve, 8))
+      active -= 1
+      return { added: true }
+    }
+  }
+  const { executor } = fixture(t, { featureTools })
+  const first = { payload: { message_type: 'group', group_id: 10, user_id: 20 } }
+  const second = { payload: { message_type: 'group', group_id: 11, user_id: 21 } }
+  const results = await Promise.all([
+    executor.execute('bot_feature', { action: 'add_custom_reply', trigger: '一', content: '甲' }, first),
+    executor.execute('bot_feature', { action: 'add_custom_reply', trigger: '二', content: '乙' }, second)
+  ])
+  assert.equal(results.every((result) => result.ok), true)
+  assert.equal(maxActive, 2)
+})
+
+test('read-only queries are not blocked by an in-flight write', async (t) => {
+  let releaseWrite
+  const gate = new Promise((resolve) => { releaseWrite = resolve })
+  const featureTools = {
+    isAdmin: async () => true,
+    addCustomReply: async () => {
+      await gate
+      return { added: true }
+    }
+  }
+  const { executor } = fixture(t, {
+    featureTools,
+    getHistoryRaw: () => [{ role: 'user', content: '之前的对话' }]
+  })
+  const writing = executor.execute('bot_feature', { action: 'add_custom_reply', trigger: 'x', content: 'y' }, trustedRuntime)
+  let readDone = false
+  const reading = executor.execute('history', { session_key: 'k' }, trustedRuntime).then((result) => {
+    readDone = true
+    return result
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(readDone, true)
+  const readResult = await reading
+  assert.equal(readResult.ok, true)
+  releaseWrite()
+  assert.equal((await writing).ok, true)
+})
+
+test('duplicate tool sends inside the dedupe window reach OneBot only once', async (t) => {
+  const sendRegistry = createSendRegistry({ ttlMs: 9000 })
+  const { executor, actions } = fixture(t, { sendRegistry })
+  const message = [{ type: 'text', data: { text: '在呢' } }]
+  const first = await executor.execute('send_group_msg', { group_id: 10, message }, trustedRuntime)
+  const second = await executor.execute('send_group_msg', { group_id: 10, message }, trustedRuntime)
+  assert.equal(first.ok, true)
+  assert.equal(second.ok, true)
+  assert.equal(second.data.deduplicated, true)
+  assert.equal(actions.length, 1)
+  // 另一个群里的同样内容不算重复。
+  const other = await executor.execute('send_group_msg', { group_id: 11, message }, {
+    ws: {},
+    payload: { message_type: 'group', group_id: 11, user_id: 20 }
+  })
+  assert.equal(other.ok, true)
+  assert.equal(actions.length, 2)
+})
+
+test('failed sends stay retryable and are not remembered as duplicates', async (t) => {
+  const sendRegistry = createSendRegistry({ ttlMs: 9000 })
+  let attempts = 0
+  const { executor } = fixture(t, {
+    sendRegistry,
+    sendAction: async () => {
+      attempts += 1
+      return attempts === 1 ? { status: 'failed', retcode: 100 } : { status: 'ok', retcode: 0 }
+    }
+  })
+  const message = [{ type: 'text', data: { text: '重试一次' } }]
+  assert.equal((await executor.execute('send_group_msg', { group_id: 10, message }, trustedRuntime)).ok, false)
+  assert.equal((await executor.execute('send_group_msg', { group_id: 10, message }, trustedRuntime)).ok, true)
+  assert.equal(attempts, 2)
 })

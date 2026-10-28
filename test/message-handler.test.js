@@ -1,17 +1,20 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { createMessageHandler } = require('../src/app/message-handler')
+const { createSendRegistry } = require('../src/app/send-registry')
 
 function createHarness(message, options = {}) {
-  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [], replyBuildOptions: [] }
+  const calls = { custom: 0, ai: 0, archived: [], modelMessages: [], replyBuildOptions: [], actions: [], history: [] }
   const prefix = '阿卡林'
   const handler = createMessageHandler({
     pending: new Map(),
     pokeCooldown: new Map(),
     mediaCache: new Map(),
+    sendRegistry: options.sendRegistry,
     getKey: () => 'g:1',
-    pushHistory: () => {},
-    sendAction: async (_ws, action) => {
+    pushHistory: (_payload, userText, botText) => calls.history.push({ userText, botText }),
+    sendAction: async (_ws, action, params) => {
+      calls.actions.push({ action, params })
       if (action === 'get_msg' && options.quotedMessage) return { status: 'ok', data: options.quotedMessage }
       if (action === 'get_forward_msg' && options.forwardedMessages) return { status: 'ok', data: { messages: options.forwardedMessages } }
       return { status: 'ok' }
@@ -287,4 +290,27 @@ test('archives multimedia metadata and expanded forwarded text', async () => {
   assert.equal(archived.media[0].kind, 'video')
   assert.equal(archived.forwarded[0].text, '转发内容')
   assert.deepEqual(archived.forwarded[0].mediaTypes, ['image'])
+})
+
+test('does not resend a reply that a tool already sent in the same conversation', async () => {
+  const sendRegistry = createSendRegistry({ ttlMs: 9000 })
+  sendRegistry.markSent(sendRegistry.fingerprint('group:1', 'AI回复'))
+  const harness = createHarness([{ type: 'text', data: { text: '阿卡林你好' } }], { sendRegistry })
+  await harness.run()
+  assert.equal(harness.calls.ai, 1)
+  assert.equal(harness.calls.actions.filter((item) => item.action === 'send_group_msg').length, 0)
+  // 即使跳过真实发送，历史仍记录已经交付的文本。
+  assert.equal(harness.calls.history[0].botText, 'AI回复')
+})
+
+test('remembers a delivered reply and skips the identical text inside the window', async () => {
+  const sendRegistry = createSendRegistry({ ttlMs: 9000 })
+  const first = createHarness([{ type: 'text', data: { text: '阿卡林你好' } }], { sendRegistry })
+  await first.run()
+  assert.equal(first.calls.actions.filter((item) => item.action === 'send_group_msg').length, 1)
+  assert.equal(sendRegistry.stats().entries, 1)
+
+  const second = createHarness([{ type: 'text', data: { text: '阿卡林再问一次' } }], { sendRegistry })
+  await second.run()
+  assert.equal(second.calls.actions.filter((item) => item.action === 'send_group_msg').length, 0)
 })
